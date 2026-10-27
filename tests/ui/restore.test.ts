@@ -17,3 +17,9 @@ it('previews replacement, cancel preserves existing game, and invalid files neve
  root.querySelector<HTMLButtonElement>('#cancel-restore')!.click();expect(repo.get('game')?.name).toBe('Lantern Road');
  input=root.querySelector<HTMLInputElement>('#import-file')!;Object.defineProperty(input,'files',{value:[new File(['{}'],'bad.json')]});input.dispatchEvent(new Event('change'));await vi.waitFor(()=>expect(root.textContent).toContain('Invalid file'));expect(repo.get('game')?.name).toBe('Lantern Road');app.destroy();
 });
+it('does not replace a newly created live view with an earlier slow import',async()=>{
+ let resolve!:(game:ReturnType<typeof fixtureGame>)=>void;const pending=new Promise<ReturnType<typeof fixtureGame>>(done=>{resolve=done;});const {root,app}=setup(()=>pending);
+ const input=root.querySelector<HTMLInputElement>('#import-file')!;Object.defineProperty(input,'files',{value:[new File(['{}'],'game.json')]});input.dispatchEvent(new Event('change'));
+ root.querySelector<HTMLInputElement>('#game-name')!.value='New live game';root.querySelector<HTMLInputElement>('#creator-name')!.value='Alex';root.querySelector<HTMLFormElement>('#new-game')!.requestSubmit();resolve(fixtureGame());await pending;await Promise.resolve();
+ expect(root.querySelector('#roll')).not.toBeNull();expect(root.textContent).toContain('New live game');app.destroy();
+});

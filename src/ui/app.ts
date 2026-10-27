@@ -64,7 +64,7 @@ export function mountApp(root:HTMLElement,deps:AppDependencies={}) {
    const inviteButton=screen.querySelector<HTMLButtonElement>('#invite');if(inviteButton)inviteButton.disabled=!environment.canConnect;
    if(state.mode==='guest'&&state.phase==='ready'){clearFlow(true);error.textContent='';}
  }
- function openSession(next:SessionController){clearSession();session=next;view?.destroy();view=null;room=null;identity=null;unsubscribe=next.subscribe(renderSession);renderSession();error.textContent='';}
+ function openSession(next:SessionController){importGeneration++;clearSession();session=next;view?.destroy();view=null;room=null;identity=null;unsubscribe=next.subscribe(renderSession);renderSession();error.textContent='';}
  function openHost(game:Game,playerId:string){const next=createHostSession(game,playerId,runtime);clearFlow();openSession(next);}
  function showStart(){
    importGeneration++;view?.destroy();room=null;identity=null;const data=repository.list();
@@ -76,7 +76,7 @@ export function mountApp(root:HTMLElement,deps:AppDependencies={}) {
    });warning.textContent=environment.message;
  }
  function restore(game:Game,imported:boolean){
-   view?.destroy();view=createRestoreView(screen,{game,rememberedPlayerId:repository.rememberedPlayer(game.id),replace:imported&&repository.get(game.id)!==null},{
+   importGeneration++;view?.destroy();view=createRestoreView(screen,{game,rememberedPlayerId:repository.rememberedPlayer(game.id),replace:imported&&repository.get(game.id)!==null},{
      open(playerId,newName){try{if(!environment.canCreate)throw new Error(environment.message);if(!playerId){const added=addPlayer(game,newName,'gm',runtime);openHost(added.game,added.player.id);}else openHost(game,playerId);}catch(e){report(e);}},cancel:showStart
    });
  }

@@ -34,3 +34,8 @@ it('applies presence-only sequence changes but rejects stale revisions and forei
  const send=(sequence:number,revision:number,sessionId='s',onlinePlayerIds=['alex'])=>a.send({type:'snapshot',snapshot:{sessionId,sequence,game:{...game,revision},onlinePlayerIds}});
  send(1,2);send(2,2,'s',[]);expect(g.getView().onlinePlayerIds).toEqual([]);send(1,2);expect(g.getView().onlinePlayerIds).toEqual([]);send(3,1);expect(g.getView().game?.revision).toBe(2);send(4,4,'wrong');expect(g.getView().game?.revision).toBe(2);g.close();
 });
+it('cannot replace an identity request beneath a host approval by reusing its ID',()=>{
+ const h=setup(),[a,b]=pair();h.attach(a);b.send({type:'claim',requestId:'same',claim:{newPlayer:{name:'Bea',role:'pj'}}});
+ b.send({type:'claim',requestId:'same',claim:{newPlayer:{name:'Mallory',role:'gm'}}});
+ h.approve(a.id,'same');expect(h.getView().game?.players[1]).toMatchObject({name:'Bea',role:'pj'});h.close();
+});

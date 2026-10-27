@@ -7,7 +7,7 @@ import { parseMessage,type Message } from './messages';
 export function createHostSession(initial:Game,localPlayerId:string,runtime:Runtime):HostSession {
  let game=validateGame(initial);check(game.players.some(p=>p.id===localPlayerId),'Choose a valid hosting player.');
  const sessionId=runtime.id(),listeners=new Set<()=>void>();let sequence=0,closed=false,error:string|null=null;
- type Peer={transport:PeerTransport;playerId:string|null;pending:PendingClaim|null;seen:Set<string>;tokens:number;at:number;unsubscribe:()=>void};
+ type Peer={transport:PeerTransport;playerId:string|null;pending:PendingClaim|null;seen:Set<string>;claimIds:Set<string>;tokens:number;at:number;unsubscribe:()=>void};
  const peers=new Map<string,Peer>();
  const online=()=>[localPlayerId,...[...peers.values()].flatMap(p=>p.playerId?[p.playerId]:[])];
  const lobby=():Lobby=>({sessionId,gameId:game.id,gameName:game.name,players:game.players.map(p=>({...p,online:online().includes(p.id)}))});
@@ -22,7 +22,7 @@ export function createHostSession(initial:Game,localPlayerId:string,runtime:Runt
  attach(transport){
    if(closed||peers.has(transport.id)||peers.size>=31||[...peers.values()].filter(p=>!p.playerId).length>=8){transport.close();return;}
    if(transport.state==='closed'||transport.state==='failed'){transport.close();return;}
-   const peer:Peer={transport,playerId:null,pending:null,seen:new Set(),tokens:20,at:Date.now(),unsubscribe:()=>{}};peers.set(transport.id,peer);
+   const peer:Peer={transport,playerId:null,pending:null,seen:new Set(),claimIds:new Set(),tokens:20,at:Date.now(),unsubscribe:()=>{}};peers.set(transport.id,peer);
    peer.unsubscribe=transport.subscribe(event=>{
      if(closed||!peers.has(transport.id))return;
      if(event.type==='state'){if(event.state==='open')send(peer,{type:'hello',version:1});else if(['disconnected','failed','closed'].includes(event.state))drop(peer);return;}
@@ -32,7 +32,7 @@ export function createHostSession(initial:Game,localPlayerId:string,runtime:Runt
        const message=parseMessage(event.value);
        if(message.type==='hello'){send(peer,{type:'lobby',lobby:lobby()});return;}
        if(message.type==='claim'){
-         check(!peer.playerId,'This connection already has a player.');peer.pending={peerId:transport.id,requestId:message.requestId,claim:message.claim};notify();return;
+         check(!peer.playerId,'This connection already has a player.');if(peer.claimIds.has(message.requestId))return;check(peer.claimIds.size<4096,'Claim history is full. Reconnect with a fresh invitation.');peer.claimIds.add(message.requestId);peer.pending={peerId:transport.id,requestId:message.requestId,claim:message.claim};notify();return;
        }
        if(message.type==='roll-request'){
          check(peer.playerId,'Host approval is required before rolling.');if(peer.seen.has(message.requestId))return;
