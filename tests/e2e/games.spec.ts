@@ -10,7 +10,7 @@ test('invalid and canceled replacement imports preserve existing saves',async({p
  await page.getByLabel('Load state file').setInputFiles({name:'invalid.json',mimeType:'application/json',buffer:Buffer.from('{"schemaVersion":2}')});await expect(page.getByText('Unsupported game schema version.')).toBeVisible();await expect(page.getByRole('button',{name:'Continue'})).toHaveCount(1);
 });
 test('responsive keyboard forms preserve die selection and safe text',async({page})=>{
- await page.setViewportSize({width:390,height:844});await createGame(page,'<img onerror=alert(1)>');await expect(page.locator('img')).toHaveCount(0);await page.getByLabel('Die',{exact:true}).selectOption('6');await page.locator('#roll').focus();await page.keyboard.press('Enter');await countRolls(page,1);await expect(page.getByLabel('Die',{exact:true})).toHaveValue('6');await expect(page.locator('#roll')).toBeFocused();
+ await page.setViewportSize({width:390,height:844});await createGame(page,'<img onerror=alert(1)>');await expect(page.locator('img')).toHaveCount(0);await page.getByRole('combobox',{name:'Die',exact:true}).selectOption('6');await page.locator('#roll').focus();await page.keyboard.press('Enter');await countRolls(page,1);await expect(page.getByRole('combobox',{name:'Die',exact:true})).toHaveValue('6');await expect(page.locator('#roll')).toBeFocused();
  expect(await page.evaluate(()=>document.documentElement.scrollWidth<=innerWidth)).toBe(true);
  await page.screenshot({path:`test-results/table-${test.info().project.name}.png`,fullPage:true});
 });

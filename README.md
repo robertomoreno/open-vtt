@@ -32,6 +32,8 @@ npm run test:e2e
 
 Changes save automatically in this browser, separately for each game. Private-mode restrictions, quota, clearing browser data, or switching origins can lose browser saves. A persistent warning distinguishes in-memory play from failed saving; download JSON for a portable backup. Leaving an unsaved table asks for confirmation. Concurrent hosting of the same game in multiple tabs is **unsupported** and not synchronized.
 
+Joining a host with a different copy of an already saved game asks before replacing that local record. **Cancel** preserves the existing save and keeps the live guest session in memory only, with file download available. This choice lasts for the session; it does not merge the two copies. Navigating away closes connections; returning from the browser’s back/forward cache remounts the saved-game start screen rather than reviving old peers.
+
 Opening any saved snapshot starts an **independent new live session**. It preserves stable player IDs and recent history, but does not restore connections, merge diverged games, or migrate an existing host.
 
 ## Connect each player (two-way exchange)
@@ -64,7 +66,16 @@ Games support **32 players**, **100 recent rolls**, and one die per request (d4/
 
 Unit and DOM tests exercise schema boundaries, immutable operations, storage/file failures, signaling/framing bounds, native-peer lifecycle through an injected RTC factory, session authority/claims/replay handling, and accessible UI flows. End-to-end tests use **actual browser data channels**, public UI link exchange, and isolated contexts; there is no debug global or mocked WebRTC in acceptance tests.
 
-Automated browser results are recorded in `docs/superpowers/plans/2026-10-27-vtt-foundation.md`. WebKit automation is **not proof of shipping Safari behavior**, and Chromium automation is not a claim that branded Edge was tested.
+### Recorded run (2026-10-27, macOS, Playwright 1.64.1)
+
+- **71 unit/DOM tests passed**, with successful type checking and production build.
+- **17 of 22 browser tests passed; 5 failed.** The full browser gate is **not green**.
+- Creation/refresh/restore, portable file roundtrip, invalid/canceled imports, denied storage, missing WebRTC feedback, responsive layout and keyboard roll passed in **Chromium, Firefox, and WebKit**.
+- **Chromium host → two WebKit guests** and **WebKit host → two Chromium guests** passed the complete actual-channel flow: approval, duplicate-name rejection, rolls from all three browsers, matching history, late join, disconnect/reclaim with fresh links, host loss, and retained-state download.
+- **Chromium↔Chromium, Firefox↔Firefox, WebKit↔WebKit, Chromium→Firefox, and Firefox→Chromium** did not complete their full connection scenarios. Same-engine Chromium/WebKit timed out during connection; Firefox-involving cases failed gathering before producing an offer/reply. These combinations remain **unproven**, not skipped or declared compatible.
+- Isolated native API probes outside Gather also failed here: a Chromium pair remained in ICE checking with 81 requests sent / zero responses; Firefox failed with zero candidates and no completed gathering after 31 seconds. This is evidence of runner/network limitations, not proof that every failing scenario is environmental. No relay, transport mock, browser privacy flag, or signaling workaround was added to the acceptance suite.
+
+Exact coverage and outstanding acceptance status are recorded in `docs/superpowers/plans/2026-10-27-vtt-foundation.md`. Re-run `npm run test:e2e` on a runner/network allowing direct WebRTC before treating the foundation as fully accepted. Failure traces under ignored `test-results/` may contain temporary signaling credentials; do not publish them without redaction. WebKit automation is **not proof of shipping Safari behavior**, and Chromium automation is not a claim that branded Edge was tested.
 
 ### Manual smoke tests (not yet run)
 

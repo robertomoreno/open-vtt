@@ -30,6 +30,7 @@ export function mountApp(root:HTMLElement,deps:AppDependencies={}) {
  const warning=status(),error=status(),screen=el('div','','screen'),flow=el('section');flow.id='connection-flow';root.replaceChildren(header,warning,error,screen,flow);
  let session:SessionController|null=null,view:{destroy():void}|null=null,room:RoomView|null=null,identity:IdentityView|null=null;
  let unsubscribe=()=>{},destroyed=false,lastSaved='',lastIdentity='',saveFailed=false,importGeneration=0;
+ let guestSavePolicy:'unchecked'|'write'|'preserve'='unchecked';
  type Operation={kind:'host'|'guest';abort:AbortController;invitation?:PendingInvitation;transport?:PeerTransport;adopted?:boolean;unsubscribe:()=>void};
  let operation:Operation|null=null,connection:ConnectionView|null=null,connectionData:ConnectionData|null=null;
  const report=(e:unknown)=>{error.textContent=e instanceof Error?e.message:String(e);};
@@ -40,11 +41,19 @@ export function mountApp(root:HTMLElement,deps:AppDependencies={}) {
    if(old&&!(keepConnected&&old.adopted&&old.transport?.state==='open')){old.abort.abort();old.invitation?.cancel();old.transport?.close();}
    connection?.destroy();connection=null;connectionData=null;flow.replaceChildren();
  }
- function clearSession(){unsubscribe();unsubscribe=()=>{};session?.close();session=null;lastSaved='';lastIdentity='';room=null;identity=null;}
+ function clearSession(){unsubscribe();unsubscribe=()=>{};session?.close();session=null;lastSaved='';lastIdentity='';guestSavePolicy='unchecked';room=null;identity=null;}
  function leave(){if(saveFailed&&!confirm('This game has not been saved. Download a JSON copy before leaving. Leave anyway?'))return;clearFlow();clearSession();showStart();}
  function persist(){
    const state=session!.getView();
-   if(state.game&&`${state.game.id}:${state.game.revision}`!==lastSaved){lastSaved=`${state.game.id}:${state.game.revision}`;const result=repository.save(state.game);saveFailed=!result.ok;warning.textContent=result.ok?'Saved in this browser. Download a copy for safekeeping.':result.message;}
+   if(state.game&&state.mode==='guest'&&guestSavePolicy==='unchecked'){
+     const existing=repository.get(state.game.id),conflict=existing&&JSON.stringify(existing)!==JSON.stringify(state.game);
+     guestSavePolicy=conflict&&!confirm('This host has a different copy of a game already saved in this browser. Replace your local save with the host’s state? Cancel preserves your existing save and keeps this live session in memory only; you can download it.')?'preserve':'write';
+   }
+   if(state.game&&`${state.game.id}:${state.game.revision}`!==lastSaved){
+     lastSaved=`${state.game.id}:${state.game.revision}`;
+     if(state.mode==='guest'&&guestSavePolicy==='preserve'){saveFailed=true;warning.textContent='Your existing local save was preserved. This guest session is in memory only; download its latest state to keep it.';}
+     else {const result=repository.save(state.game);saveFailed=!result.ok;warning.textContent=result.ok?'Saved in this browser. Download a copy for safekeeping.':result.message;}
+   }
    if(state.game&&state.localPlayerId&&state.phase==='ready'&&lastIdentity!==`${state.game.id}:${state.localPlayerId}`){lastIdentity=`${state.game.id}:${state.localPlayerId}`;const result=repository.rememberPlayer(state.game.id,state.localPlayerId);if(!result.ok)warning.textContent=result.message;}
  }
  function download(){const game=session?.getView().game;if(game)try{(deps.download??downloadGame)(game);}catch(e){report(e);}}
