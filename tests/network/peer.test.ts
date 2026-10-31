@@ -3,8 +3,9 @@ import { createInvitation,answerInvitation } from '../../src/network/peer';
 class Channel extends EventTarget {label='gather-v1';ordered=true;maxRetransmits=null;maxPacketLifeTime=null;readyState='connecting';bufferedAmount=0;send=vi.fn();close(){this.readyState='closed';this.dispatchEvent(new Event('close'));}}
 class RTC extends EventTarget {
  iceGatheringState='gathering';connectionState='new';localDescription={type:'offer',sdp:'sdp'};channel=new Channel(); close=vi.fn();
+ remoteDescription:{type:string;sdp:string}|null=null;
  createDataChannel(){return this.channel;} async createOffer(){return {type:'offer',sdp:'sdp'};} async createAnswer(){return {type:'answer',sdp:'sdp'};}
- async setLocalDescription(d:{type:string;sdp:string}){this.localDescription=d;} async setRemoteDescription(){}
+ async setLocalDescription(d:{type:string;sdp:string}){this.localDescription=d;} async setRemoteDescription(d:{type:string;sdp:string}){this.remoteDescription=d;}
  complete(){this.iceGatheringState='complete';this.dispatchEvent(new Event('icegatheringstatechange'));}
 }
 afterEach(()=>vi.useRealTimers());
@@ -25,5 +26,28 @@ it('fails channel errors, validates frames and reports backpressure',async()=>{
  const rtc=new RTC();rtc.complete();const invite=await createInvitation({rtcFactory:()=>rtc as unknown as RTCPeerConnection});rtc.channel.readyState='open';rtc.channel.dispatchEvent(new Event('open'));expect(invite.transport.state).toBe('open');rtc.channel.bufferedAmount=1048576;expect(()=>invite.transport.send({x:1})).toThrow();rtc.channel.dispatchEvent(new Event('error'));expect(invite.transport.state).toBe('failed');
 });
 it('rejects answering an answer before constructing a peer',async()=>{
- await expect(answerInvitation({version:1,kind:'answer',invitationId:'i',description:{type:'answer',sdp:'x'}})).rejects.toThrow();
+  await expect(answerInvitation({version:1,kind:'answer',invitationId:'i',description:{type:'answer',sdp:'x'}})).rejects.toThrow();
+});
+it('keeps a reply alive during a slow manual exchange, then expires it with a specific reason',async()=>{
+ vi.useFakeTimers();const rtc=new RTC();rtc.complete();
+ const result=await answerInvitation({version:1,kind:'offer',invitationId:'i',description:{type:'offer',sdp:'offer'}},{rtcFactory:()=>rtc as unknown as RTCPeerConnection});
+ const errors:string[]=[];result.transport.subscribe(event=>{if(event.type==='error')errors.push(event.message);});
+ await vi.advanceTimersByTimeAsync(60000);expect(result.transport.state).toBe('connecting');
+ await vi.advanceTimersByTimeAsync(540000);expect(result.transport.state).toBe('failed');expect(errors.at(-1)).toMatch(/reply.*expired|waiting.*host/i);expect(vi.getTimerCount()).toBe(0);
+});
+it('reports connection state on a host-side post-reply timeout without exposing SDP',async()=>{
+ vi.useFakeTimers();const rtc=new RTC();rtc.complete();
+ const invitation=await createInvitation({rtcFactory:()=>rtc as unknown as RTCPeerConnection});
+ rtc.localDescription.sdp='private-credential';
+ const errors:string[]=[];invitation.transport.subscribe(event=>{if(event.type==='error')errors.push(event.message);});
+ rtc.connectionState='connecting';Object.assign(rtc,{iceConnectionState:'checking'});
+ await invitation.accept({version:1,kind:'answer',invitationId:invitation.invitationId,description:{type:'answer',sdp:'private-answer'}});
+ await vi.advanceTimersByTimeAsync(45001);expect(invitation.transport.state).toBe('failed');
+ expect(errors.at(-1)).toMatch(/ICE: checking/);expect(errors.at(-1)).toMatch(/channel: connecting/);expect(errors.at(-1)).not.toMatch(/private-/);
+});
+it('cancels the guest exchange deadline once the channel opens',async()=>{
+ vi.useFakeTimers();const rtc=new RTC();rtc.complete();
+ const result=await answerInvitation({version:1,kind:'offer',invitationId:'i',description:{type:'offer',sdp:'offer'}},{rtcFactory:()=>rtc as unknown as RTCPeerConnection});
+ const event=new Event('datachannel');Object.assign(event,{channel:rtc.channel});rtc.dispatchEvent(event);rtc.channel.readyState='open';rtc.channel.dispatchEvent(new Event('open'));
+ expect(result.transport.state).toBe('open');expect(vi.getTimerCount()).toBe(0);await vi.advanceTimersByTimeAsync(600000);expect(result.transport.state).toBe('open');result.transport.close();
 });

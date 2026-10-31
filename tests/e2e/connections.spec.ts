@@ -19,3 +19,10 @@ for(const [hostEngine,guestEngine] of [['chromium','chromium'],['firefox','firef
   }finally{await hostBrowser.close();await guestBrowser.close();}
  });
 }
+test('chromium host ↔ webkit guest: delayed manual reply still connects and rolls',async({page:host})=>{
+ const guestBrowser=await webkit.launch();
+ try{
+  const context=await guestBrowser.newContext({baseURL:'http://localhost:5173'}),guest=await context.newPage();
+  await createGame(host);await exchange(host,guest,60000);await claimNew(host,guest,'Bea');await guest.locator('#roll').click();await countRolls(host,1);await countRolls(guest,1);
+ }finally{await guestBrowser.close();}
+});

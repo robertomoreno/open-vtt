@@ -91,11 +91,12 @@ export function mountApp(root:HTMLElement,deps:AppDependencies={}) {
  }
  function monitor(op:Operation,transport:PeerTransport){
    op.transport=transport;
+   let failure:string|null=null;
    const update=()=>{if(operation!==op||!connectionData)return;const state=transport.state;
-     if(state==='open')showConnection({...connectionData,phase:'connected',message:'Connected. Player identity still requires host approval.'});
-     else if(state==='closed'||state==='failed')showConnection({...connectionData,phase:'failed',message:'Connection closed or invitation expired. Generate a fresh invitation; restrictive networks may block direct connections.'});
+     if(state==='open'){failure=null;showConnection({...connectionData,phase:'connected',message:'Connected. Player identity still requires host approval.'});}
+     else if(state==='closed'||state==='failed')showConnection({...connectionData,phase:'failed',message:failure??'Connection closed. Generate a fresh invitation to reconnect.'});
    };
-   op.unsubscribe=transport.subscribe(event=>{if(operation!==op||!connectionData)return;if(event.type==='error')showConnection({...connectionData,phase:'failed',message:event.message});else if(event.type==='state')update();});update();
+   op.unsubscribe=transport.subscribe(event=>{if(operation!==op||!connectionData)return;if(event.type==='error'){failure=event.message;showConnection({...connectionData,phase:'failed',message:failure});}else if(event.type==='state')update();});update();
  }
  function startHostFlow(){
    if(!environment.canConnect){report(new Error(environment.message));return;}if(session?.getView().mode!=='host')return;
