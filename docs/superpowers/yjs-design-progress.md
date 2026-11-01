@@ -11,8 +11,9 @@
 - [x] Confirm successor/fresh-room fallback reset; apply the user's online-only additional-player creation requirement without blocking existing-player offline edits.
 - [x] Incorporate review resolutions, scoped occupancy guarantees, and the explicitly proposed initial-game-player bootstrap exception.
 - [x] Confirm the revised design resolves the builder's material planning gaps; follow-up result: “nothing important left.”
-- [ ] Obtain user approval of the complete written design.
-- [ ] After approval, invoke writing-plans for implementation planning.
+- [x] Obtain user approval of the complete written design (“go”, 2026-11-01).
+- [x] After approval, invoke writing-plans and write/self-review `plans/2026-11-01-yjs-local-first-sync.md`.
+- [ ] Obtain implementation-plan review and execution-method choice before changing application code or dependencies.
 
 Design: `specs/2026-11-01-yjs-local-first-sync-design.md`.
 

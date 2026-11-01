@@ -1,6 +1,6 @@
 # Gather: local-first Yjs synchronization and shared room links
 
-Status: independently builder-reviewed proposed design, incorporating the user's review decisions and awaiting full user approval. The reconciliation rules in `AGENTS.md` are approved; this complete migration design is not yet approved. No implementation or dependency installation is authorized by this document.
+Status: approved by the user on 2026-11-01 after independent builder review and resolution of its material questions. Implementation planning is authorized. Review of the implementation plan and selection of an execution method must precede application changes or dependency installation.
 
 ## Intent
 
