@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import * as Y from 'yjs';
-import { Awareness, applyAwarenessUpdate, encodeAwarenessUpdate } from 'y-protocols/awareness';
+import { Awareness, applyAwarenessUpdate, encodeAwarenessUpdate, removeAwarenessStates } from 'y-protocols/awareness';
 import { createRoomLink } from '../../src/network/room-link';
 import { createRoomTransport } from '../../src/network/room';
 
@@ -38,7 +38,9 @@ describe('room transport', () => {
     const t = createRoomTransport(doc, link(), 'p1');
     expect(t.getView().phase).toBe('looking');
     expect(FakeSocket.made).toEqual([]);
-    await vi.waitFor(() => expect(t.getView().phase).toBe('connected'));
+    await vi.waitFor(() => expect(t.getView().presence.map(p => p.id)).toEqual(['p1']));
+    expect(t.getView().phase).toBe('looking');
+    expect(t.getView().openRtcConnections).toBe(0);
     expect(FakeSocket.made).toEqual(['wss://y-webrtc-eu.fly.dev']);
     expect(t.getView().presence.map(p => p.id)).toEqual(['p1']);
     t.close();
@@ -72,8 +74,9 @@ describe('room transport', () => {
     vi.stubGlobal('WebSocket', FakeSocket);
     vi.useFakeTimers({ toFake: ['setInterval', 'clearInterval', 'Date'] });
     const t = createRoomTransport(new Y.Doc(), link(), 'p1');
-    for (let i = 0; i < 100 && t.getView().phase !== 'connected'; i++) await new Promise(resolve => setTimeout(resolve, 10));
-    expect(t.getView().phase).toBe('connected');
+    for (let i = 0; i < 100 && t.getView().presence.length === 0; i++) await new Promise(resolve => setTimeout(resolve, 10));
+    expect(t.getView().presence).toHaveLength(1);
+    expect(t.getView().phase).toBe('looking');
     const first = t.getView().presence[0].seenAt;
     vi.advanceTimersByTime(4_999);
     expect(t.getView().presence[0].seenAt).toBe(first);
@@ -104,7 +107,7 @@ describe('room transport', () => {
       const doc = new Y.Doc();
       const awareness = new Awareness(doc);
       const t = createRoomTransport(doc, link(), 'local', { awareness });
-      await vi.waitFor(() => expect(t.getView().phase).toBe('connected'));
+      await vi.waitFor(() => expect(t.getView().presence).toHaveLength(1));
       return { t, awareness };
     };
 
@@ -144,6 +147,78 @@ describe('room transport', () => {
       expect(t.getView().presence).toHaveLength(32);
       t.close();
       awareness.destroy();
+    });
+
+    it('does not retain y-protocols metadata for repeatedly rejected client IDs', async () => {
+      const { t, awareness } = await connect();
+      for (let i = 0; i < 300; i++) remote(awareness, i % 2 ? { id: 'bad id' } : { id: 'big', pad: 'x'.repeat(9000) });
+      await Promise.resolve();
+      expect(awareness.getStates().size).toBe(1);
+      expect(awareness.meta.size).toBe(1);
+      t.close();
+      awareness.destroy();
+    });
+
+    it('does not retain metadata beyond the participant cap, and drops it when a participant expires', async () => {
+      const { t, awareness } = await connect();
+      const ids = Array.from({ length: 40 }, (_, i) => remote(awareness, { id: `peer-${i}` }));
+      await Promise.resolve();
+      expect(awareness.meta.size).toBe(32);
+      removeAwarenessStates(awareness, [ids[0], ids[1]], 'timeout');
+      await Promise.resolve();
+      expect(awareness.meta.size).toBe(30);
+      expect(awareness.meta.has(ids[0])).toBe(false);
+      t.close();
+      awareness.destroy();
+    });
+  });
+
+  describe('teardown and reopen', () => {
+    it('keeps the room lock until delayed key derivation settles, so an immediate reopen neither fails nor double-opens', async () => {
+      vi.stubGlobal('RTCPeerConnection', FakePc);
+      vi.stubGlobal('RTCSessionDescription', class {});
+      vi.stubGlobal('RTCIceCandidate', class {});
+      vi.stubGlobal('WebSocket', FakeSocket);
+      const unhandled: unknown[] = [];
+      const record = (reason: unknown) => { unhandled.push(reason); };
+      process.on('unhandledRejection', record);
+      const real = crypto.subtle.importKey.bind(crypto.subtle);
+      let release!: () => void;
+      const gate = new Promise<void>(resolve => { release = resolve; });
+      const spy = vi.spyOn(crypto.subtle, 'importKey').mockImplementation(async (...args: any[]) => { await gate; return (real as any)(...args); });
+      try {
+        const roomLink = link();
+        const first = createRoomTransport(new Y.Doc(), roomLink, 'one');
+        await vi.waitFor(() => expect(spy).toHaveBeenCalledTimes(1));
+        first.close();
+        expect(first.getView().phase).toBe('closed');
+        const second = createRoomTransport(new Y.Doc(), roomLink, 'two');
+        expect(second.getView().phase).toBe('looking');
+        release();
+        await vi.waitFor(() => expect(second.getView().presence).toHaveLength(1));
+        expect(second.getView().phase).toBe('looking');
+        await new Promise(resolve => setTimeout(resolve, 50));
+        expect(unhandled).toEqual([]);
+        expect(FakeSocket.open).toBe(1);
+        second.close();
+        await vi.waitFor(() => expect(FakeSocket.open).toBe(0));
+      } finally {
+        process.off('unhandledRejection', record);
+        spy.mockRestore();
+      }
+    });
+
+    it('refuses a second live transport for the same room', () => {
+      vi.stubGlobal('RTCPeerConnection', FakePc);
+      vi.stubGlobal('RTCSessionDescription', class {});
+      vi.stubGlobal('RTCIceCandidate', class {});
+      vi.stubGlobal('WebSocket', FakeSocket);
+      const roomLink = link();
+      const first = createRoomTransport(new Y.Doc(), roomLink, 'one');
+      const second = createRoomTransport(new Y.Doc(), roomLink, 'two');
+      expect(second.getView().phase).toBe('failed');
+      first.close();
+      second.close();
     });
   });
 });

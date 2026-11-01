@@ -4,7 +4,7 @@ import { MESSAGE_BYTES, NATIVE_BUFFERED_BYTES, NATIVE_BUFFER_LOW_BYTES, NATIVE_R
 export type RtcConstructors = Pick<typeof globalThis, 'RTCPeerConnection' | 'RTCSessionDescription' | 'RTCIceCandidate'>;
 type Options = { native?: RtcConstructors; now: () => number; onChange: () => void; onError: (message: string) => void };
 type Handler = ((event: any) => void) | null;
-type Frames = { iterator: Iterator<Uint8Array>; bytes: number };
+type Frames = { iterator: Iterator<Uint8Array>; bytes: number; held?: Uint8Array };
 
 export function createBoundedRtcRuntime(options: Options) {
   const native: RtcConstructors = options.native ?? {
@@ -34,8 +34,8 @@ export function createBoundedRtcRuntime(options: Options) {
     let threshold = 0;
     const handlers: Record<'onopen' | 'onclose' | 'onerror' | 'onmessage' | 'onbufferedamountlow', Handler> = { onopen: null, onclose: null, onerror: null, onmessage: null, onbufferedamountlow: null };
 
-    const call = (name: keyof typeof handlers, event: unknown) => {
-      try { handlers[name]?.(event); } catch { report('Peer message handler failed.'); }
+    const call = (name: keyof typeof handlers, event: unknown): boolean => {
+      try { handlers[name]?.(event); return true; } catch { return false; }
     };
     const markClosed = () => {
       if (opened) { opened = false; openCount--; }
@@ -54,20 +54,27 @@ export function createBoundedRtcRuntime(options: Options) {
       report(message);
       const wasDone = done;
       markClosed();
-      if (!wasDone) { try { channel.close(); } catch { /* already closed */ } }
+      try { channel.close(); } catch { /* already closed */ }
+      if (!wasDone) call('onclose', new Event('close'));
     };
     const pump = () => {
-      while (!done && queue.length > 0 && channel.readyState === 'open' && channel.bufferedAmount < NATIVE_BUFFERED_BYTES) {
+      while (!done && queue.length > 0 && channel.readyState === 'open') {
         const head = queue[0];
-        const next = head.iterator.next();
-        if (next.done) { queue.shift(); queued -= head.bytes; outboundTotal -= head.bytes; continue; }
-        try { channel.send(next.value); } catch { fail('Peer send failed.'); return; }
+        if (!head.held) {
+          const next = head.iterator.next();
+          if (next.done) { queue.shift(); queued -= head.bytes; outboundTotal -= head.bytes; continue; }
+          head.held = next.value;
+        }
+        if (channel.bufferedAmount + head.held.byteLength > NATIVE_BUFFERED_BYTES) return;
+        const frame = head.held;
+        head.held = undefined;
+        try { channel.send(frame); } catch { fail('Peer send failed.'); return; }
       }
     };
     const total = () => channel.bufferedAmount + queued;
 
     const api: any = {
-      shutdown() { const wasDone = done; markClosed(); if (!wasDone) { try { channel.close(); } catch { /* already closed */ } } },
+      shutdown() { markClosed(); try { channel.close(); } catch { /* already closed */ } },
       get label() { return channel.label; },
       get readyState() { return channel.readyState; },
       get bufferedAmount() { return total(); },
@@ -79,9 +86,9 @@ export function createBoundedRtcRuntime(options: Options) {
       send(data: unknown) {
         const bytes = data instanceof ArrayBuffer ? new Uint8Array(data) : ArrayBuffer.isView(data) ? new Uint8Array(data.buffer, data.byteOffset, data.byteLength) : undefined;
         if (!bytes) throw new Error('Only binary data can be sent.');
-        if (bytes.byteLength > MESSAGE_BYTES) throw new Error('Message is too large.');
         if (done) throw new Error('Channel is closed.');
-        if (queued + bytes.byteLength > OUTBOUND_QUEUE_CONNECTION_BYTES || outboundTotal + bytes.byteLength > OUTBOUND_QUEUE_TOTAL_BYTES) throw new Error('Outbound queue is full.');
+        if (bytes.byteLength > MESSAGE_BYTES) { fail('Outbound message is too large.'); throw new Error('Message is too large.'); }
+        if (queued + bytes.byteLength > OUTBOUND_QUEUE_CONNECTION_BYTES || outboundTotal + bytes.byteLength > OUTBOUND_QUEUE_TOTAL_BYTES) { fail('Outbound queue is full.'); throw new Error('Outbound queue is full.'); }
         queued += bytes.byteLength;
         outboundTotal += bytes.byteLength;
         queue.push({ iterator: encodeBinaryFrames(bytes, transferId++ >>> 0)[Symbol.iterator](), bytes: bytes.byteLength });
@@ -101,12 +108,12 @@ export function createBoundedRtcRuntime(options: Options) {
     }
     channel.binaryType = 'arraybuffer';
     channel.bufferedAmountLowThreshold = NATIVE_BUFFER_LOW_BYTES;
-    listen('open', event => { if (done || opened) return; opened = true; openCount++; changed(); call('onopen', event); pump(); });
+    listen('open', event => { if (done || opened) return; opened = true; openCount++; changed(); if (!call('onopen', event)) { fail('Peer handler failed.'); return; } pump(); });
     listen('close', event => { const wasDone = done; markClosed(); if (!wasDone) call('onclose', event); });
-    listen('error', event => call('onerror', event));
+    listen('error', event => { if (!call('onerror', event)) fail('Peer handler failed.'); });
     listen('bufferedamountlow', () => {
       pump();
-      if (!done && queue.length === 0 && total() <= threshold) call('onbufferedamountlow', new Event('bufferedamountlow'));
+      if (!done && queue.length === 0 && total() <= threshold && !call('onbufferedamountlow', new Event('bufferedamountlow'))) fail('Peer handler failed.');
     });
     listen('message', event => {
       if (done) return;
@@ -119,7 +126,7 @@ export function createBoundedRtcRuntime(options: Options) {
         fail('Invalid peer frame.');
         return;
       }
-      if (message) call('onmessage', new MessageEvent('message', { data: message.buffer.slice(message.byteOffset, message.byteOffset + message.byteLength) }));
+      if (message && !call('onmessage', new MessageEvent('message', { data: message.buffer.slice(message.byteOffset, message.byteOffset + message.byteLength) }))) fail('Peer message handler failed.');
     });
     if (channel.readyState === 'open') { opened = true; openCount++; changed(); }
     return api;
@@ -128,19 +135,28 @@ export function createBoundedRtcRuntime(options: Options) {
   class GuardedPeerConnection extends NativePc {
     #handler: Handler = null;
     #done = false;
+    #channels = 0;
     constructor(config?: RTCConfiguration) {
       if (closed) throw new Error('RTC runtime is closed.');
       if (connections.size >= NATIVE_REMOTE_CONNECTIONS) throw new Error('Too many peer connections.');
       super(config);
       connections.add(this);
       this.addEventListener('datachannel', (event: any) => {
+        if (this.#channels >= 1) {
+          report('Peer opened too many channels.');
+          try { event.channel.close(); } catch { /* already closed */ }
+          return;
+        }
+        this.#channels++;
         const wrapped = wrapChannel(event.channel);
-        try { this.#handler?.({ channel: wrapped }); } catch { report('Peer message handler failed.'); }
+        try { this.#handler?.({ channel: wrapped }); } catch { report('Peer message handler failed.'); wrapped.shutdown(); }
       });
     }
     get ondatachannel(): Handler { return this.#handler; }
     set ondatachannel(fn: Handler) { this.#handler = fn; }
     createDataChannel(label: string, init?: RTCDataChannelInit) {
+      if (this.#channels >= 1) throw new Error('Only one data channel is allowed per connection.');
+      this.#channels++;
       return wrapChannel(super.createDataChannel(label, init));
     }
     close() {

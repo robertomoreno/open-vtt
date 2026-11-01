@@ -41,48 +41,63 @@ type Transfer = { count: number; startedAt: number; parts: Map<number, Uint8Arra
 
 export function createBinaryAssembler(now: () => number, budget: InboundBudget) {
   const transfers = new Map<number, Transfer>();
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const cancel = () => { if (timer !== undefined) { clearTimeout(timer); timer = undefined; } };
+  const expire = () => {
+    const time = now();
+    for (const [id, transfer] of [...transfers]) if (time - transfer.startedAt > TRANSFER_TIMEOUT_MS) drop(id);
+  };
+  const schedule = () => {
+    cancel();
+    if (transfers.size === 0) return;
+    const earliest = Math.min(...[...transfers.values()].map(transfer => transfer.startedAt));
+    timer = setTimeout(() => { timer = undefined; expire(); schedule(); }, Math.max(0, earliest + TRANSFER_TIMEOUT_MS + 1 - now()));
+  };
   const drop = (id: number) => {
     const transfer = transfers.get(id);
     if (transfer) { budget.release(transfer.bytes); transfers.delete(id); }
   };
   return {
     accept(frame: Uint8Array): Uint8Array | undefined {
-      check(frame.byteLength >= FRAME_HEADER_BYTES && frame.byteLength <= FRAME_BYTES, 'Invalid frame size.');
-      const view = new DataView(frame.buffer, frame.byteOffset, frame.byteLength);
-      check(view.getUint32(0) === MAGIC && view.getUint8(4) === VERSION && view.getUint8(5) === 0, 'Invalid frame header.');
-      const id = view.getUint32(6), index = view.getUint16(10), count = view.getUint16(12), length = view.getUint16(14);
-      check(count >= 1 && count <= MESSAGE_CHUNKS && index < count, 'Invalid frame index.');
-      check(length === frame.byteLength - FRAME_HEADER_BYTES, 'Invalid frame length.');
-      const time = now();
-      let expired = false;
-      for (const [other, transfer] of [...transfers]) {
-        if (time - transfer.startedAt > TRANSFER_TIMEOUT_MS) { drop(other); if (other === id) expired = true; }
-      }
-      check(!expired, 'Transfer expired.');
-      let transfer = transfers.get(id);
-      if (!transfer) {
-        check(transfers.size < INCOMPLETE_TRANSFERS, 'Too many incomplete transfers.');
-        transfer = { count, startedAt: time, parts: new Map(), bytes: 0 };
-        transfers.set(id, transfer);
-      }
-      try {
-        check(transfer.count === count, 'Inconsistent fragment count.');
-        check(!transfer.parts.has(index), 'Duplicate fragment.');
-        check(transfer.bytes + length <= MESSAGE_BYTES, 'Message is too large.');
-        budget.reserve(length);
-      } catch (error) {
-        drop(id);
-        throw error;
-      }
-      transfer.bytes += length;
-      transfer.parts.set(index, frame.slice(FRAME_HEADER_BYTES));
-      if (transfer.parts.size < transfer.count) return undefined;
-      const result = new Uint8Array(transfer.bytes);
-      let offset = 0;
-      for (let i = 0; i < transfer.count; i++) { const part = transfer.parts.get(i)!; result.set(part, offset); offset += part.byteLength; }
-      drop(id);
-      return result;
+      try { return accept(frame); } finally { schedule(); }
     },
-    clear() { for (const id of [...transfers.keys()]) drop(id); },
+    clear() { cancel(); for (const id of [...transfers.keys()]) drop(id); },
   };
+  function accept(frame: Uint8Array): Uint8Array | undefined {
+    check(frame.byteLength >= FRAME_HEADER_BYTES && frame.byteLength <= FRAME_BYTES, 'Invalid frame size.');
+    const view = new DataView(frame.buffer, frame.byteOffset, frame.byteLength);
+    check(view.getUint32(0) === MAGIC && view.getUint8(4) === VERSION && view.getUint8(5) === 0, 'Invalid frame header.');
+    const id = view.getUint32(6), index = view.getUint16(10), count = view.getUint16(12), length = view.getUint16(14);
+    check(count >= 1 && count <= MESSAGE_CHUNKS && index < count, 'Invalid frame index.');
+    check(length === frame.byteLength - FRAME_HEADER_BYTES, 'Invalid frame length.');
+    const time = now();
+    let expired = false;
+    for (const [other, transfer] of [...transfers]) {
+      if (time - transfer.startedAt > TRANSFER_TIMEOUT_MS) { drop(other); if (other === id) expired = true; }
+    }
+    check(!expired, 'Transfer expired.');
+    let transfer = transfers.get(id);
+    if (!transfer) {
+      check(transfers.size < INCOMPLETE_TRANSFERS, 'Too many incomplete transfers.');
+      transfer = { count, startedAt: time, parts: new Map(), bytes: 0 };
+      transfers.set(id, transfer);
+    }
+    try {
+      check(transfer.count === count, 'Inconsistent fragment count.');
+      check(!transfer.parts.has(index), 'Duplicate fragment.');
+      check(transfer.bytes + length <= MESSAGE_BYTES, 'Message is too large.');
+      budget.reserve(length);
+    } catch (error) {
+      drop(id);
+      throw error;
+    }
+    transfer.bytes += length;
+    transfer.parts.set(index, frame.slice(FRAME_HEADER_BYTES));
+    if (transfer.parts.size < transfer.count) return undefined;
+    const result = new Uint8Array(transfer.bytes);
+    let offset = 0;
+    for (let i = 0; i < transfer.count; i++) { const part = transfer.parts.get(i)!; result.set(part, offset); offset += part.byteLength; }
+    drop(id);
+    return result;
+  }
 }

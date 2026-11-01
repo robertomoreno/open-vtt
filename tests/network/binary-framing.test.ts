@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { createBinaryAssembler, createInboundBudget, encodeBinaryFrames } from '../../src/network/binary-framing';
 
 const MiB = 1024 * 1024;
@@ -10,6 +10,9 @@ function header(frame: Uint8Array, patch: (view: DataView) => void): Uint8Array 
 }
 
 describe('binary framing', () => {
+  beforeEach(() => { vi.useFakeTimers(); });
+  afterEach(() => { vi.useRealTimers(); });
+
   it('frames and exactly reassembles a 2-MiB binary sync message', () => {
     const bytes = new Uint8Array(2 * MiB).fill(7);
     const assembler = createBinaryAssembler(() => 0, createInboundBudget());
@@ -107,6 +110,39 @@ describe('binary framing', () => {
     expect(assembler.accept(second)).toBeUndefined();
     now = 10_001;
     expect(() => assembler.accept(third)).toThrow();
+    expect(budget.reserved()).toBe(0);
+  });
+
+  it('expires and releases an idle incomplete transfer at 10,001 ms with no further input, then leaves no timer', () => {
+    const budget = createInboundBudget();
+    const assembler = createBinaryAssembler(() => Date.now(), budget);
+    assembler.accept(frames(new Uint8Array(40_000), 1)[0]);
+    expect(budget.reserved()).toBe(16_368);
+    vi.advanceTimersByTime(10_000);
+    expect(budget.reserved()).toBe(16_368);
+    vi.advanceTimersByTime(1);
+    expect(budget.reserved()).toBe(0);
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it('clear() cancels the expiry timer and releases reservations', () => {
+    const budget = createInboundBudget();
+    const assembler = createBinaryAssembler(() => Date.now(), budget);
+    assembler.accept(frames(new Uint8Array(40_000), 1)[0]);
+    assembler.clear();
+    expect(budget.reserved()).toBe(0);
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it('expires each incomplete transfer by its own start time', () => {
+    const budget = createInboundBudget();
+    const assembler = createBinaryAssembler(() => Date.now(), budget);
+    assembler.accept(frames(new Uint8Array(40_000), 1)[0]);
+    vi.advanceTimersByTime(6_000);
+    assembler.accept(frames(new Uint8Array(40_000), 2)[0]);
+    vi.advanceTimersByTime(4_001);
+    expect(budget.reserved()).toBe(16_368);
+    vi.advanceTimersByTime(6_000);
     expect(budget.reserved()).toBe(0);
   });
 });

@@ -26,7 +26,7 @@ class FakePc extends EventTarget {
 const native = { RTCPeerConnection: FakePc, RTCSessionDescription: class {}, RTCIceCandidate: class {} } as unknown as RtcConstructors;
 const make = (errors: string[] = []) => {
   const changes = { n: 0 };
-  const runtime = createBoundedRtcRuntime({ native, now: () => 0, onChange: () => { changes.n++; }, onError: m => errors.push(m) });
+  const runtime = createBoundedRtcRuntime({ native, now: () => Date.now(), onChange: () => { changes.n++; }, onError: m => errors.push(m) });
   return { runtime, changes, errors };
 };
 const frame = (n: number) => [...encodeBinaryFrames(new Uint8Array(n).fill(3), 1)];
@@ -72,13 +72,74 @@ describe('bounded RTC runtime', () => {
     expect(n.sent.length).toBeGreaterThan(before);
   });
 
-  it('rejects sends that exceed the per-connection queue, and over-2MiB messages', () => {
+  it('never exceeds the 1 MiB native buffer: the next frame must fit', () => {
     const { runtime } = make();
     const ch = new runtime.wrtc.RTCPeerConnection().createDataChannel('x');
-    FakePc.all[0].channels[0].open();
-    expect(() => ch.send(new Uint8Array(2 * 1024 * 1024 + 1))).toThrow();
+    const n = FakePc.all[0].channels[0]; n.open();
+    n.bufferedAmount = 1_040_000;
+    ch.send(new Uint8Array(40_000));
+    expect(n.sent).toHaveLength(0);
+    n.bufferedAmount = 1_048_576 - 16_384;
+    n.dispatchEvent(new Event('bufferedamountlow'));
+    expect(n.sent).toHaveLength(1);
+    expect(n.bufferedAmount).toBe(1_048_576);
+    n.drain();
+    expect(n.sent).toHaveLength(3);
+  });
+
+  it('fails the connection (native close + onclose to the owner) when a send overflows the queue, instead of silently dropping', () => {
+    const errors: string[] = [];
+    const { runtime } = make(errors);
+    const ch = new runtime.wrtc.RTCPeerConnection().createDataChannel('x');
+    const n = FakePc.all[0].channels[0]; n.open();
+    let closes = 0; ch.onclose = () => { closes++; };
     ch.send(new Uint8Array(2 * 1024 * 1024)); ch.send(new Uint8Array(2 * 1024 * 1024));
     expect(() => ch.send(new Uint8Array(1024))).toThrow();
+    expect(n.closed).toBe(1);
+    expect(closes).toBe(1);
+    expect(runtime.getOpenCount()).toBe(0);
+    expect(errors).toEqual(['Outbound queue is full.']);
+  });
+
+  it('fails the connection for an over-2MiB send', () => {
+    const { runtime } = make();
+    const ch = new runtime.wrtc.RTCPeerConnection().createDataChannel('x');
+    const n = FakePc.all[0].channels[0]; n.open();
+    let closes = 0; ch.onclose = () => { closes++; };
+    expect(() => ch.send(new Uint8Array(2 * 1024 * 1024 + 1))).toThrow();
+    expect(n.closed).toBe(1);
+    expect(closes).toBe(1);
+  });
+
+  it('allows one data channel per connection and closes excess local and remote channels', () => {
+    const errors: string[] = [];
+    const { runtime } = make(errors);
+    const pc = new runtime.wrtc.RTCPeerConnection();
+    const first = pc.createDataChannel('x');
+    expect(() => pc.createDataChannel('y')).toThrow();
+    const seenChannels: unknown[] = [];
+    pc.ondatachannel = (e: any) => seenChannels.push(e.channel);
+    const extra = new FakeChannel();
+    FakePc.all[0].incoming(extra);
+    expect(extra.closed).toBe(1);
+    expect(seenChannels).toHaveLength(0);
+    expect(errors).toEqual(['Peer opened too many channels.']);
+    FakePc.all[0].channels[0].open();
+    first.send(new Uint8Array(3));
+    expect(FakePc.all[0].channels[0].sent).toHaveLength(1);
+  });
+
+  it('releases pending inbound bytes of a silent peer after 10,001 ms and leaves no timers after close', () => {
+    vi.useFakeTimers();
+    const { runtime } = make();
+    const pc = new runtime.wrtc.RTCPeerConnection();
+    pc.createDataChannel('x');
+    const n = FakePc.all[0].channels[0]; n.open();
+    n.receive(frame(40_000)[0]);
+    expect(vi.getTimerCount()).toBe(1);
+    vi.advanceTimersByTime(10_001);
+    expect(vi.getTimerCount()).toBe(0);
+    runtime.close();
   });
 
   it('isolates an invalid frame to the peer that sent it', () => {
@@ -88,25 +149,33 @@ describe('bounded RTC runtime', () => {
     const ca = a.createDataChannel('x'), cb = b.createDataChannel('x');
     const [na, nb] = FakePc.all.map(p => p.channels[0]); na.open(); nb.open();
     const gotA: unknown[] = [], gotB: unknown[] = [];
+    let closedA = 0; ca.onclose = () => { closedA++; };
     ca.onmessage = (e: MessageEvent) => gotA.push(e.data); cb.onmessage = (e: MessageEvent) => gotB.push(e.data);
     na.receive(new Uint8Array(40));
     expect(errors).toEqual(['Invalid peer frame.']);
     expect(na.closed).toBe(1);
+    expect(closedA).toBe(1);
+    expect(runtime.getOpenCount()).toBe(1);
     expect(nb.closed).toBe(0);
     for (const f of frame(10)) nb.receive(f);
     expect(gotB).toHaveLength(1);
     expect(gotA).toHaveLength(0);
   });
 
-  it('survives a throwing message listener without breaking the channel', () => {
+  it('closes the channel and notifies the owner when the message listener throws, with no timers left', () => {
+    vi.useFakeTimers();
     const errors: string[] = [];
     const { runtime } = make(errors);
     const ch = new runtime.wrtc.RTCPeerConnection().createDataChannel('x');
     const n = FakePc.all[0].channels[0]; n.open();
+    let closes = 0; ch.onclose = () => { closes++; };
     ch.onmessage = () => { throw new Error('secret-listener-detail'); };
     expect(() => frame(5).forEach(f => n.receive(f))).not.toThrow();
     expect(errors).toEqual(['Peer message handler failed.']);
-    expect(n.closed).toBe(0);
+    expect(n.closed).toBe(1);
+    expect(closes).toBe(1);
+    expect(runtime.getOpenCount()).toBe(0);
+    expect(vi.getTimerCount()).toBe(0);
   });
 
   it('closes unordered or lossy channels', () => {

@@ -15,7 +15,8 @@ export type RoomTransportView = {
 export type RoomTransport = { getView(): RoomTransportView; subscribe(fn: () => void): () => void; close(): void };
 
 const participantPattern = /^[A-Za-z0-9_-]{1,64}$/;
-const activeRooms = new Set<string>();
+type RoomLock = { settled: Promise<void> | null; resolve?: () => void };
+const roomLocks = new Map<string, RoomLock>();
 
 export type RoomTransportOptions = { awareness?: Awareness };
 
@@ -31,7 +32,10 @@ export function createRoomTransport(doc: Y.Doc, link: RoomLink, participantId: s
   let provider: any;
   let heartbeat: ReturnType<typeof setInterval> | undefined;
   let view: RoomTransportView | undefined;
-  let ownsRoom = false;
+  let lock: RoomLock | undefined;
+  let previous: Promise<void> | null = null;
+  let opened = false;
+  let started = false;
 
   const notify = () => { view = undefined; for (const fn of [...listeners]) fn(); };
   const fail = (message: string) => {
@@ -45,25 +49,36 @@ export function createRoomTransport(doc: Y.Doc, link: RoomLink, participantId: s
   if (unsupported) {
     phase = 'failed';
     error = 'This browser does not support WebRTC data channels, WebSocket signaling, or secure-context cryptography.';
-  } else if (activeRooms.has(roomName)) {
+  } else if (roomLocks.get(roomName) && !roomLocks.get(roomName)!.settled) {
     phase = 'failed';
     error = 'This room is already open in this page.';
   } else {
-    activeRooms.add(roomName);
-    ownsRoom = true;
+    previous = roomLocks.get(roomName)?.settled ?? null;
+    lock = { settled: null };
+    roomLocks.set(roomName, lock);
     void start();
   }
 
+  function release() {
+    if (!lock) return;
+    if (roomLocks.get(roomName) === lock) roomLocks.delete(roomName);
+    lock.resolve?.();
+  }
+
   async function start() {
+    started = true;
+    if (previous) await previous;
+    if (closed) { release(); return; }
     let module: typeof import('y-webrtc');
     let protocols: typeof import('y-protocols/awareness');
     try {
       [module, protocols] = await Promise.all([import('y-webrtc'), import('y-protocols/awareness')]);
     } catch {
       fail('The room transport could not be loaded.');
+      release();
       return;
     }
-    if (closed) return;
+    if (closed) { release(); return; }
     runtime = createBoundedRtcRuntime({ now: () => Date.now(), onChange: notify, onError: fail });
     try {
       provider = new module.WebrtcProvider(roomName, doc, {
@@ -75,6 +90,7 @@ export function createRoomTransport(doc: Y.Doc, link: RoomLink, participantId: s
       });
     } catch {
       fail('The room transport could not start.');
+      release();
       return;
     }
     const awareness = provider.awareness;
@@ -96,24 +112,28 @@ export function createRoomTransport(doc: Y.Doc, link: RoomLink, participantId: s
       }
       if (reject.length > 0) protocols.removeAwarenessStates(awareness, reject, 'gather-bounds');
     };
+    // y-protocols keeps per-client clock metadata after a state is removed; prune it (after y-webrtc's own update handler has encoded removals).
+    const sweep = () => {
+      if (closed) return;
+      const live = awareness.getStates() as Map<number, unknown>;
+      for (const client of [...awareness.meta.keys()] as number[]) if (!live.has(client) && client !== awareness.clientID) awareness.meta.delete(client);
+    };
     awareness.on('update', ({ added, updated, removed }: { added: number[]; updated: number[]; removed: number[] }) => {
       if (closed) return;
       for (const client of removed) seen.delete(client);
       refresh([...added, ...updated]);
+      queueMicrotask(sweep);
       notify();
     });
-    provider.on('status', ({ connected }: { connected: boolean }) => {
-      if (closed) return;
-      phase = connected ? 'connected' : 'looking';
-      notify();
-    });
+    // status.connected only means discovery is enabled; the phase follows actual native channel opens instead.
+    provider.on('status', () => { opened = true; });
     provider.on('peers', ({ bcPeers }: { bcPeers: string[] }) => {
       if (closed) return;
       bcPeerCount = bcPeers.length;
       notify();
     });
     let beat = 0;
-    const announce = () => awareness.setLocalState({ id: participantId, beat: beat++ });
+    const announce = () => { awareness.setLocalState({ id: participantId, beat: beat++ }); sweep(); };
     announce();
     heartbeat = setInterval(announce, HEARTBEAT_MS);
   }
@@ -121,7 +141,7 @@ export function createRoomTransport(doc: Y.Doc, link: RoomLink, participantId: s
   return {
     getView() {
       view ??= {
-        phase,
+        phase: phase === 'looking' && (runtime?.getOpenCount() ?? 0) > 0 ? 'connected' : phase,
         openRtcConnections: runtime?.getOpenCount() ?? 0,
         bcPeerCount,
         presence: [...seen.values()].sort((a, b) => a.id.localeCompare(b.id)).map(entry => ({ ...entry })),
@@ -137,13 +157,20 @@ export function createRoomTransport(doc: Y.Doc, link: RoomLink, participantId: s
       if (closed) return;
       closed = true;
       if (heartbeat !== undefined) clearInterval(heartbeat);
+      if (lock) { const current = lock; current.settled = new Promise<void>(resolve => { current.resolve = resolve; }); }
       if (provider) {
-        provider.disconnect();
-        provider.destroy();
-        if (!options.awareness) provider.awareness.destroy();
-      }
+        const owned = provider;
+        owned.disconnect();
+        const finish = () => {
+          owned.destroy();
+          if (!options.awareness) owned.awareness.destroy();
+          // upstream waits for key derivation inside destroy(); release the lock only after that microtask has run
+          queueMicrotask(release);
+        };
+        // before the key resolves upstream has no room yet; wait for its first status event so destroy() tears down the room it opens
+        if (opened) finish(); else owned.once('status', finish);
+      } else if (!started) release();
       runtime?.close();
-      if (ownsRoom) activeRooms.delete(roomName);
       phase = 'closed';
       seen.clear();
       bcPeerCount = 0;

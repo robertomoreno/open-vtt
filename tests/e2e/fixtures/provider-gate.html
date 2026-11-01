@@ -4,6 +4,7 @@
 <label>Room link <input id="link" autocomplete="off"></label>
 <label>Participant <input id="participant" value="p"></label>
 <button id="connect" type="button">Connect</button>
+<label>Seed <input id="seed" value="7"></label>
 <label>Value <input id="small-value" autocomplete="off"></label>
 <button id="publish" type="button">Publish value</button>
 <button id="publish-large" type="button">Publish large value</button>
@@ -11,7 +12,7 @@
 <p>Phase: <output id="phase">idle</output></p>
 <p>Native opens: <output id="opens">0</output></p>
 <p>Received: <output id="received"></output></p>
-<p>Large received: <output id="large"></output></p>
+<div id="larges"></div>
 <p>Error: <output id="error"></output></p>
 </main>
 <script type="module" src="./provider-gate.ts"></script>
