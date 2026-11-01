@@ -1,7 +1,29 @@
-import { describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import { parseSignalingUrls, rtcConfiguration, roomNetworkConfig } from '../../src/network/config';
 
 describe('network configuration', () => {
+  afterEach(() => {
+    vi.unstubAllEnvs();
+    vi.resetModules();
+  });
+
+  it('defaults to the required initial signaling candidate', async () => {
+    vi.stubEnv('VITE_GATHER_SIGNALING_URLS', '');
+    const config = await import('../../src/network/config');
+    expect(config.roomNetworkConfig.signaling).toEqual(['wss://y-webrtc-eu.fly.dev']);
+  });
+
+  it('honors the VITE_GATHER_SIGNALING_URLS build-time override', async () => {
+    vi.stubEnv('VITE_GATHER_SIGNALING_URLS', 'wss://a.example.test,wss://b.example.test');
+    const config = await import('../../src/network/config');
+    expect(config.roomNetworkConfig.signaling).toEqual(['wss://a.example.test', 'wss://b.example.test']);
+  });
+
+  it('rejects an invalid VITE_GATHER_SIGNALING_URLS override at load time', async () => {
+    vi.stubEnv('VITE_GATHER_SIGNALING_URLS', 'ws://insecure.example.test');
+    await expect(import('../../src/network/config')).rejects.toThrow();
+  });
+
   it('uses explicit STUN-only ICE', () => {
     const urls = roomNetworkConfig.rtc.iceServers?.flatMap(server => server.urls) ?? [];
     expect(urls.length).toBeGreaterThan(0);

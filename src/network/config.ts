@@ -4,7 +4,7 @@ import { SIGNALING_URL_LIMIT } from './limits';
 // Public STUN discovers network addresses; it never relays gameplay. No TURN.
 export const rtcConfiguration: RTCConfiguration = {iceServers:[{urls:['stun:stun.l.google.com:19302','stun:stun1.l.google.com:19302']}]};
 
-const defaultSignalingUrls = 'wss://signaling.yjs.dev';
+const defaultSignalingUrls = 'wss://y-webrtc-eu.fly.dev';
 
 export function parseSignalingUrls(input: string): string[] {
   const urls = input.split(',').map(url => url.trim()).filter(Boolean);
@@ -22,6 +22,6 @@ export function parseSignalingUrls(input: string): string[] {
 }
 
 export const roomNetworkConfig: { signaling: string[]; rtc: RTCConfiguration } = {
-  signaling: parseSignalingUrls(import.meta.env.VITE_SIGNALING_URLS || defaultSignalingUrls),
+  signaling: parseSignalingUrls(import.meta.env.VITE_GATHER_SIGNALING_URLS || defaultSignalingUrls),
   rtc: rtcConfiguration,
 };
