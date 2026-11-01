@@ -22,3 +22,7 @@ The public endpoint is intermittently unresponsive from this network. Between ab
 - Upstream y-webrtc applies remote Yjs updates before application observers run; nothing here claims input is validated before entering the transient document. This task does not bridge to a validated durable workspace.
 - `provider.connected`/phase `connected` means discovery is enabled. Native opens are reported separately by the guarded runtime.
 - `WebrtcProvider.destroy()` does not close signaling sockets; `close()` calls `disconnect()` then `destroy()` and then destroys awareness and the RTC runtime.
+
+## Amendment: retained awareness bounds (after the first gate run)
+
+`y-protocols` stores a remote awareness state before emitting `update`; the 2-MiB message/frame bounds remain the pre-parse guard. `room.ts` now removes invalid, over-8-KiB (UTF-8 bytes) and over-32-participant remote states from retained awareness via the public `removeAwarenessStates`, and keeps valid local/remote states. `y-protocols` is now a declared direct dependency (1.0.7, already installed transitively). Because `room.ts` changed, the Chromium↔WebKit gate was rerun: one run at ~13:06 UTC (first run after the new dependency import) had chromium→webkit fail a `toHaveText` assertion, which I did not diagnose (possibly the endpoint or a first-load Vite dependency re-optimisation; unconfirmed); one further run hung and was killed; later runs at ~13:23 and ~13:40 UTC passed 2/2. The same two cases only; no wider claim.

@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import * as Y from 'yjs';
+import { Awareness, applyAwarenessUpdate, encodeAwarenessUpdate } from 'y-protocols/awareness';
 import { createRoomLink } from '../../src/network/room-link';
 import { createRoomTransport } from '../../src/network/room';
 
@@ -81,5 +82,68 @@ describe('room transport', () => {
     t.close();
     expect(vi.getTimerCount()).toBe(0);
     vi.useRealTimers();
+  });
+
+  describe('retained awareness bounds', () => {
+    const stub = () => {
+      vi.stubGlobal('RTCPeerConnection', FakePc);
+      vi.stubGlobal('RTCSessionDescription', class {});
+      vi.stubGlobal('RTCIceCandidate', class {});
+      vi.stubGlobal('WebSocket', FakeSocket);
+    };
+    const remote = (awareness: Awareness, state: unknown) => {
+      const other = new Awareness(new Y.Doc());
+      other.setLocalState(state as Record<string, unknown>);
+      applyAwarenessUpdate(awareness, encodeAwarenessUpdate(other, [other.clientID]), 'test');
+      const id = other.clientID;
+      other.destroy();
+      return id;
+    };
+    const connect = async () => {
+      stub();
+      const doc = new Y.Doc();
+      const awareness = new Awareness(doc);
+      const t = createRoomTransport(doc, link(), 'local', { awareness });
+      await vi.waitFor(() => expect(t.getView().phase).toBe('connected'));
+      return { t, awareness };
+    };
+
+    it('keeps valid remote states and drops invalid or oversized ones from retained state and presence', async () => {
+      const { t, awareness } = await connect();
+      const good = remote(awareness, { id: 'good-peer' });
+      const badId = remote(awareness, { id: 'has space!' });
+      const noId = remote(awareness, { name: 'x' });
+      const huge = remote(awareness, { id: 'huge', pad: 'x'.repeat(8 * 1024) });
+      const multibyte = remote(awareness, { id: 'wide', pad: '€'.repeat(3000) });
+      const states = awareness.getStates();
+      expect(states.has(good)).toBe(true);
+      for (const gone of [badId, noId, huge, multibyte]) expect(states.has(gone)).toBe(false);
+      expect(t.getView().presence.map(p => p.id)).toEqual(['good-peer', 'local']);
+      t.close();
+      awareness.destroy();
+    });
+
+    it('accepts a state of exactly 8 KiB of UTF-8 and rejects one byte more', async () => {
+      const { t, awareness } = await connect();
+      const base = JSON.stringify({ id: 'edge', pad: '' }).length;
+      const exact = remote(awareness, { id: 'edge', pad: 'x'.repeat(8192 - base) });
+      const over = remote(awareness, { id: 'over', pad: 'x'.repeat(8192 - base + 1) });
+      expect(awareness.getStates().has(exact)).toBe(true);
+      expect(awareness.getStates().has(over)).toBe(false);
+      t.close();
+      awareness.destroy();
+    });
+
+    it('retains at most 32 participants including local and keeps the earliest admitted', async () => {
+      const { t, awareness } = await connect();
+      const ids = Array.from({ length: 33 }, (_, i) => remote(awareness, { id: `peer-${String(i).padStart(2, '0')}` }));
+      const retained = ids.filter(id => awareness.getStates().has(id));
+      expect(retained).toEqual(ids.slice(0, 31));
+      expect(awareness.getStates().size).toBe(32);
+      expect(awareness.getStates().has(awareness.clientID)).toBe(true);
+      expect(t.getView().presence).toHaveLength(32);
+      t.close();
+      awareness.destroy();
+    });
   });
 });

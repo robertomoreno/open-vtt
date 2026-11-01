@@ -1,3 +1,4 @@
+import type { Awareness } from 'y-protocols/awareness';
 import type * as Y from 'yjs';
 import { ADMITTED_PARTICIPANTS, AWARENESS_BYTES, HEARTBEAT_MS, NATIVE_REMOTE_CONNECTIONS } from './limits';
 import { roomNetworkConfig } from './config';
@@ -16,7 +17,9 @@ export type RoomTransport = { getView(): RoomTransportView; subscribe(fn: () => 
 const participantPattern = /^[A-Za-z0-9_-]{1,64}$/;
 const activeRooms = new Set<string>();
 
-export function createRoomTransport(doc: Y.Doc, link: RoomLink, participantId: string): RoomTransport {
+export type RoomTransportOptions = { awareness?: Awareness };
+
+export function createRoomTransport(doc: Y.Doc, link: RoomLink, participantId: string, options: RoomTransportOptions = {}): RoomTransport {
   const roomName = 'gather-v2:' + link.roomId;
   const listeners = new Set<() => void>();
   const seen = new Map<number, { id: string; seenAt: number }>();
@@ -53,8 +56,9 @@ export function createRoomTransport(doc: Y.Doc, link: RoomLink, participantId: s
 
   async function start() {
     let module: typeof import('y-webrtc');
+    let protocols: typeof import('y-protocols/awareness');
     try {
-      module = await import('y-webrtc');
+      [module, protocols] = await Promise.all([import('y-webrtc'), import('y-protocols/awareness')]);
     } catch {
       fail('The room transport could not be loaded.');
       return;
@@ -64,6 +68,7 @@ export function createRoomTransport(doc: Y.Doc, link: RoomLink, participantId: s
     try {
       provider = new module.WebrtcProvider(roomName, doc, {
         password: link.secret,
+        awareness: options.awareness ?? new protocols.Awareness(doc),
         signaling: roomNetworkConfig.signaling,
         maxConns: NATIVE_REMOTE_CONNECTIONS,
         peerOpts: { wrtc: runtime.wrtc, config: roomNetworkConfig.rtc },
@@ -73,15 +78,23 @@ export function createRoomTransport(doc: Y.Doc, link: RoomLink, participantId: s
       return;
     }
     const awareness = provider.awareness;
+    const encoder = new TextEncoder();
+    // y-protocols stores remote states before it emits 'update'; enforce retained-state bounds here.
     const refresh = (clients: number[]) => {
       const states = awareness.getStates() as Map<number, unknown>;
+      const reject: number[] = [];
       for (const client of clients) {
         const state = states.get(client) as { id?: unknown } | undefined;
-        const valid = state && typeof state.id === 'string' && participantPattern.test(state.id) && JSON.stringify(state).length <= AWARENESS_BYTES;
-        if (!valid) { seen.delete(client); continue; }
-        if (!seen.has(client) && seen.size >= ADMITTED_PARTICIPANTS) continue;
-        seen.set(client, { id: state.id as string, seenAt: Date.now() });
+        const valid = state !== undefined && state !== null && typeof state.id === 'string' && participantPattern.test(state.id) && encoder.encode(JSON.stringify(state)).byteLength <= AWARENESS_BYTES;
+        const admitted = valid && (seen.has(client) || seen.size < ADMITTED_PARTICIPANTS);
+        if (admitted) {
+          seen.set(client, { id: state.id as string, seenAt: Date.now() });
+        } else {
+          seen.delete(client);
+          if (state !== undefined && client !== awareness.clientID) reject.push(client);
+        }
       }
+      if (reject.length > 0) protocols.removeAwarenessStates(awareness, reject, 'gather-bounds');
     };
     awareness.on('update', ({ added, updated, removed }: { added: number[]; updated: number[]; removed: number[] }) => {
       if (closed) return;
@@ -127,7 +140,7 @@ export function createRoomTransport(doc: Y.Doc, link: RoomLink, participantId: s
       if (provider) {
         provider.disconnect();
         provider.destroy();
-        provider.awareness.destroy();
+        if (!options.awareness) provider.awareness.destroy();
       }
       runtime?.close();
       if (ownsRoom) activeRooms.delete(roomName);
