@@ -39,19 +39,21 @@ export function* encodeBinaryFrames(data: Uint8Array, transferId: number): Itera
 
 type Transfer = { count: number; startedAt: number; parts: Map<number, Uint8Array>; bytes: number };
 
-export function createBinaryAssembler(now: () => number, budget: InboundBudget) {
+export function createBinaryAssembler(now: () => number, budget: InboundBudget, onExpire?: () => void) {
   const transfers = new Map<number, Transfer>();
   let timer: ReturnType<typeof setTimeout> | undefined;
   const cancel = () => { if (timer !== undefined) { clearTimeout(timer); timer = undefined; } };
-  const expire = () => {
+  const expire = (): boolean => {
     const time = now();
-    for (const [id, transfer] of [...transfers]) if (time - transfer.startedAt > TRANSFER_TIMEOUT_MS) drop(id);
+    let any = false;
+    for (const [id, transfer] of [...transfers]) if (time - transfer.startedAt > TRANSFER_TIMEOUT_MS) { drop(id); any = true; }
+    return any;
   };
   const schedule = () => {
     cancel();
     if (transfers.size === 0) return;
     const earliest = Math.min(...[...transfers.values()].map(transfer => transfer.startedAt));
-    timer = setTimeout(() => { timer = undefined; expire(); schedule(); }, Math.max(0, earliest + TRANSFER_TIMEOUT_MS + 1 - now()));
+    timer = setTimeout(() => { timer = undefined; const any = expire(); schedule(); if (any) onExpire?.(); }, Math.max(0, earliest + TRANSFER_TIMEOUT_MS + 1 - now()));
   };
   const drop = (id: number) => {
     const transfer = transfers.get(id);
@@ -71,11 +73,7 @@ export function createBinaryAssembler(now: () => number, budget: InboundBudget) 
     check(count >= 1 && count <= MESSAGE_CHUNKS && index < count, 'Invalid frame index.');
     check(length === frame.byteLength - FRAME_HEADER_BYTES, 'Invalid frame length.');
     const time = now();
-    let expired = false;
-    for (const [other, transfer] of [...transfers]) {
-      if (time - transfer.startedAt > TRANSFER_TIMEOUT_MS) { drop(other); if (other === id) expired = true; }
-    }
-    check(!expired, 'Transfer expired.');
+    check(!expire(), 'Transfer expired.');
     let transfer = transfers.get(id);
     if (!transfer) {
       check(transfers.size < INCOMPLETE_TRANSFERS, 'Too many incomplete transfers.');

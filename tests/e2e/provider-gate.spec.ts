@@ -47,8 +47,7 @@ for (const [a, b] of [['chromium', 'webkit'], ['webkit', 'chromium']]) {
         await page.getByRole('button', { name: 'Publish large value' }).click();
       };
       const exactLarge = async (page: Page, key: string, seed: number) => {
-        await expect(page.locator(`[data-large="${key}"]`)).toBeAttached({ timeout: 30_000 });
-        expect(await page.locator(`[data-large="${key}"]`).textContent()).toBe(expectedLarge(seed));
+        await expect(page.locator(`[data-large="${key}"]`)).toHaveText(expectedLarge(seed), { timeout: 30_000 });
       };
 
       await publish(pageA, 'hello-from-a');
@@ -64,6 +63,8 @@ for (const [a, b] of [['chromium', 'webkit'], ['webkit', 'chromium']]) {
       await expect(pageB.locator('#received')).toContainText('small-alice=after-closed-from-a');
       await publishLarge(pageB, 11);
       await exactLarge(pageA, 'large-bob', 11);
+      await publishLarge(pageA, 13);
+      await exactLarge(pageB, 'large-alice', 13);
       await expect(opens(pageA)).not.toHaveText('0');
       await expect(opens(pageB)).not.toHaveText('0');
 

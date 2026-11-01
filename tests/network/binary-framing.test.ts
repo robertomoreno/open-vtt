@@ -145,4 +145,26 @@ describe('binary framing', () => {
     vi.advanceTimersByTime(6_000);
     expect(budget.reserved()).toBe(0);
   });
+
+  it('signals the owner exactly once when a transfer expires with no further input', () => {
+    const budget = createInboundBudget();
+    let expired = 0;
+    const assembler = createBinaryAssembler(() => Date.now(), budget, () => { expired++; });
+    assembler.accept(frames(new Uint8Array(40_000), 1)[0]);
+    vi.advanceTimersByTime(10_000);
+    expect(expired).toBe(0);
+    vi.advanceTimersByTime(1);
+    expect(expired).toBe(1);
+    expect(budget.reserved()).toBe(0);
+    vi.advanceTimersByTime(60_000);
+    expect(expired).toBe(1);
+  });
+
+  it('fails the next frame when any other transfer expired, instead of silently dropping it', () => {
+    let now = 0;
+    const assembler = createBinaryAssembler(() => now, createInboundBudget());
+    assembler.accept(frames(new Uint8Array(40_000), 1)[0]);
+    now = 10_001;
+    expect(() => assembler.accept(frames(new Uint8Array(40_000), 2)[0])).toThrow();
+  });
 });

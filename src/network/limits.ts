@@ -33,3 +33,5 @@ export const ACTION_TOKEN_REFILL_PER_SECOND = 10;
 export const ROOM_LINK_INPUT_BYTES = 8 * KiB;
 export const ROOM_LINK_DESCRIPTOR_BYTES = 2 * KiB;
 export const SIGNALING_URL_LIMIT = 4;
+export const KEY_SETTLE_MS = 10_000;
+export const AWARENESS_TOMBSTONES = 64;

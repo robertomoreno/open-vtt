@@ -1,6 +1,6 @@
 import type { Awareness } from 'y-protocols/awareness';
 import type * as Y from 'yjs';
-import { ADMITTED_PARTICIPANTS, AWARENESS_BYTES, HEARTBEAT_MS, NATIVE_REMOTE_CONNECTIONS } from './limits';
+import { ADMITTED_PARTICIPANTS, AWARENESS_BYTES, AWARENESS_TOMBSTONES, HEARTBEAT_MS, KEY_SETTLE_MS, NATIVE_REMOTE_CONNECTIONS } from './limits';
 import { roomNetworkConfig } from './config';
 import type { RoomLink } from './room-link';
 import { createBoundedRtcRuntime } from './rtc-runtime';
@@ -38,6 +38,12 @@ export function createRoomTransport(doc: Y.Doc, link: RoomLink, participantId: s
   let started = false;
 
   const notify = () => { view = undefined; for (const fn of [...listeners]) fn(); };
+  // A guard failure closes only the offending peer; it must not mark the whole room failed while other channels are open.
+  const peerError = (message: string) => {
+    if (closed) return;
+    error = message;
+    notify();
+  };
   const fail = (message: string) => {
     if (closed) return;
     phase = 'failed';
@@ -79,7 +85,7 @@ export function createRoomTransport(doc: Y.Doc, link: RoomLink, participantId: s
       return;
     }
     if (closed) { release(); return; }
-    runtime = createBoundedRtcRuntime({ now: () => Date.now(), onChange: notify, onError: fail });
+    runtime = createBoundedRtcRuntime({ now: () => Date.now(), onChange: notify, onError: peerError });
     try {
       provider = new module.WebrtcProvider(roomName, doc, {
         password: link.secret,
@@ -112,17 +118,33 @@ export function createRoomTransport(doc: Y.Doc, link: RoomLink, participantId: s
       }
       if (reject.length > 0) protocols.removeAwarenessStates(awareness, reject, 'gather-bounds');
     };
-    // y-protocols keeps per-client clock metadata after a state is removed; prune it (after y-webrtc's own update handler has encoded removals).
-    const sweep = () => {
-      if (closed) return;
-      const live = awareness.getStates() as Map<number, unknown>;
-      for (const client of [...awareness.meta.keys()] as number[]) if (!live.has(client) && client !== awareness.clientID) awareness.meta.delete(client);
+    // y-protocols records a clock for every client it has ever seen, even with a null state and without emitting 'update'.
+    // Keep those clocks (they reject stale replays) but cap how many stateless ones are retained, at insertion time.
+    const states = awareness.getStates() as Map<number, unknown>;
+    const oldMeta = awareness.meta as Map<number, { clock: number; lastUpdated: number }>;
+    const trimMeta = (meta: Map<number, { clock: number; lastUpdated: number }>) => {
+      let stateless = 0;
+      for (const key of meta.keys()) if (!states.has(key) && key !== awareness.clientID) stateless++;
+      for (const key of [...meta.keys()]) {
+        if (stateless <= AWARENESS_TOMBSTONES) break;
+        if (!states.has(key) && key !== awareness.clientID) { meta.delete(key); stateless--; }
+      }
     };
+    const bounded = new class extends Map<number, { clock: number; lastUpdated: number }> {
+      override set(client: number, value: { clock: number; lastUpdated: number }) {
+        super.set(client, value);
+        trimMeta(this);
+        return this;
+      }
+    }();
+    for (const [client, value] of oldMeta) Map.prototype.set.call(bounded, client, value);
+    awareness.meta = bounded;
     awareness.on('update', ({ added, updated, removed }: { added: number[]; updated: number[]; removed: number[] }) => {
       if (closed) return;
       for (const client of removed) seen.delete(client);
       refresh([...added, ...updated]);
-      queueMicrotask(sweep);
+      // states rejected above became stateless; trim after y-webrtc's own update handler has encoded them
+      queueMicrotask(() => { if (!closed) trimMeta(awareness.meta); });
       notify();
     });
     // status.connected only means discovery is enabled; the phase follows actual native channel opens instead.
@@ -133,7 +155,7 @@ export function createRoomTransport(doc: Y.Doc, link: RoomLink, participantId: s
       notify();
     });
     let beat = 0;
-    const announce = () => { awareness.setLocalState({ id: participantId, beat: beat++ }); sweep(); };
+    const announce = () => { awareness.setLocalState({ id: participantId, beat: beat++ }); };
     announce();
     heartbeat = setInterval(announce, HEARTBEAT_MS);
   }
@@ -161,14 +183,20 @@ export function createRoomTransport(doc: Y.Doc, link: RoomLink, participantId: s
       if (provider) {
         const owned = provider;
         owned.disconnect();
+        let finished = false;
+        let deadline: ReturnType<typeof setTimeout> | undefined;
         const finish = () => {
+          if (finished) return;
+          finished = true;
+          if (deadline !== undefined) clearTimeout(deadline);
           owned.destroy();
           if (!options.awareness) owned.awareness.destroy();
           // upstream waits for key derivation inside destroy(); release the lock only after that microtask has run
           queueMicrotask(release);
         };
         // before the key resolves upstream has no room yet; wait for its first status event so destroy() tears down the room it opens
-        if (opened) finish(); else owned.once('status', finish);
+        // If key derivation fails or never settles upstream emits no status; force teardown after a deadline so the lock is not held forever.
+        if (opened) finish(); else { owned.once('status', finish); deadline = setTimeout(finish, KEY_SETTLE_MS); }
       } else if (!started) release();
       runtime?.close();
       phase = 'closed';

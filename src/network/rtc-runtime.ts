@@ -24,8 +24,9 @@ export function createBoundedRtcRuntime(options: Options) {
   const report = (message: string) => { if (!closed) options.onError(message); };
 
   function wrapChannel(channel: any) {
+    let pendingClose = false;
     const abort = new AbortController();
-    const assembler = createBinaryAssembler(options.now, inbound);
+    const assembler = createBinaryAssembler(options.now, inbound, () => fail('Peer transfer expired.'));
     const queue: Frames[] = [];
     let queued = 0;
     let transferId = 0;
@@ -36,6 +37,10 @@ export function createBoundedRtcRuntime(options: Options) {
 
     const call = (name: keyof typeof handlers, event: unknown): boolean => {
       try { handlers[name]?.(event); return true; } catch { return false; }
+    };
+    const notifyClose = (event: unknown) => {
+      if (handlers.onclose) call('onclose', event);
+      else pendingClose = true;
     };
     const markClosed = () => {
       if (opened) { opened = false; openCount--; }
@@ -55,7 +60,7 @@ export function createBoundedRtcRuntime(options: Options) {
       const wasDone = done;
       markClosed();
       try { channel.close(); } catch { /* already closed */ }
-      if (!wasDone) call('onclose', new Event('close'));
+      if (!wasDone) notifyClose(new Event('close'));
     };
     const pump = () => {
       while (!done && queue.length > 0 && channel.readyState === 'open') {
@@ -74,7 +79,7 @@ export function createBoundedRtcRuntime(options: Options) {
     const total = () => channel.bufferedAmount + queued;
 
     const api: any = {
-      shutdown() { markClosed(); try { channel.close(); } catch { /* already closed */ } },
+      shutdown() { const was = done; markClosed(); if (!was) { try { channel.close(); } catch { /* already closed */ } } },
       get label() { return channel.label; },
       get readyState() { return channel.readyState; },
       get bufferedAmount() { return total(); },
@@ -97,7 +102,14 @@ export function createBoundedRtcRuntime(options: Options) {
       close() { api.shutdown(); },
     };
     for (const name of Object.keys(handlers) as (keyof typeof handlers)[]) {
-      Object.defineProperty(api, name, { get: () => handlers[name], set: (fn: Handler) => { handlers[name] = fn; }, enumerable: true });
+      Object.defineProperty(api, name, {
+        get: () => handlers[name],
+        set: (fn: Handler) => {
+          handlers[name] = fn;
+          if (name === 'onclose' && fn && pendingClose) { pendingClose = false; queueMicrotask(() => call('onclose', new Event('close'))); }
+        },
+        enumerable: true,
+      });
     }
 
     const listen = (type: string, fn: (event: any) => void) => channel.addEventListener(type, fn, { signal: abort.signal });
@@ -109,7 +121,7 @@ export function createBoundedRtcRuntime(options: Options) {
     channel.binaryType = 'arraybuffer';
     channel.bufferedAmountLowThreshold = NATIVE_BUFFER_LOW_BYTES;
     listen('open', event => { if (done || opened) return; opened = true; openCount++; changed(); if (!call('onopen', event)) { fail('Peer handler failed.'); return; } pump(); });
-    listen('close', event => { const wasDone = done; markClosed(); if (!wasDone) call('onclose', event); });
+    listen('close', event => { const wasDone = done; markClosed(); if (!wasDone) notifyClose(event); });
     listen('error', event => { if (!call('onerror', event)) fail('Peer handler failed.'); });
     listen('bufferedamountlow', () => {
       pump();
@@ -136,6 +148,8 @@ export function createBoundedRtcRuntime(options: Options) {
     #handler: Handler = null;
     #done = false;
     #channels = 0;
+    #wrapped: { shutdown(): void }[] = [];
+    #aborted = false;
     constructor(config?: RTCConfiguration) {
       if (closed) throw new Error('RTC runtime is closed.');
       if (connections.size >= NATIVE_REMOTE_CONNECTIONS) throw new Error('Too many peer connections.');
@@ -145,11 +159,13 @@ export function createBoundedRtcRuntime(options: Options) {
         if (this.#channels >= 1) {
           report('Peer opened too many channels.');
           try { event.channel.close(); } catch { /* already closed */ }
+          this.abort();
           return;
         }
         this.#channels++;
         const wrapped = wrapChannel(event.channel);
-        try { this.#handler?.({ channel: wrapped }); } catch { report('Peer message handler failed.'); wrapped.shutdown(); }
+        this.#wrapped.push(wrapped);
+        try { this.#handler?.({ channel: wrapped }); } catch { report('Peer message handler failed.'); wrapped.shutdown(); this.abort(); }
       });
     }
     get ondatachannel(): Handler { return this.#handler; }
@@ -157,12 +173,22 @@ export function createBoundedRtcRuntime(options: Options) {
     createDataChannel(label: string, init?: RTCDataChannelInit) {
       if (this.#channels >= 1) throw new Error('Only one data channel is allowed per connection.');
       this.#channels++;
-      return wrapChannel(super.createDataChannel(label, init));
+      const wrapped = wrapChannel(super.createDataChannel(label, init));
+      this.#wrapped.push(wrapped);
+      return wrapped;
+    }
+    // Close this connection and tell its owner (simple-peer reacts to iceConnectionState 'closed').
+    abort() {
+      if (this.#aborted) return;
+      this.#aborted = true;
+      this.close();
+      try { (this as any).oniceconnectionstatechange?.(new Event('iceconnectionstatechange')); } catch { /* owner already gone */ }
     }
     close() {
       if (this.#done) return;
       this.#done = true;
       connections.delete(this);
+      for (const wrapped of this.#wrapped) wrapped.shutdown();
       super.close();
     }
   }

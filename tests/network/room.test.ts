@@ -3,6 +3,7 @@ import * as Y from 'yjs';
 import { Awareness, applyAwarenessUpdate, encodeAwarenessUpdate, removeAwarenessStates } from 'y-protocols/awareness';
 import { createRoomLink } from '../../src/network/room-link';
 import { createRoomTransport } from '../../src/network/room';
+import { KEY_SETTLE_MS } from '../../src/network/limits';
 
 class FakeSocket extends EventTarget {
   static made: string[] = [];
@@ -149,25 +150,45 @@ describe('room transport', () => {
       awareness.destroy();
     });
 
-    it('does not retain y-protocols metadata for repeatedly rejected client IDs', async () => {
+    it('keeps awareness metadata bounded under repeated rejected states (live ≤ 32, stateless tombstones ≤ 64)', async () => {
       const { t, awareness } = await connect();
       for (let i = 0; i < 300; i++) remote(awareness, i % 2 ? { id: 'bad id' } : { id: 'big', pad: 'x'.repeat(9000) });
       await Promise.resolve();
       expect(awareness.getStates().size).toBe(1);
-      expect(awareness.meta.size).toBe(1);
+      expect(awareness.meta.size).toBeLessThanOrEqual(65);
       t.close();
       awareness.destroy();
     });
 
-    it('does not retain metadata beyond the participant cap, and drops it when a participant expires', async () => {
+    it('bounds metadata immediately for unknown clients announced with a null state (no update event)', async () => {
       const { t, awareness } = await connect();
-      const ids = Array.from({ length: 40 }, (_, i) => remote(awareness, { id: `peer-${i}` }));
+      for (let i = 0; i < 500; i++) {
+        const other = new Awareness(new Y.Doc());
+        other.setLocalState(null);
+        applyAwarenessUpdate(awareness, encodeAwarenessUpdate(other, [other.clientID]), 'test');
+        other.destroy();
+        expect(awareness.meta.size).toBeLessThanOrEqual(65);
+      }
+      t.close();
+      awareness.destroy();
+    });
+
+    it('does not retain more than 32 live states, and keeps the stale-clock record of an expired participant so a delayed older state is rejected', async () => {
+      const { t, awareness } = await connect();
+      const other = new Awareness(new Y.Doc());
+      other.setLocalState({ id: 'late' });
+      const older = encodeAwarenessUpdate(other, [other.clientID]);
+      other.setLocalState({ id: 'late', beat: 1 });
+      const newer = encodeAwarenessUpdate(other, [other.clientID]);
+      applyAwarenessUpdate(awareness, newer, 'test');
+      expect(awareness.getStates().has(other.clientID)).toBe(true);
+      removeAwarenessStates(awareness, [other.clientID], 'timeout');
       await Promise.resolve();
-      expect(awareness.meta.size).toBe(32);
-      removeAwarenessStates(awareness, [ids[0], ids[1]], 'timeout');
-      await Promise.resolve();
-      expect(awareness.meta.size).toBe(30);
-      expect(awareness.meta.has(ids[0])).toBe(false);
+      expect(awareness.meta.has(other.clientID)).toBe(true);
+      applyAwarenessUpdate(awareness, older, 'test');
+      expect(awareness.getStates().has(other.clientID)).toBe(false);
+      expect(t.getView().presence.map(p => p.id)).toEqual(['local']);
+      other.destroy();
       t.close();
       awareness.destroy();
     });
@@ -220,5 +241,35 @@ describe('room transport', () => {
       first.close();
       second.close();
     });
+  });
+
+  it('releases the room lock and owned awareness when the key never settles (rejected or hung derivation), after the settle deadline', async () => {
+    vi.stubGlobal('RTCPeerConnection', FakePc);
+    vi.stubGlobal('RTCSessionDescription', class {});
+    vi.stubGlobal('RTCIceCandidate', class {});
+    vi.stubGlobal('WebSocket', FakeSocket);
+    const spy = vi.spyOn(crypto.subtle, 'importKey').mockImplementation(() => new Promise<CryptoKey>(() => {}));
+    try {
+      const roomLink = link();
+      const first = createRoomTransport(new Y.Doc(), roomLink, 'one');
+      await vi.waitFor(() => expect(spy).toHaveBeenCalledTimes(1));
+      vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
+      first.close();
+      const blocked = createRoomTransport(new Y.Doc(), roomLink, 'two');
+      expect(blocked.getView().phase).toBe('looking');
+      spy.mockRestore();
+      await vi.advanceTimersByTimeAsync(KEY_SETTLE_MS - 1);
+      expect(FakeSocket.open).toBe(0);
+      expect(FakeSocket.made).toHaveLength(1);
+      await vi.advanceTimersByTimeAsync(2);
+      vi.useRealTimers();
+      await vi.waitFor(() => expect(blocked.getView().presence).toHaveLength(1));
+      expect(FakeSocket.open).toBe(1);
+      blocked.close();
+      await vi.waitFor(() => expect(FakeSocket.open).toBe(0));
+    } finally {
+      vi.useRealTimers();
+      spy.mockRestore();
+    }
   });
 });

@@ -111,11 +111,13 @@ describe('bounded RTC runtime', () => {
     expect(closes).toBe(1);
   });
 
-  it('allows one data channel per connection and closes excess local and remote channels', () => {
+  it('treats a second channel as a misbehaving peer: closes the whole connection and notifies the owner', () => {
     const errors: string[] = [];
     const { runtime } = make(errors);
     const pc = new runtime.wrtc.RTCPeerConnection();
     const first = pc.createDataChannel('x');
+    let closes = 0; first.onclose = () => { closes++; };
+    let iceNotices = 0; (pc as any).oniceconnectionstatechange = () => { iceNotices++; };
     expect(() => pc.createDataChannel('y')).toThrow();
     const seenChannels: unknown[] = [];
     pc.ondatachannel = (e: any) => seenChannels.push(e.channel);
@@ -123,23 +125,60 @@ describe('bounded RTC runtime', () => {
     FakePc.all[0].incoming(extra);
     expect(extra.closed).toBe(1);
     expect(seenChannels).toHaveLength(0);
+    expect(FakePc.all[0].closed).toBe(1);
+    expect(FakePc.all[0].channels[0].closed).toBeGreaterThanOrEqual(1);
+    expect(iceNotices).toBe(1);
     expect(errors).toEqual(['Peer opened too many channels.']);
-    FakePc.all[0].channels[0].open();
-    first.send(new Uint8Array(3));
-    expect(FakePc.all[0].channels[0].sent).toHaveLength(1);
+    expect(runtime.getOpenCount()).toBe(0);
   });
 
-  it('releases pending inbound bytes of a silent peer after 10,001 ms and leaves no timers after close', () => {
+  it('fails the owning peer and releases bytes when an inbound transfer expires while the peer is silent', () => {
     vi.useFakeTimers();
-    const { runtime } = make();
-    const pc = new runtime.wrtc.RTCPeerConnection();
-    pc.createDataChannel('x');
+    const errors: string[] = [];
+    const { runtime } = make(errors);
+    const ch = new runtime.wrtc.RTCPeerConnection().createDataChannel('x');
+    let closes = 0; ch.onclose = () => { closes++; };
     const n = FakePc.all[0].channels[0]; n.open();
     n.receive(frame(40_000)[0]);
     expect(vi.getTimerCount()).toBe(1);
-    vi.advanceTimersByTime(10_001);
+    vi.advanceTimersByTime(10_000);
+    expect(closes).toBe(0);
+    vi.advanceTimersByTime(1);
+    expect(closes).toBe(1);
+    expect(n.closed).toBe(1);
+    expect(errors).toEqual(['Peer transfer expired.']);
     expect(vi.getTimerCount()).toBe(0);
-    runtime.close();
+    expect(runtime.getOpenCount()).toBe(0);
+  });
+
+  it('replays the close to a handler installed after an early guard failure (unreliable local channel)', async () => {
+    const errors: string[] = [];
+    const { runtime } = make(errors);
+    const pc = new runtime.wrtc.RTCPeerConnection();
+    const ch = pc.createDataChannel('x', { ordered: false });
+    expect(FakePc.all[0].channels[0].closed).toBe(1);
+    let closes = 0;
+    ch.onclose = () => { closes++; pc.close(); };
+    expect(closes).toBe(0);
+    await Promise.resolve();
+    expect(closes).toBe(1);
+    expect(FakePc.all[0].closed).toBe(1);
+    await Promise.resolve();
+    expect(closes).toBe(1);
+  });
+
+  it('closes the owning connection and notifies it when the incoming-channel handler throws', () => {
+    const errors: string[] = [];
+    const { runtime } = make(errors);
+    const pc = new runtime.wrtc.RTCPeerConnection();
+    let iceNotices = 0; (pc as any).oniceconnectionstatechange = () => { iceNotices++; };
+    pc.ondatachannel = () => { throw new Error('secret'); };
+    const incoming = new FakeChannel();
+    FakePc.all[0].incoming(incoming);
+    expect(incoming.closed).toBe(1);
+    expect(FakePc.all[0].closed).toBe(1);
+    expect(iceNotices).toBe(1);
+    expect(errors).toEqual(['Peer message handler failed.']);
   });
 
   it('isolates an invalid frame to the peer that sent it', () => {

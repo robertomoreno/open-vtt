@@ -8,7 +8,7 @@ Endpoint under test: `wss://y-webrtc-eu.fly.dev` (Task 1 default, `VITE_GATHER_S
 
 | Host engine | Guest engine | Cases asserted | Result |
 |---|---|---|---|
-| Chromium | WebKit (Playwright) | real y-webrtc signaling; native opens > 0 on both; 1.5 MB binary values delivered byte-for-byte (full base64 comparison against bytes generated independently in Node), in both directions; after the page-side signaling sockets are closed, small values and a 1.5 MB value flow A→B and B→A over the established channels; the `connected` phase is shown only while native opens > 0 and returns to `looking` when the last channel closes; teardown (other side open count returns to 0) | pass (2 consecutive runs) |
+| Chromium | WebKit (Playwright) | real y-webrtc signaling; native opens > 0 on both; 1.5 MB binary values delivered byte-for-byte (full base64 string comparison against bytes generated independently in Node); before signaling closure a 1.5 MB value goes A→B; after the page-side signaling sockets are closed, small values go A→B and B→A and a 1.5 MB value goes B→A and then A→B (a different payload), each compared byte-for-byte; the `connected` phase is shown only while native opens > 0 and returns to `looking` when the last channel closes; teardown (other side open count returns to 0) | pass (2 consecutive runs) |
 | WebKit (Playwright) | Chromium | same | pass (2 consecutive runs + 1 earlier pass) |
 
 This does not prove Firefox, branded Safari/Edge, other networks, or the final compatibility matrix. WebKit automation is not shipping Safari.
@@ -35,3 +35,13 @@ y-webrtc 10.3.0 also synchronizes same-origin tabs through lib0 `BroadcastChanne
 ## Fix round 2 (review findings 2–9 and phase labeling)
 
 Awareness metadata pruned (public `awareness.meta`), per-connection one-channel cap, idle transfer expiry timer, guard failures close the channel and notify the owner, outbound overflow fails the connection, exact next-frame 1 MiB bound, room lock held through pending key derivation, `connected` derived from native opens only. Browser reruns this round (both Chromium↔WebKit directions, real y-webrtc): 13:48 and 13:49 UTC runs passed 2/2 each (endpoint warm). Earlier flakiness notes above still apply.
+
+
+## Fix round 3
+
+- Awareness metadata: `awareness.meta` is replaced by a Map subclass that caps stateless clock records at 64 at insertion (covers null-state unknown IDs that emit no `update`) and again by microtask after update events. Stale-clock records are kept (a delayed older state stays rejected) until evicted by the cap; an evicted client's very old state could be re-accepted, then validated/capped and expired by y-protocols after 30 s. Live states stay ≤ 32. Residual: within one synchronous message the count can transiently exceed the cap by that message's client count (bounded by the 2-MiB message limit), trimmed right after.
+- Guard failures close the owning native connection and notify simple-peer (replayed `onclose` for handlers installed after an early failure; `iceconnectionstatechange` after abort for incoming-channel handler failures and excess channels). simple-peer itself is not driven in unit tests (fake native objects); this is not proven against its internal timers.
+- Expired transfers fail the connection (`Peer transfer expired.`), and any expiry observed on a later frame throws.
+- Peer-local guard errors no longer set the room phase `failed`; the error label is kept while the phase follows native opens.
+- Room teardown: if the key never settles (rejected/hung derivation) no `status` arrives; teardown is forced after 10 s so the lock and owned awareness are released. Upstream's own rejected-key promise rejection cannot be caught without its private `provider.key`.
+- The BroadcastChannel blocker above is unchanged: **Task 2's hard gate remains blocked; Task 3 stays paused.**
