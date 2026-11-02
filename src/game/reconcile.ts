@@ -295,10 +295,16 @@ export function reconcileHistories(histories: readonly GameHistory[], priority: 
       while (loads.length <= k) { loads.push([]); plans.push([]); }
       loads[k].push(p);
     }
-    const filler = patches.find(p => p.type !== 'remove-roll' && p.type !== 'put-roll');
+    // Seed-roll patches act on rolls present before every operation, so the whole (bounded) roll
+    // patch list can be repeated on any link: remove-then-put always ends at the retained roll.
+    const seedRollsOnly = patches.length <= CAUSAL_PARENTS && patches.every(p => (p.type === 'remove-roll' && opRoll(p) === undefined) || p.type === 'put-roll');
+    const nonRoll = patches.find(p => p.type !== 'remove-roll' && p.type !== 'put-roll');
     let link: string | undefined;
     plans.forEach((plan, i) => {
-      if (!loads[i].length) { check(filler, 'Resolution chain has no idempotent patch.'); loads[i].push(filler); }
+      if (!loads[i].length) {
+        check(nonRoll || seedRollsOnly, 'Resolution chain has no idempotent patch.');
+        loads[i].push(...(nonRoll ? [nonRoll] : patches));
+      }
       const parents = [...(link ? [link] : []), ...plan].sort(byId);
       const cited = parents.filter(id => id === link || heads.has(id));
       const last = i === plans.length - 1;
@@ -448,12 +454,14 @@ export function reconcileHistories(histories: readonly GameHistory[], priority: 
 
 function noticeFor(final: Resolution, graph: Graph): ConflictNotice | undefined {
   if (!final.candidateHeads.every(id => graph.has(id))) return undefined;
-  // A chain's patches are spread across its links; report their union.
+  // A chain's patches are spread across its links; report their union. Intermediate chain links carry
+  // no fallback frontier; a complete earlier resolution that this one extends is a competing head whose
+  // proposals are reported through candidate expansion, not by merging its (superseded) patches.
   const all: ResolutionPatch[] = [], seenPatch = new Set<string>(), stack = [final];
   while (stack.length) {
     const r = stack.pop()!;
     for (const p of r.patches) { const k = JSON.stringify(p); if (!seenPatch.has(k)) { seenPatch.add(k); all.push(p); } }
-    for (const id of r.extendedResolutionIds) { const x = graph.node(id)?.op; if (x?.type === 'resolution') stack.push(x); }
+    for (const id of r.extendedResolutionIds) { const x = graph.node(id)?.op; if (x?.type === 'resolution' && x.fallbackFrontier.length === 0) stack.push(x); }
   }
   const op = { ...final, patches: all };
   const heads = op.candidateHeads.map(id => graph.idx(id));
@@ -484,6 +492,6 @@ function noticeFor(final: Resolution, graph: Graph): ConflictNotice | undefined 
     ? `Changes to ${affected.join(', ')} would break the rule that player names are unique (${competing}). The first room participant's version was kept (${describe(retained)}); the other proposals remain in history for recovery.`
     : reason === 'limited-history'
       ? `Copies of ${affected.join(', ')} have no shared history (${competing}). Compatible additions were merged and the first room participant's value ${describe(retained)} was kept.`
-      : `${affected[0]} was changed concurrently (${competing}). The first room participant's version ${describe(retained)} was kept.`;
+      : `${affected[0]} was changed concurrently (${competing}). The first room participant's version ${describe(retained)} was kept${leaves.some(i => graph.authors[i] === final.authorId && graph.writes[i].get(reg!) === retained) ? ' because it is their own edit' : ', because their version wins genuine conflicts'}.`;
   return { id, affected, reason, candidates, retained, explanation };
 }

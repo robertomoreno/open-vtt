@@ -467,4 +467,43 @@ describe('granular reconciliation', () => {
     }
     expect(removals).toBeGreaterThanOrEqual(140);
   }, 60000);
+
+  it('reports the actual competing proposals when a priority edit extends an earlier resolution', () => {
+    const { alice, bob, carol, priority } = castle();
+    bob.applyLocal({ type: 'set-game-name', name: 'Red Castle' });
+    carol.applyLocal({ type: 'set-game-name', name: 'Blue Castle' });
+    const first = reconcileHistories([alice.getHistory(), bob.getHistory(), carol.getHistory()], priority, namedRuntime('r'));
+    expect(first.game.name).toBe('Old Castle');
+    alice.applyLocal({ type: 'set-game-name', name: 'Gold Castle' });
+    alice.accept(bob.getHistory()); alice.accept(carol.getHistory());
+    const result = reconcileHistories([first.history, alice.getHistory()], priority, namedRuntime('r2'));
+    expect(result.game.name).toBe('Gold Castle');
+    expect(result.notices).toHaveLength(1);
+    const [notice] = result.notices;
+    expect(notice).toMatchObject({ reason: 'concurrent-value', affected: ['game.name'], retained: 'Gold Castle' });
+    expect(notice.candidates.map(c => c.value).sort()).toEqual(['Blue Castle', 'Gold Castle', 'Red Castle']);
+    expect(notice.explanation).toContain('Gold Castle');
+    expect(notice.explanation).toMatch(/first room participant/i);
+    expect(reconcileHistories([result.history, alice.getHistory()], priority, namedRuntime('r3')).notices).toEqual([]);
+  });
+
+  it('chains a pure-roll legacy collision with more than 128 seed candidates', () => {
+    const base = fixtureRoster(), at = base.createdAt;
+    const keep = { id: 'keep', playerId: 'alex', sides: 6 as const, value: 2, at };
+    const baseline: GameHistory = { modelVersion: 1, gameId: 'game', seeds: { base: { ...base, rolls: [keep] } }, operations: {} };
+    const seeds: GameHistory['seeds'] = {};
+    for (let i = 0; i < 130; i++) seeds[`s${String(i).padStart(3, '0')}`] = { ...base, rolls: [i < 100 ? { id: 'shared', playerId: 'bea', sides: 100 as const, value: i + 1, at } : { id: 'shared', playerId: 'alex', sides: 100 as const, value: i - 99, at }] };
+    const result = reconcileHistories([baseline, { modelVersion: 1, gameId: 'game', seeds, operations: {} }], capturePriority(baseline, 'opener', 'room'), namedRuntime('r'));
+    expect(result.game.rolls).toEqual([keep]);
+    expect(projectHistory(result.history)).toEqual(result.game);
+    expect(Object.keys(result.history.seeds)).toHaveLength(131);
+    for (const op of resolutions(result.history)) if (op.type === 'resolution') {
+      for (const list of [op.parents, op.candidateHeads, op.patches, op.fallbackBase, op.fallbackFrontier, op.extendedResolutionIds]) expect(list.length).toBeLessThanOrEqual(128);
+      expect(op.patches.every(p => p.type === 'remove-roll' && p.rollId === 'shared')).toBe(true);
+    }
+    expect(result.notices).toHaveLength(1);
+    expect(result.notices[0]).toMatchObject({ reason: 'limited-history', affected: ['roll:shared'] });
+    expect(result.notices[0].candidates).toHaveLength(130);
+    expect(reconcileHistories([result.history], capturePriority(baseline, 'opener', 'room'), namedRuntime('again')).history).toEqual(result.history);
+  });
 });
