@@ -3,7 +3,8 @@ import { makeRosterAddition, projectHistory } from '../../src/game/history';
 import { capturePriority, reconcileHistories } from '../../src/game/reconcile';
 import type { GameHistory } from '../../src/game/sync-types';
 import type { Player, Runtime } from '../../src/game/types';
-import type { Workspace } from '../../src/game/workspace';
+import { createWorkspace, type Workspace } from '../../src/game/workspace';
+import { parseBackup, serializeBackup } from '../../src/storage/backups';
 import { createTestWorkspace, fixtureRoster, forkTestWorkspace, namedRuntime } from '../helpers/workspace';
 
 function castle() {
@@ -135,6 +136,38 @@ describe('granular reconciliation', () => {
     expect(reconcileHistories([fresh.getHistory(), carol.getHistory()], room, namedRuntime('f')).game.name).toBe('Red Castle');
     // Within Alice's tenure the historical fallback is still Old.
     expect(reconcileHistories([dave.getHistory(), carol.getHistory()], capturePriority(alice.getHistory(), alice.replicaId, 'tenure-1'), namedRuntime('a')).game.name).toBe('Old Castle');
+  });
+
+  it('survives a backup roundtrip with semantic causality and a caller-supplied fresh tenure', () => {
+    const { alice, bob, carol, priority } = castle();
+    bob.applyLocal({ type: 'set-game-name', name: 'Red Castle' });
+    carol.applyLocal({ type: 'set-game-name', name: 'Blue Castle' });
+    carol.applyLocal({ type: 'set-player-name', playerId: 'bea', name: 'Bee' });
+    bob.applyLocal({ type: 'roll', playerId: 'alex', sides: 20 });
+    const resolved = reconcileHistories([alice.getHistory(), bob.getHistory(), carol.getHistory()], priority, namedRuntime('r'));
+    expect(resolved.game.name).toBe('Old Castle');
+    alice.accept(resolved.history);
+    // Round-trip the resolved causal history through a portable backup file.
+    const restored = parseBackup(serializeBackup(alice.getSnapshot()), namedRuntime('import'));
+    const fresh = createWorkspace(restored, namedRuntime('fresh'), 'opener');
+    const room = capturePriority(fresh.getHistory(), 'opener', 'room-2');
+    // The fresh room's tenure is caller-supplied, never restored from the file.
+    expect(room.tenureId).toBe('room-2');
+    expect(room.participantId).toBe('opener');
+    // Semantic IDs and causality survive the roundtrip.
+    expect(projectHistory(fresh.getHistory())).toEqual(resolved.game);
+    // Independent edits already merged are preserved, and a new concurrent conflict
+    // still resolves to the fresh room's first-participant value.
+    const p1 = forkTestWorkspace(fresh, 'p1');
+    const p2 = forkTestWorkspace(fresh, 'p2');
+    p1.applyLocal({ type: 'set-game-name', name: 'Amber Castle' });
+    p2.applyLocal({ type: 'set-game-name', name: 'Beryl Castle' });
+    const conflict = reconcileHistories([fresh.getHistory(), p1.getHistory(), p2.getHistory()], room, namedRuntime('rc'));
+    expect(conflict.game.name).toBe('Old Castle');
+    expect(conflict.game.players.find(p => p.id === 'bea')?.name).toBe('Bee');
+    expect(conflict.game.rolls).toHaveLength(1);
+    expect(conflict.notices).toHaveLength(1);
+    expect(conflict.notices[0]).toMatchObject({ reason: 'concurrent-value', retained: 'Old Castle' });
   });
 
   it('duplicate names/new records with dependent rolls keep a valid roster and an unrelated roll', () => {
