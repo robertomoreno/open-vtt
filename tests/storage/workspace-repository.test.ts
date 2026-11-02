@@ -18,6 +18,31 @@ function blockedFactory(): IDBFactory {
     },
   } as unknown as IDBFactory;
 }
+function lateSuccessFactory(): { indexedDB: IDBFactory; close: ReturnType<typeof vi.fn> } {
+  const close = vi.fn();
+  const handle = { close };
+  const indexedDB = {
+    open() {
+      const request: { onblocked?: (() => void) | null; onsuccess?: (() => void) | null; onupgradeneeded?: (() => void) | null; onerror?: (() => void) | null; result?: unknown } = {};
+      setTimeout(() => request.onblocked?.(), 0);
+      setTimeout(() => { request.result = handle; request.onsuccess?.(); }, 2000);
+      return request as unknown as IDBOpenDBRequest;
+    },
+  } as unknown as IDBFactory;
+  return { indexedDB, close };
+}
+function delayedSuccessFactory(): { indexedDB: IDBFactory; close: ReturnType<typeof vi.fn> } {
+  const close = vi.fn();
+  const handle = { close };
+  const indexedDB = {
+    open() {
+      const request: { onsuccess?: (() => void) | null; result?: unknown } = {};
+      setTimeout(() => { request.result = handle; request.onsuccess?.(); }, 0);
+      return request as unknown as IDBOpenDBRequest;
+    },
+  } as unknown as IDBFactory;
+  return { indexedDB, close };
+}
 async function putRawRecord(indexedDB: IDBFactory, dbName: string, record: unknown): Promise<void> {
   await new Promise<void>((resolve, reject) => {
     const request = indexedDB.open(dbName, 1);
@@ -199,4 +224,57 @@ it('browserWorkspaceRepository settles when browser storage globals are absent',
   const repo = browserWorkspaceRepository(namedRuntime('bw'));
   expect((await repo.list()).games).toEqual([]);
   expect((await repo.save(createTestWorkspace('bw').getSnapshot(), 0)).ok).toBe(false);
+});
+
+it('closes a database handle that succeeds after the open settled as blocked', async () => {
+  vi.useFakeTimers();
+  try {
+    const { indexedDB, close } = lateSuccessFactory();
+    const repo = createWorkspaceRepository({ indexedDB, dbName: randomUUID(), runtime: namedRuntime('l') });
+    const pending = repo.list();
+    await vi.advanceTimersByTimeAsync(1);
+    await vi.advanceTimersByTimeAsync(1000);
+    expect((await pending).games).toEqual([]);
+    await vi.advanceTimersByTimeAsync(2000);
+    expect(close).toHaveBeenCalledTimes(1);
+  } finally {
+    vi.useRealTimers();
+  }
+});
+
+it('closes a database handle that succeeds after close()', async () => {
+  vi.useFakeTimers();
+  try {
+    const { indexedDB, close } = delayedSuccessFactory();
+    const repo = createWorkspaceRepository({ indexedDB, dbName: randomUUID(), runtime: namedRuntime('l') });
+    const pending = repo.list();
+    repo.close();
+    await vi.advanceTimersByTimeAsync(1);
+    expect((await pending).games).toEqual([]);
+    expect(close).toHaveBeenCalledTimes(1);
+  } finally {
+    vi.useRealTimers();
+  }
+});
+
+it('allows re-saving over a corrupt record instead of returning stale forever', async () => {
+  const indexedDB = new IDBFactory(), dbName = randomUUID();
+  const repo = createWorkspaceRepository({ indexedDB, dbName, runtime: namedRuntime('t') });
+  const snapshot = createTestWorkspace('seed').getSnapshot();
+  await putRawRecord(indexedDB, dbName, { id: snapshot.game.id, version: 1, snapshot: { game: {}, history: new Uint8Array() } });
+  expect(await repo.load(snapshot.game.id)).toMatchObject({ snapshot: null, version: 0 });
+  expect(await repo.save(snapshot, 0)).toEqual({ ok: true, version: 1 });
+  expect((await repo.load(snapshot.game.id)).snapshot).toEqual(snapshot);
+});
+
+it('recovers a corrupt durable record from intact legacy bytes', async () => {
+  const indexedDB = new IDBFactory(), dbName = randomUUID();
+  const storage = memoryStorage();
+  storage.setItem('gather:game:legacy', JSON.stringify(legacyGame()));
+  const repo = createWorkspaceRepository({ indexedDB, dbName, storage, runtime: namedRuntime('m') });
+  await putRawRecord(indexedDB, dbName, { id: 'legacy', version: 1, snapshot: { game: {}, history: new Uint8Array() } });
+  const loaded = await repo.load('legacy');
+  expect(loaded.snapshot).not.toBeNull();
+  expect(loaded.snapshot!.game).toEqual(legacyGame());
+  expect(loaded.version).toBe(1);
 });

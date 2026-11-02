@@ -27,7 +27,6 @@ const STORAGE_WARNING = 'Browser save unavailable. Your game is still in memory;
 const CORRUPT_WARNING = 'A corrupt browser save was skipped. Other saves are still available.';
 const MIGRATION_WARNING = 'A saved game could not be moved to durable storage; a temporary in-memory copy is still usable.';
 
-type GameRecord = { id: string; version: number; snapshot: WorkspaceSnapshot };
 type RecoveryRecord = { id: string; snapshot: WorkspaceSnapshot };
 
 function deniedStorage(): Storage {
@@ -83,6 +82,11 @@ export function createWorkspaceRepository(options: {
       request.onsuccess = () => {
         if (blockedTimer) clearTimeout(blockedTimer);
         const handle = request.result;
+        if (closed || unavailable) {
+          try { handle.close(); } catch {}
+          reject(new Error('Workspace storage unavailable'));
+          return;
+        }
         handle.onversionchange = () => { handle.close(); db = null; openPromise = null; };
         db = handle;
         resolve(handle);
@@ -159,8 +163,8 @@ export function createWorkspaceRepository(options: {
       const fail = (error: unknown) => { if (!settled) { settled = true; reject(error instanceof Error ? error : new Error('Save failed')); } };
       const get = store.get(id);
       get.onsuccess = () => {
-        const record = get.result as GameRecord | undefined;
-        const current = record ? record.version : 0;
+        const parsed = parseRecord(get.result);
+        const current = parsed === 'corrupt' ? 0 : parsed.version;
         if (current !== expectedVersion) { stale = true; return; }
         try {
           store.put({ id, version: current + 1, snapshot });
@@ -211,8 +215,8 @@ export function createWorkspaceRepository(options: {
       const record = await getOne<unknown>(handle, GAMES_STORE, id);
       if (record !== undefined) {
         const parsed = parseRecord(record);
-        if (parsed === 'corrupt') { warnings.push(CORRUPT_WARNING); return { snapshot: null, version: 0, warnings }; }
-        return { snapshot: parsed.snapshot, version: parsed.version, warnings };
+        if (parsed !== 'corrupt') return { snapshot: parsed.snapshot, version: parsed.version, warnings };
+        warnings.push(CORRUPT_WARNING);
       }
     } catch { idbAvailable = false; }
     const legacyGame = legacy.get(id);
