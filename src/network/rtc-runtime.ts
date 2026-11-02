@@ -21,7 +21,8 @@ export function createBoundedRtcRuntime(options: Options) {
 
   function wrapChannel(channel: any) {
     let pendingClose = false;
-    const liveClose = new Map<EventListener, boolean>(); // live close listeners -> once
+    type CloseRegistration = { wrapper: EventListener; signal?: AbortSignal; onAbort?: () => void };
+    const liveClose = new Map<EventListenerOrEventListenerObject, Map<boolean, CloseRegistration>>();
     const abort = new AbortController();
     const assembler = createBinaryAssembler(options.now, inbound, () => fail('Peer transfer expired.'));
     const queue: Frames[] = [];
@@ -60,8 +61,15 @@ export function createBoundedRtcRuntime(options: Options) {
       let ok = true;
       listenerFailed = false;
       try { EventTarget.prototype.dispatchEvent.call(api, event); } catch { ok = false; }
-      if (event.type === 'close') for (const [wrapper, once] of [...liveClose]) if (once) liveClose.delete(wrapper);
       return ok && !listenerFailed;
+    };
+    const removeClose = (fn: EventListenerOrEventListenerObject, capture: boolean, registration: CloseRegistration) => {
+      const registrations = liveClose.get(fn);
+      if (registrations?.get(capture) !== registration) return;
+      registrations.delete(capture);
+      if (registrations.size === 0) liveClose.delete(fn);
+      registration.signal?.removeEventListener('abort', registration.onAbort!);
+      EventTarget.prototype.removeEventListener.call(api, 'close', registration.wrapper, { capture });
     };
     // a close recorded while nobody was listening is delivered once to the first live handler or listener that appears
     const replayClose = () => {
@@ -136,19 +144,41 @@ export function createBoundedRtcRuntime(options: Options) {
       close() { api.shutdown(); },
       addEventListener(type: string, fn: EventListenerOrEventListenerObject | null, options?: AddEventListenerOptions | boolean) {
         if (!fn) return;
+        if (type === 'close') {
+          const capture = typeof options === 'boolean' ? options : options?.capture === true;
+          const signal = typeof options === 'object' && options !== null ? options.signal : undefined;
+          if (signal?.aborted || liveClose.get(fn)?.has(capture)) return;
+          const once = typeof options === 'object' && options !== null && options.once === true;
+          const registration: CloseRegistration = {
+            signal,
+            wrapper: function (this: unknown, event: Event) {
+              if (once) removeClose(fn, capture, registration);
+              try { typeof fn === 'function' ? fn.call(this, event) : fn.handleEvent(event); } catch { listenerFailed = true; }
+            },
+          };
+          let registrations = liveClose.get(fn);
+          if (!registrations) { registrations = new Map(); liveClose.set(fn, registrations); }
+          registrations.set(capture, registration);
+          EventTarget.prototype.addEventListener.call(api, type, registration.wrapper, { capture });
+          if (signal) {
+            registration.onAbort = () => removeClose(fn, capture, registration);
+            signal.addEventListener('abort', registration.onAbort, { once: true });
+          }
+          replayClose();
+          return;
+        }
         const wrapper = containing(fn);
         EventTarget.prototype.addEventListener.call(api, type, wrapper, options);
-        if (type !== 'close') return;
-        const signal = typeof options === 'object' ? options.signal : undefined;
-        if (signal?.aborted) return;
-        liveClose.set(wrapper, typeof options === 'object' && options.once === true);
-        signal?.addEventListener('abort', () => { liveClose.delete(wrapper); }, { once: true });
-        replayClose();
       },
       removeEventListener(type: string, fn: EventListenerOrEventListenerObject | null, options?: EventListenerOptions | boolean) {
         if (!fn) return;
+        if (type === 'close') {
+          const capture = typeof options === 'boolean' ? options : options?.capture === true;
+          const registration = liveClose.get(fn)?.get(capture);
+          if (registration) removeClose(fn, capture, registration);
+          return;
+        }
         const wrapper = containing(fn);
-        if (type === 'close') liveClose.delete(wrapper);
         EventTarget.prototype.removeEventListener.call(api, type, wrapper, options);
       },
     };

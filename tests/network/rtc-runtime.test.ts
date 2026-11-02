@@ -457,4 +457,95 @@ describe('close replay with no live listener', () => {
     await Promise.resolve(); await Promise.resolve();
     expect(once).toHaveBeenCalledTimes(1);
   });
+
+  it('keeps a capture listener live when removed with the wrong capture option', async () => {
+    const { ch, fail } = failed();
+    const listener = vi.fn(), later = vi.fn();
+    ch.addEventListener('close', listener, { capture: true });
+    ch.removeEventListener('close', listener, { capture: false });
+    fail();
+    expect(listener).toHaveBeenCalledTimes(1);
+    expect(listener.mock.calls[0][0].target).toBe(ch);
+    ch.onclose = later;
+    await Promise.resolve();
+    expect(later).not.toHaveBeenCalled();
+  });
+
+  it('delivers close to both capture registrations of the same callback', () => {
+    const { ch, fail } = failed();
+    const listener = vi.fn();
+    ch.addEventListener('close', listener, { capture: true });
+    ch.addEventListener('close', listener, { capture: false });
+    fail();
+    expect(listener).toHaveBeenCalledTimes(2);
+  });
+
+  for (const removedCapture of [true, false]) {
+    it(`delivers close to the other capture registration after removing capture=${removedCapture}`, async () => {
+      const { ch, fail } = failed();
+      const listener = vi.fn(), later = vi.fn();
+      ch.addEventListener('close', listener, { capture: true });
+      ch.addEventListener('close', listener, { capture: false });
+      ch.removeEventListener('close', listener, { capture: removedCapture });
+      fail();
+      expect(listener).toHaveBeenCalledTimes(1);
+      ch.onclose = later;
+      await Promise.resolve();
+      expect(later).not.toHaveBeenCalled();
+    });
+
+    it(`keeps the other capture registration live after aborting capture=${removedCapture}`, async () => {
+      const { ch, fail } = failed();
+      const controller = new AbortController();
+      const listener = vi.fn(), later = vi.fn();
+      ch.addEventListener('close', listener, { capture: removedCapture, signal: controller.signal });
+      ch.addEventListener('close', listener, { capture: !removedCapture });
+      controller.abort();
+      fail();
+      expect(listener).toHaveBeenCalledTimes(1);
+      ch.onclose = later;
+      await Promise.resolve();
+      expect(later).not.toHaveBeenCalled();
+    });
+  }
+
+  it('ignores a duplicate registration signal when the original listener remains live', async () => {
+    const { ch, fail } = failed();
+    const controller = new AbortController();
+    const listener = vi.fn(), later = vi.fn();
+    ch.addEventListener('close', listener, { capture: true });
+    ch.addEventListener('close', listener, { capture: true, signal: controller.signal });
+    controller.abort();
+    fail();
+    expect(listener).toHaveBeenCalledTimes(1);
+    ch.onclose = later;
+    await Promise.resolve();
+    expect(later).not.toHaveBeenCalled();
+  });
+
+  it('does not let an old aborted signal remove a newly registered listener', () => {
+    const { ch, fail } = failed();
+    const controller = new AbortController();
+    const listener = vi.fn();
+    ch.addEventListener('close', listener, { capture: true, signal: controller.signal });
+    ch.removeEventListener('close', listener, true);
+    ch.addEventListener('close', listener, true);
+    controller.abort();
+    fail();
+    expect(listener).toHaveBeenCalledTimes(1);
+  });
+
+  it('honours once independently for two capture registrations', async () => {
+    const { ch, fail } = failed();
+    const listener = vi.fn(), later = vi.fn();
+    ch.addEventListener('close', listener, { capture: true, once: true });
+    ch.addEventListener('close', listener, { capture: false });
+    fail();
+    expect(listener).toHaveBeenCalledTimes(2);
+    ch.onclose = later;
+    await Promise.resolve();
+    expect(later).not.toHaveBeenCalled();
+    ch.dispatchEvent(new Event('close'));
+    expect(listener).toHaveBeenCalledTimes(3);
+  });
 });
