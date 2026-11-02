@@ -264,20 +264,33 @@ export function reconcileHistories(histories: readonly GameHistory[], priority: 
     operations: sortedRecord(nodes.filter(n => n.op).map(n => [n.id, n.op!])),
   };
   const fallbackFrontier = frontier(baseline);
-  const created: Resolution[] = [];
+  // Causal lists are bounded, so a component whose evidence exceeds the bound is published as a chain:
+  // each link cites the previous link plus the next bounded slice of evidence; the final link carries
+  // the full fallback evidence (all causal ancestors through the chain). Parents are the cited evidence
+  // only, never the whole frontier, which may itself exceed the bound.
   const publish = (patches: ResolutionPatch[], candidateHeads: number[], base: number[]) => {
-    for (let k = 0; k < patches.length; k += CAUSAL_PARENTS) {
+    const heads = new Set(candidateHeads.map(i => nodes[i].id)), fallbackBase = base.map(i => nodes[i].id).sort(byId);
+    check(fallbackBase.length <= CAUSAL_PARENTS, 'Conflict base exceeds the causal bound.');
+    // Removed rolls must be projected before the patch that removes them.
+    const removed = patches.flatMap(p => p.type === 'remove-roll' && Object.hasOwn(history.operations, p.rollId) ? [p.rollId] : []);
+    const queue = [...new Set([...fallbackFrontier, ...fallbackBase, ...[...heads].sort(byId), ...removed.sort(byId)])];
+    const chunks: ResolutionPatch[][] = [];
+    for (let k = 0; k < patches.length; k += CAUSAL_PARENTS) chunks.push(patches.slice(k, k + CAUSAL_PARENTS));
+    let link: string | undefined;
+    for (let step = 0; queue.length || step < chunks.length; step++) {
+      const taken = queue.splice(0, link ? CAUSAL_PARENTS - 1 : CAUSAL_PARENTS);
+      const parents = [...(link ? [link] : []), ...taken].sort(byId);
+      const cited = parents.filter(id => id === link || heads.has(id));
+      const last = !queue.length;
       const op = validateOperation({
-        type: 'resolution', id: runtime.id(), authorId: priority.participantId, parents: frontier(history), at: runtime.now(),
-        patches: patches.slice(k, k + CAUSAL_PARENTS),
-        candidateHeads: candidateHeads.map(i => nodes[i].id).sort(byId),
-        fallbackBase: base.map(i => nodes[i].id).sort(byId),
-        fallbackFrontier,
-        extendedResolutionIds: candidateHeads.filter(i => nodes[i].op?.type === 'resolution').map(i => nodes[i].id).sort(byId),
+        type: 'resolution', id: runtime.id(), authorId: priority.participantId, parents, at: runtime.now(),
+        patches: chunks[Math.min(step, chunks.length - 1)], candidateHeads: cited,
+        fallbackBase: last ? fallbackBase : [], fallbackFrontier: last ? fallbackFrontier : [],
+        extendedResolutionIds: cited.filter(id => (history.operations[id] ?? graph.node(id)?.op)?.type === 'resolution'),
       }) as Resolution;
       check(!Object.hasOwn(history.operations, op.id) && !Object.hasOwn(history.seeds, op.id), 'Operation ID collision.');
       history = { ...history, operations: { ...history.operations, [op.id]: op } };
-      created.push(op);
+      link = op.id;
     }
   };
 
@@ -331,9 +344,22 @@ export function reconcileHistories(histories: readonly GameHistory[], priority: 
     } else if (duplicate) {
       const playerId = duplicate.key, list = creators.get(playerId) ?? [];
       const kept = list.find(i => inMask(inBaseline, i)) ?? list.find(i => graph.authors[i] === priority.participantId);
-      const record = kept === undefined ? undefined : baselineGame.players.find(p => p.id === playerId) ?? (nodes[kept].seed?.players.find(p => p.id === playerId) ?? (nodes[kept].op as Extract<GameOperation, { type: 'add-player' }>).player);
       const losers = list.filter(i => i !== kept);
-      candidates = list;
+      candidates = [...list];
+      let record: Player | undefined;
+      if (kept !== undefined) {
+        // The kept record's fields come from causal history excluding the losing creations' lineage,
+        // so valid edits to the kept player (including the priority participant's) survive.
+        const mask = new Uint32Array(inBaseline.length);
+        nodes.forEach((_, i) => { if (!losers.some(l => upTo(l, i))) mask[i >>> 5] |= 1 << (i & 31); });
+        const created = nodes[kept].seed?.players.find(p => p.id === playerId) ?? (nodes[kept].op as Extract<GameOperation, { type: 'add-player' }>).player;
+        const field = (f: 'name' | 'role') => {
+          const reg = `player:${playerId}.${f}`;
+          candidates.push(...graph.maximal(graph.members(mask).filter(i => graph.writes[i].has(reg))));
+          return valueIn(reg, mask, 0) ?? created[f];
+        };
+        record = { id: playerId, name: field('name'), role: field('role') as Player['role'] };
+      }
       patches.push(record ? { type: 'put-player', player: record } : { type: 'remove-player', playerId });
       withdraw(game, playerId, patches, owner => kept === undefined || (owner !== undefined && losers.some(l => upTo(l, owner))), rollOwner);
     } else if (absent !== undefined) {
@@ -355,7 +381,13 @@ export function reconcileHistories(histories: readonly GameHistory[], priority: 
         else { patches.push({ type: 'remove-player', playerId: p.id }); withdraw(game, p.id, patches, () => true, rollOwner); }
       }
     } else if (game.players.length > 32) {
-      const extra = game.players.filter(p => !baselineGame.players.some(b => b.id === p.id)).map(p => p.id).sort(byId).slice(-(game.players.length - 32));
+      // Keep the priority roster (baseline plus the priority participant's own additions) and withhold
+      // every concurrently competing addition: the causally latest additions not made by the priority.
+      const additionCreators = game.players.flatMap(p => baselineGame.players.some(b => b.id === p.id) ? [] : (creators.get(p.id) ?? []));
+      const owned = (id: string) => (creators.get(id) ?? []).some(i => inMask(inBaseline, i) || graph.authors[i] === priority.participantId);
+      const extra = game.players.filter(p => !baselineGame.players.some(b => b.id === p.id) && !owned(p.id)
+        && (creators.get(p.id) ?? []).every(c => !additionCreators.some(o => o !== c && graph.below(c, o)))).map(p => p.id).sort(byId);
+      check(extra.length > 0, 'Games need 1–32 players.');
       for (const playerId of extra) {
         candidates.push(...(creators.get(playerId) ?? []));
         patches.push({ type: 'remove-player', playerId });
@@ -370,9 +402,13 @@ export function reconcileHistories(histories: readonly GameHistory[], priority: 
   const game = projectHistory(history);
   const seen = new Set(Object.keys(histories[0].operations ?? {}));
   const notices = new Map<string, ConflictNotice>();
-  for (const op of Object.values(history.operations)) {
-    if (op.type !== 'resolution' || seen.has(op.id)) continue;
-    const notice = noticeFor(op, graph);
+  const final = new Graph([...Object.keys(history.seeds).sort(byId).map(id => ({ id, seed: history.seeds[id] })), ...orderOps(history)]);
+  const fresh = Object.values(history.operations).filter((op): op is Resolution => op.type === 'resolution' && !seen.has(op.id));
+  const extended = new Set(fresh.flatMap(op => op.extendedResolutionIds));
+  for (const op of fresh) {
+    // A chain link or an extended resolution is reported through the resolution that extends it.
+    if (extended.has(op.id)) continue;
+    const notice = noticeFor(op, final);
     if (notice) notices.set(notice.id, notice);
   }
   return {

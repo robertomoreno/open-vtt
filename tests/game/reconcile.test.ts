@@ -296,9 +296,7 @@ describe('granular reconciliation', () => {
     const ha: GameHistory = { modelVersion: 1, gameId: 'game', seeds: { 'legacy-a': a }, operations: {} };
     const hb: GameHistory = { modelVersion: 1, gameId: 'game', seeds: { 'legacy-b': b }, operations: {} };
     const result = reconcileHistories([ha, hb], capturePriority(ha, 'opener', 'room'), namedRuntime('r'));
-    expect(result.game.players).toHaveLength(32);
-    expect(result.game.players.map(p => p.id)).not.toContain('b9');
-    expect(result.game.players.map(p => p.id)).toEqual(expect.arrayContaining(a.players.map(p => p.id)));
+    expect(result.game.players.map(p => p.id)).toEqual(a.players.map(p => p.id));
     expect(result.game.rolls.map(r => r.id)).toEqual(['rb-alex']);
     expect(result.notices.length).toBeGreaterThan(0);
   });
@@ -360,5 +358,69 @@ describe('granular reconciliation', () => {
     expect(result.rejectedIds).toEqual(['junk']);
     expect(result.game.name).toBe('Red Castle');
     expect([local, bad, priority]).toEqual(snapshot);
+  });
+
+  it('accounts for more than 128 competing same-field heads with bounded resolutions', () => {
+    const { alice, priority } = castle();
+    const h = alice.getHistory(), seed = Object.keys(h.seeds)[0], at = '2026-01-01T00:00:00.000Z';
+    const operations: GameHistory['operations'] = {};
+    for (let i = 0; i < 300; i++) operations[`n-${i}`] = { type: 'set-game-name', id: `n-${i}`, authorId: `p${i}`, parents: [seed], at, name: `Name ${i}` };
+    const result = reconcileHistories([h, { ...h, operations }], priority, namedRuntime('r'));
+    expect(result.game.name).toBe('Old Castle');
+    expect(Object.keys(operations).every(id => result.history.operations[id])).toBe(true);
+    const made = resolutions(result.history);
+    expect(made.every(op => op.type === 'resolution' && op.candidateHeads.length <= 128 && op.parents.length <= 128)).toBe(true);
+    const accounted = new Set(made.flatMap(op => op.type === 'resolution' ? op.candidateHeads : []));
+    expect(Object.keys(operations).every(id => accounted.has(id))).toBe(true);
+    expect(result.notices).toHaveLength(1);
+    expect(result.notices[0].candidates).toHaveLength(300);
+    expect(projectHistory(result.history)).toEqual(result.game);
+    expect(reconcileHistories([result.history], priority, namedRuntime('again')).history).toEqual(result.history);
+  });
+
+  it('keeps the priority participant’s valid edits to a kept player on an ID collision', () => {
+    const { alice, bob, carol, priority } = castle();
+    alice.applyLocal({ type: 'set-player-name', playerId: 'cy', name: 'Cyan' });
+    alice.applyLocal({ type: 'set-player-role', playerId: 'cy', role: 'gm' });
+    carol.applyLocal({ type: 'set-player-name', playerId: 'bea', name: 'Bee' });
+    const h = bob.getHistory(), seed = Object.keys(h.seeds)[0], at = '2026-01-01T00:00:00.000Z';
+    const forged: GameHistory = { ...h, operations: {
+      'x-1': { type: 'add-player', id: 'x-1', authorId: 'bob', parents: [seed], at, player: { id: 'cy', name: 'Cyrus', role: 'pj' } },
+      'x-2': { type: 'roll', id: 'x-2', authorId: 'bob', parents: ['x-1'], at, playerId: 'alex', sides: 20, value: 5 },
+    } };
+    const result = reconcileHistories([alice.getHistory(), forged, carol.getHistory()], priority, namedRuntime('r'));
+    expect(result.game.players).toEqual([{ id: 'alex', name: 'Alex', role: 'gm' }, { id: 'bea', name: 'Bee', role: 'pj' }, { id: 'cy', name: 'Cyan', role: 'gm' }]);
+    expect(result.game.rolls.map(r => r.id)).toEqual(['x-2']);
+    expect(projectHistory(result.history)).toEqual(result.game);
+  });
+
+  describe('roster bound follows priority, not ID order', () => {
+    const roster = (n: number) => ({ ...fixtureRoster(), name: 'Old Castle', players: Array.from({ length: n }, (_, i) => ({ id: `p${String(i).padStart(2, '0')}`, name: `P ${i}`, role: 'pj' as const })) });
+    it('keeps the baseline roster when the priority added neither record', () => {
+      const alice = createTestWorkspace('alice', roster(31));
+      const bob = forkTestWorkspace(alice, 'bob'), carol = forkTestWorkspace(alice, 'carol');
+      const priority = capturePriority(alice.getHistory(), alice.replicaId, 't');
+      const b = addPlayer(bob, { id: 'aaa', name: 'Bobby', role: 'pj' }, 'bob-add');
+      const c = addPlayer(carol, { id: 'zzz', name: 'Carly', role: 'pj' }, 'carol-add');
+      carol.applyLocal({ type: 'roll', playerId: 'p00', sides: 6 });
+      bob.applyLocal({ type: 'set-game-name', name: 'Red Castle' });
+      const result = reconcileHistories([alice.getHistory(), bob.getHistory(), carol.getHistory()], priority, namedRuntime('r'));
+      expect(result.game.players.map(p => p.id)).toEqual(roster(31).players.map(p => p.id));
+      expect(result.game.rolls.map(r => r.playerId)).toEqual(['p00']);
+      expect(result.game.name).toBe('Red Castle');
+      expect(result.history.operations[b.id]).toEqual(b);
+      expect(result.history.operations[c.id]).toEqual(c);
+      expect(projectHistory(result.history)).toEqual(result.game);
+    });
+    it('retains the priority participant’s own addition and withholds the other', () => {
+      const alice = createTestWorkspace('alice', roster(31));
+      const bob = forkTestWorkspace(alice, 'bob');
+      const priority = capturePriority(alice.getHistory(), alice.replicaId, 't');
+      addPlayer(alice, { id: 'zzz', name: 'Alicia', role: 'pj' }, 'alice-add');
+      addPlayer(bob, { id: 'aaa', name: 'Bobby', role: 'pj' }, 'bob-add');
+      const result = reconcileHistories([alice.getHistory(), bob.getHistory()], priority, namedRuntime('r'));
+      expect(result.game.players.map(p => p.id)).toEqual([...roster(31).players.map(p => p.id), 'zzz']);
+      expect(projectHistory(result.history)).toEqual(result.game);
+    });
   });
 });
