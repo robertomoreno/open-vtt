@@ -18,6 +18,7 @@
     "@playwright/test": "^1.56.1",
     "@types/node": "^26.6.5",
     "@types/ws": "8.18.2",
+    "fake-indexeddb": "6.2.7",
     "jsdom": "^27.0.1",
     "typescript": "^5.9.3",
     "vite": "^7.1.12",
