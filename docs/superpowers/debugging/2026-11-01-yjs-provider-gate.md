@@ -45,3 +45,29 @@ Awareness metadata pruned (public `awareness.meta`), per-connection one-channel 
 - Peer-local guard errors no longer set the room phase `failed`; the error label is kept while the phase follows native opens.
 - Room teardown: if the key never settles (rejected/hung derivation) no `status` arrives; teardown is forced after 10 s so the lock and owned awareness are released. Upstream's own rejected-key promise rejection cannot be caught without its private `provider.key`.
 - The BroadcastChannel blocker above is unchanged: **Task 2's hard gate remains blocked; Task 3 stays paused.**
+
+
+---
+
+# Revised provider (Trystero Core 0.26.0 over public WSS) — gate status: NOT GREEN (endpoint unreachable)
+
+Everything above is the history of the stock `y-webrtc@10.3.0` attempt, which was stopped by the BroadcastChannel blocker. The provider was revised (see `docs/superpowers/specs/2026-11-02-yjs-bounded-provider-design.md`). The revised transport uses `@trystero-p2p/core@0.26.0` directly with public `createTopicStrategy`, `rtcPolyfill`, `rtcConfig`, `maxReceiveBytes`, `onReceive`/`onReceiveProgress` and `getPeers`; no BroadcastChannel, umbrella package, vendored patch or global replacement.
+
+## Observed results (2026-11-02, operator: Task 2 subagent, macOS, Node v26.5.0, Playwright Chromium + WebKit)
+
+| Check | Result |
+|---|---|
+| Unit/DOM tests (`npm test`) | 25 files / 152 tests pass; the pre-existing Node ExperimentalWarning about `localStorage` remains |
+| `npm run typecheck`, `npm run build` | pass |
+| `npm run check:signaling -- wss://y-webrtc-eu.fly.dev` (revised random-topic subscribe/publish probe) | **fail**, 8+ attempts between 08:58 and 09:07 UTC: "could not connect" (TCP/TLS/WebSocket handshake stalls; `curl` to the host timed out after 8 s; DNS resolves). `wss://signaling.yjs.dev` and the two `y-webrtc-signaling-*.herokuapp.com` hosts also did not connect |
+| Public gate, `interoperability` project, `provider-gate.spec.ts`, Chromium→WebKit and WebKit→Chromium | **fail, both directions** (09:01 and 09:04–09:06 UTC): native opens stayed 0 on the first page for 60 s because discovery never reached the relay |
+
+**The technical gate is not green and Task 3 must not assume it is.** The failure is environmental (the public endpoint did not answer), not an observed application failure; it also means the endpoint's support for the custom topic/publish protocol is *unproven*, not disproven. Earlier (y-webrtc era) runs showed the same endpoint working intermittently, so a rerun when it answers is the next step.
+
+## Diagnostic that is NOT gate evidence
+
+To separate "endpoint down" from "application bug", an uncommitted temporary spec routed the page WebSockets (Playwright `routeWebSocket`) to an in-test topic relay implementing the same `subscribe`/`unsubscribe`/`publish` envelopes. Real Trystero Core, the real bounded RTC guard and real browser native data channels were used; only the signaling server was mocked. Chromium→WebKit and WebKit→Chromium both passed: native opens >0 on both sides, 1.5 MB values byte-for-byte both ways, small and large values still delivered after closing the signaling sockets, and teardown. This found and fixed a real bug (an incoming data channel that was already `open` at hand-off never delivered `open` to Trystero, so the peer never connected). It does not substitute for the public-endpoint gate.
+
+## Hooks check
+
+Trystero Core's public hooks were sufficient for every bound: `rtcPolyfill` wraps the native `RTCPeerConnection` (exact 16,384-byte physical frames, 1 MiB native buffer, one ordered/reliable channel per peer, ≤31 connections, 4/8 MiB outbound queues, 4 incomplete transfers/10 s expiry/8 MiB pending inbound), `onReceive` rejects >2 MiB payloads, a fifth pending transfer per peer and >8 MiB aggregate, and inactivity (10 s, extended by `onReceiveProgress`) closes the attributable peer via `getPeers()`. Not implemented: automatic signaling-socket reconnection (a dropped relay socket ends discovery; established channels continue).

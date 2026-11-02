@@ -1,44 +1,57 @@
-import type { Awareness } from 'y-protocols/awareness';
-import type * as Y from 'yjs';
-import { ADMITTED_PARTICIPANTS, AWARENESS_BYTES, AWARENESS_TOMBSTONES, HEARTBEAT_MS, KEY_SETTLE_MS, NATIVE_REMOTE_CONNECTIONS } from './limits';
+import * as Y from 'yjs';
+import type { JoinRoom, JoinRoomConfig, MessageAction, Room } from '@trystero-p2p/core';
 import { roomNetworkConfig } from './config';
+import { ACTION_TOKEN_BURST, ACTION_TOKEN_REFILL_PER_SECOND, ADMITTED_PARTICIPANTS, AWARENESS_BYTES, CONTROL_BYTES, CONTROL_ENTRIES, EXPIRY_MS, HEARTBEAT_MS, INCOMPLETE_TRANSFERS, MESSAGE_BYTES, NATIVE_REMOTE_CONNECTIONS, PENDING_ADMISSIONS, PENDING_INBOUND_BYTES, TRANSFER_TIMEOUT_MS } from './limits';
 import type { RoomLink } from './room-link';
-import { createBoundedRtcRuntime } from './rtc-runtime';
+import { createBoundedRtcRuntime, type RtcConstructors } from './rtc-runtime';
 
 export type RoomTransportView = {
   phase: 'looking' | 'connected' | 'failed' | 'closed';
   openRtcConnections: number;
-  bcPeerCount: number;
   presence: Array<{ id: string; seenAt: number }>;
   error: string | null;
 };
 export type RoomTransport = { getView(): RoomTransportView; subscribe(fn: () => void): () => void; close(): void };
+export type RoomTransportOptions = { join?: JoinRoom<JoinRoomConfig>; native?: RtcConstructors };
 
 const participantPattern = /^[A-Za-z0-9_-]{1,64}$/;
-type RoomLock = { settled: Promise<void> | null; resolve?: () => void };
-const roomLocks = new Map<string, RoomLock>();
+const SYNC_ACTION = 'gather-sync-v2';
+const PRESENCE_ACTION = 'gather-presence-v2';
+const encoder = new TextEncoder();
 
-export type RoomTransportOptions = { awareness?: Awareness };
+function bucket(now: () => number) {
+  let tokens = ACTION_TOKEN_BURST, at = now();
+  return () => {
+    const time = now();
+    tokens = Math.min(ACTION_TOKEN_BURST, tokens + ((time - at) / 1000) * ACTION_TOKEN_REFILL_PER_SECOND);
+    at = time;
+    if (tokens < 1) return false;
+    tokens--;
+    return true;
+  };
+}
 
 export function createRoomTransport(doc: Y.Doc, link: RoomLink, participantId: string, options: RoomTransportOptions = {}): RoomTransport {
-  const roomName = 'gather-v2:' + link.roomId;
   const listeners = new Set<() => void>();
-  const seen = new Map<number, { id: string; seenAt: number }>();
-  let phase: RoomTransportView['phase'] = 'looking';
+  const peers = new Set<string>();
+  const participants = new Map<string, string>();
+  const seen = new Map<string, { id: string; seenAt: number }>();
+  const expiries = new Map<string, ReturnType<typeof setTimeout>>();
+  const limiters = new Map<string, () => boolean>();
+  const pendingByPeer = new Map<string, Set<{ bytes: number; restart(): void; cancel(): void }>>();
+  let pendingBytes = 0;
+  let pendingHandshakes = 0;
+  let phase: 'looking' | 'failed' | 'closed' = 'looking';
   let error: string | null = null;
-  let bcPeerCount = 0;
   let closed = false;
   let runtime: ReturnType<typeof createBoundedRtcRuntime> | undefined;
-  let provider: any;
+  let room: Room | undefined;
   let heartbeat: ReturnType<typeof setInterval> | undefined;
   let view: RoomTransportView | undefined;
-  let lock: RoomLock | undefined;
-  let previous: Promise<void> | null = null;
-  let opened = false;
-  let started = false;
+  let selfSeenAt = Date.now();
 
   const notify = () => { view = undefined; for (const fn of [...listeners]) fn(); };
-  // A guard failure closes only the offending peer; it must not mark the whole room failed while other channels are open.
+  // A fault from one peer closes only that peer; it must not fail the room while other channels are open.
   const peerError = (message: string) => {
     if (closed) return;
     error = message;
@@ -50,123 +63,160 @@ export function createRoomTransport(doc: Y.Doc, link: RoomLink, participantId: s
     error = message;
     notify();
   };
+  const closePeer = (peerId: string) => { try { room?.getPeers()[peerId]?.close(); } catch { /* already gone */ } };
 
-  const unsupported = typeof RTCPeerConnection !== 'function' || typeof RTCSessionDescription !== 'function' || typeof RTCIceCandidate !== 'function' || typeof WebSocket !== 'function' || !globalThis.crypto?.subtle;
+  const unsupported = typeof RTCPeerConnection !== 'function' || typeof WebSocket !== 'function' || !globalThis.crypto?.subtle;
   if (unsupported) {
     phase = 'failed';
     error = 'This browser does not support WebRTC data channels, WebSocket signaling, or secure-context cryptography.';
-  } else if (roomLocks.get(roomName) && !roomLocks.get(roomName)!.settled) {
-    phase = 'failed';
-    error = 'This room is already open in this page.';
   } else {
-    previous = roomLocks.get(roomName)?.settled ?? null;
-    lock = { settled: null };
-    roomLocks.set(roomName, lock);
     void start();
   }
 
-  function release() {
-    if (!lock) return;
-    if (roomLocks.get(roomName) === lock) roomLocks.delete(roomName);
-    lock.resolve?.();
-  }
-
   async function start() {
-    started = true;
-    if (previous) await previous;
-    if (closed) { release(); return; }
-    let module: typeof import('y-webrtc');
-    let protocols: typeof import('y-protocols/awareness');
+    let join: JoinRoom<JoinRoomConfig>;
     try {
-      [module, protocols] = await Promise.all([import('y-webrtc'), import('y-protocols/awareness')]);
+      join = options.join ?? (await import('./trystero-signaling')).createGatherSignalingStrategy();
     } catch {
       fail('The room transport could not be loaded.');
-      release();
       return;
     }
-    if (closed) { release(); return; }
-    runtime = createBoundedRtcRuntime({ now: () => Date.now(), onChange: notify, onError: peerError });
+    await Promise.resolve();
+    if (closed) return;
+    runtime = createBoundedRtcRuntime({ native: options.native, now: () => Date.now(), onChange: notify, onError: peerError });
     try {
-      provider = new module.WebrtcProvider(roomName, doc, {
+      room = join({
+        appId: 'gather-v2',
         password: link.secret,
-        awareness: options.awareness ?? new protocols.Awareness(doc),
-        signaling: roomNetworkConfig.signaling,
-        maxConns: NATIVE_REMOTE_CONNECTIONS,
-        peerOpts: { wrtc: runtime.wrtc, config: roomNetworkConfig.rtc },
-      });
+        maxReceiveBytes: 8 * 1024 * 1024,
+        relayConfig: { urls: roomNetworkConfig.signaling },
+        rtcConfig: roomNetworkConfig.rtc,
+        rtcPolyfill: runtime.rtcPolyfill,
+      }, link.roomId, { onPeerHandshake: handshake, onJoinError: () => peerError('Room discovery failed.') });
+      wire(room);
     } catch {
       fail('The room transport could not start.');
-      release();
+      runtime.close();
       return;
     }
-    const awareness = provider.awareness;
-    const encoder = new TextEncoder();
-    // y-protocols stores remote states before it emits 'update'; enforce retained-state bounds here.
-    const refresh = (clients: number[]) => {
-      const states = awareness.getStates() as Map<number, unknown>;
-      const reject: number[] = [];
-      for (const client of clients) {
-        const state = states.get(client) as { id?: unknown } | undefined;
-        const valid = state !== undefined && state !== null && typeof state.id === 'string' && participantPattern.test(state.id) && encoder.encode(JSON.stringify(state)).byteLength <= AWARENESS_BYTES;
-        const admitted = valid && (seen.has(client) || seen.size < ADMITTED_PARTICIPANTS);
-        if (admitted) {
-          seen.set(client, { id: state.id as string, seenAt: Date.now() });
-        } else {
-          seen.delete(client);
-          if (state !== undefined && client !== awareness.clientID) reject.push(client);
-        }
-      }
-      if (reject.length > 0) protocols.removeAwarenessStates(awareness, reject, 'gather-bounds');
+    selfSeenAt = Date.now();
+    heartbeat = setInterval(beat, HEARTBEAT_MS);
+    notify();
+  }
+
+  // The handshake exchanges the protocol version and an opaque label; it does not authenticate a person.
+  async function handshake(peerId: string, send: (data: any) => Promise<void>, receive: () => Promise<{ data: any }>) {
+    if (pendingHandshakes >= PENDING_ADMISSIONS || peers.size + pendingHandshakes >= ADMITTED_PARTICIPANTS - 1) throw new Error('busy');
+    pendingHandshakes++;
+    try {
+      await send({ v: 2, id: participantId });
+      const { data } = await receive();
+      const keys = data !== null && typeof data === 'object' ? Object.keys(data) : [];
+      if (keys.length !== 2 || data.v !== 2 || typeof data.id !== 'string' || !participantPattern.test(data.id)) throw new Error('rejected');
+      participants.set(peerId, data.id);
+    } finally {
+      pendingHandshakes--;
+    }
+  }
+
+  function admission(peerId: string, bytes: number, signal: AbortSignal): boolean {
+    if (closed) return false;
+    const set = pendingByPeer.get(peerId) ?? new Set();
+    if (bytes > MESSAGE_BYTES || set.size >= INCOMPLETE_TRANSFERS || pendingBytes + bytes > PENDING_INBOUND_BYTES) { peerError('Peer sent too much pending data.'); return false; }
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const entry = {
+      bytes,
+      restart() { clearTimeout(timer); timer = setTimeout(() => { settle(); peerError('Peer transfer expired.'); closePeer(peerId); }, TRANSFER_TIMEOUT_MS); },
+      cancel() { clearTimeout(timer); },
     };
-    // y-protocols records a clock for every client it has ever seen, even with a null state and without emitting 'update'.
-    // Keep those clocks (they reject stale replays) but cap how many stateless ones are retained, at insertion time.
-    const states = awareness.getStates() as Map<number, unknown>;
-    const oldMeta = awareness.meta as Map<number, { clock: number; lastUpdated: number }>;
-    const trimMeta = (meta: Map<number, { clock: number; lastUpdated: number }>) => {
-      let stateless = 0;
-      for (const key of meta.keys()) if (!states.has(key) && key !== awareness.clientID) stateless++;
-      for (const key of [...meta.keys()]) {
-        if (stateless <= AWARENESS_TOMBSTONES) break;
-        if (!states.has(key) && key !== awareness.clientID) { meta.delete(key); stateless--; }
-      }
+    const settle = () => {
+      if (!set.delete(entry)) return;
+      clearTimeout(timer);
+      pendingBytes -= bytes;
+      if (set.size === 0) pendingByPeer.delete(peerId);
     };
-    const bounded = new class extends Map<number, { clock: number; lastUpdated: number }> {
-      override set(client: number, value: { clock: number; lastUpdated: number }) {
-        super.set(client, value);
-        trimMeta(this);
-        return this;
-      }
-    }();
-    for (const [client, value] of oldMeta) Map.prototype.set.call(bounded, client, value);
-    awareness.meta = bounded;
-    awareness.on('update', ({ added, updated, removed }: { added: number[]; updated: number[]; removed: number[] }) => {
+    set.add(entry);
+    pendingByPeer.set(peerId, set);
+    pendingBytes += bytes;
+    entry.restart();
+    if (signal.aborted) settle(); else signal.addEventListener('abort', settle, { once: true });
+    return true;
+  }
+
+  function wire(joined: Room) {
+    const sync = joined.makeAction<Uint8Array>(SYNC_ACTION, {
+      onReceive: context => admission(context.peerId, context.byteLength, context.signal),
+      onReceiveProgress: (_progress, context) => { for (const entry of pendingByPeer.get(context.peerId) ?? []) entry.restart(); },
+      onMessage: (data, context) => {
+        if (closed || !peers.has(context.peerId)) return;
+        if (!(data instanceof Uint8Array) || data.byteLength > MESSAGE_BYTES) { peerError('Peer sent an invalid update.'); return; }
+        try { Y.applyUpdate(doc, data, context.peerId); } catch { peerError('Peer sent an invalid update.'); }
+      },
+    }) as MessageAction<Uint8Array>;
+    const presence = joined.makeAction<any>(PRESENCE_ACTION, {
+      onReceive: context => context.byteLength <= AWARENESS_BYTES,
+      onMessage: (data, context) => {
+        if (closed || !peers.has(context.peerId)) return;
+        if (!(limiters.get(context.peerId) ?? (limiters.set(context.peerId, bucket(() => Date.now())), limiters.get(context.peerId)!))()) return;
+        const known = participants.get(context.peerId);
+        if (data === null || typeof data !== 'object' || Object.keys(data).length !== 1 || typeof data.id !== 'string' || data.id !== known) return;
+        if (encoder.encode(JSON.stringify(data)).byteLength > AWARENESS_BYTES) return;
+        if (!seen.has(context.peerId) && (seen.size >= CONTROL_ENTRIES || seen.size + 1 >= ADMITTED_PARTICIPANTS)) return;
+        const peerId = context.peerId;
+        seen.set(peerId, { id: data.id, seenAt: Date.now() });
+        clearTimeout(expiries.get(peerId));
+        expiries.set(peerId, setTimeout(() => { expiries.delete(peerId); if (seen.delete(peerId) && !closed) notify(); }, EXPIRY_MS));
+        notify();
+      },
+    }) as MessageAction<any>;
+    const targets = (except?: unknown) => [...peers].filter(peer => peer !== except);
+    const send = (action: MessageAction<any>, data: unknown, target: string | string[]) => {
+      Promise.resolve(action.send(data, { target })).catch(() => peerError('Peer send failed.'));
+    };
+    sendPresence = () => { const target = targets(); if (target.length > 0) send(presence, { id: participantId }, target); };
+    doc.on('update', onUpdate);
+    function onUpdate(update: Uint8Array, origin: unknown) {
       if (closed) return;
-      for (const client of removed) seen.delete(client);
-      refresh([...added, ...updated]);
-      // states rejected above became stateless; trim after y-webrtc's own update handler has encoded them
-      queueMicrotask(() => { if (!closed) trimMeta(awareness.meta); });
-      notify();
-    });
-    // status.connected only means discovery is enabled; the phase follows actual native channel opens instead.
-    provider.on('status', () => { opened = true; });
-    provider.on('peers', ({ bcPeers }: { bcPeers: string[] }) => {
+      const target = targets(origin);
+      if (target.length > 0) send(sync, update, target);
+    }
+    removeUpdate = () => doc.off('update', onUpdate);
+    joined.onPeerJoin = peerId => {
       if (closed) return;
-      bcPeerCount = bcPeers.length;
+      if (peers.size >= NATIVE_REMOTE_CONNECTIONS) { closePeer(peerId); return; }
+      peers.add(peerId);
+      send(sync, Y.encodeStateAsUpdate(doc), peerId);
+      send(presence, { id: participantId }, peerId);
       notify();
-    });
-    let beat = 0;
-    const announce = () => { awareness.setLocalState({ id: participantId, beat: beat++ }); };
-    announce();
-    heartbeat = setInterval(announce, HEARTBEAT_MS);
+    };
+    joined.onPeerLeave = peerId => {
+      peers.delete(peerId);
+      participants.delete(peerId);
+      limiters.delete(peerId);
+      seen.delete(peerId);
+      clearTimeout(expiries.get(peerId));
+      expiries.delete(peerId);
+      for (const entry of pendingByPeer.get(peerId) ?? []) { entry.cancel(); pendingBytes -= entry.bytes; }
+      pendingByPeer.delete(peerId);
+      if (!closed) notify();
+    };
+  }
+  let sendPresence = () => {};
+  let removeUpdate = () => {};
+
+  function beat() {
+    if (closed) return;
+    selfSeenAt = Date.now();
+    sendPresence();
+    notify();
   }
 
   return {
     getView() {
       view ??= {
-        phase: phase === 'looking' && (runtime?.getOpenCount() ?? 0) > 0 ? 'connected' : phase,
+        phase: phase !== 'looking' ? phase : (runtime?.getOpenCount() ?? 0) > 0 ? 'connected' : 'looking',
         openRtcConnections: runtime?.getOpenCount() ?? 0,
-        bcPeerCount,
-        presence: [...seen.values()].sort((a, b) => a.id.localeCompare(b.id)).map(entry => ({ ...entry })),
+        presence: closed || phase === 'failed' || !room ? [] : [{ id: participantId, seenAt: selfSeenAt }, ...seen.values()].sort((a, b) => a.id.localeCompare(b.id)).map(entry => ({ ...entry })),
         error,
       };
       return view;
@@ -178,30 +228,21 @@ export function createRoomTransport(doc: Y.Doc, link: RoomLink, participantId: s
     close() {
       if (closed) return;
       closed = true;
-      if (heartbeat !== undefined) clearInterval(heartbeat);
-      if (lock) { const current = lock; current.settled = new Promise<void>(resolve => { current.resolve = resolve; }); }
-      if (provider) {
-        const owned = provider;
-        owned.disconnect();
-        let finished = false;
-        let deadline: ReturnType<typeof setTimeout> | undefined;
-        const finish = () => {
-          if (finished) return;
-          finished = true;
-          if (deadline !== undefined) clearTimeout(deadline);
-          owned.destroy();
-          if (!options.awareness) owned.awareness.destroy();
-          // upstream waits for key derivation inside destroy(); release the lock only after that microtask has run
-          queueMicrotask(release);
-        };
-        // before the key resolves upstream has no room yet; wait for its first status event so destroy() tears down the room it opens
-        // If key derivation fails or never settles upstream emits no status; force teardown after a deadline so the lock is not held forever.
-        if (opened) finish(); else { owned.once('status', finish); deadline = setTimeout(finish, KEY_SETTLE_MS); }
-      } else if (!started) release();
-      runtime?.close();
       phase = 'closed';
+      if (heartbeat !== undefined) clearInterval(heartbeat);
+      removeUpdate();
+      for (const set of pendingByPeer.values()) for (const entry of set) entry.cancel();
+      const owned = room;
+      room = undefined;
+      try { void Promise.resolve(owned?.leave()).catch(() => {}); } catch { /* leaving is best effort */ }
+      runtime?.close();
+      for (const set of pendingByPeer.values()) set.clear();
+      pendingByPeer.clear();
+      peers.clear();
       seen.clear();
-      bcPeerCount = 0;
+      for (const timer of expiries.values()) clearTimeout(timer);
+      expiries.clear();
+      pendingBytes = 0;
       notify();
     },
   };

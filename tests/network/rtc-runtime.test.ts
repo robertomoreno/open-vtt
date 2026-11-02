@@ -23,7 +23,7 @@ class FakePc extends EventTarget {
   incoming(c: FakeChannel) { const e = new Event('datachannel') as Event & { channel: FakeChannel }; e.channel = c; this.dispatchEvent(e); }
   close() { this.closed++; for (const c of this.channels) c.close(); }
 }
-const native = { RTCPeerConnection: FakePc, RTCSessionDescription: class {}, RTCIceCandidate: class {} } as unknown as RtcConstructors;
+const native = { RTCPeerConnection: FakePc } as unknown as RtcConstructors;
 const make = (errors: string[] = []) => {
   const changes = { n: 0 };
   const runtime = createBoundedRtcRuntime({ native, now: () => Date.now(), onChange: () => { changes.n++; }, onError: m => errors.push(m) });
@@ -35,7 +35,7 @@ afterEach(() => { FakePc.all = []; vi.useRealTimers(); });
 describe('bounded RTC runtime', () => {
   it('counts only actually-open native channels and reports changes', () => {
     const { runtime, changes } = make();
-    const pc = new runtime.wrtc.RTCPeerConnection();
+    const pc = new runtime.rtcPolyfill();
     const ch = pc.createDataChannel('x');
     expect(runtime.getOpenCount()).toBe(0);
     (FakePc.all[0].channels[0]).open();
@@ -47,7 +47,7 @@ describe('bounded RTC runtime', () => {
 
   it('frames outgoing messages into ≤16 KiB native sends and reassembles inbound frames', () => {
     const { runtime } = make();
-    const pc = new runtime.wrtc.RTCPeerConnection();
+    const pc = new runtime.rtcPolyfill();
     const ch = pc.createDataChannel('x');
     const native0 = FakePc.all[0].channels[0]; native0.open();
     const got: ArrayBuffer[] = [];
@@ -62,7 +62,7 @@ describe('bounded RTC runtime', () => {
 
   it('does not push more than 1 MiB into the native buffer and resumes on drain', () => {
     const { runtime } = make();
-    const ch = new runtime.wrtc.RTCPeerConnection().createDataChannel('x');
+    const ch = new runtime.rtcPolyfill().createDataChannel('x');
     const n = FakePc.all[0].channels[0]; n.open();
     ch.send(new Uint8Array(2 * 1024 * 1024));
     expect(n.bufferedAmount).toBeLessThan(1024 * 1024 + 16_384);
@@ -74,7 +74,7 @@ describe('bounded RTC runtime', () => {
 
   it('never exceeds the 1 MiB native buffer: the next frame must fit', () => {
     const { runtime } = make();
-    const ch = new runtime.wrtc.RTCPeerConnection().createDataChannel('x');
+    const ch = new runtime.rtcPolyfill().createDataChannel('x');
     const n = FakePc.all[0].channels[0]; n.open();
     n.bufferedAmount = 1_040_000;
     ch.send(new Uint8Array(40_000));
@@ -90,7 +90,7 @@ describe('bounded RTC runtime', () => {
   it('fails the connection (native close + onclose to the owner) when a send overflows the queue, instead of silently dropping', () => {
     const errors: string[] = [];
     const { runtime } = make(errors);
-    const ch = new runtime.wrtc.RTCPeerConnection().createDataChannel('x');
+    const ch = new runtime.rtcPolyfill().createDataChannel('x');
     const n = FakePc.all[0].channels[0]; n.open();
     let closes = 0; ch.onclose = () => { closes++; };
     ch.send(new Uint8Array(2 * 1024 * 1024)); ch.send(new Uint8Array(2 * 1024 * 1024));
@@ -103,7 +103,7 @@ describe('bounded RTC runtime', () => {
 
   it('fails the connection for an over-2MiB send', () => {
     const { runtime } = make();
-    const ch = new runtime.wrtc.RTCPeerConnection().createDataChannel('x');
+    const ch = new runtime.rtcPolyfill().createDataChannel('x');
     const n = FakePc.all[0].channels[0]; n.open();
     let closes = 0; ch.onclose = () => { closes++; };
     expect(() => ch.send(new Uint8Array(2 * 1024 * 1024 + 1))).toThrow();
@@ -114,7 +114,7 @@ describe('bounded RTC runtime', () => {
   it('treats a second channel as a misbehaving peer: closes the whole connection and notifies the owner', () => {
     const errors: string[] = [];
     const { runtime } = make(errors);
-    const pc = new runtime.wrtc.RTCPeerConnection();
+    const pc = new runtime.rtcPolyfill();
     const first = pc.createDataChannel('x');
     let closes = 0; first.onclose = () => { closes++; };
     let iceNotices = 0; (pc as any).oniceconnectionstatechange = () => { iceNotices++; };
@@ -136,7 +136,7 @@ describe('bounded RTC runtime', () => {
     vi.useFakeTimers();
     const errors: string[] = [];
     const { runtime } = make(errors);
-    const ch = new runtime.wrtc.RTCPeerConnection().createDataChannel('x');
+    const ch = new runtime.rtcPolyfill().createDataChannel('x');
     let closes = 0; ch.onclose = () => { closes++; };
     const n = FakePc.all[0].channels[0]; n.open();
     n.receive(frame(40_000)[0]);
@@ -154,7 +154,7 @@ describe('bounded RTC runtime', () => {
   it('replays the close to a handler installed after an early guard failure (unreliable local channel)', async () => {
     const errors: string[] = [];
     const { runtime } = make(errors);
-    const pc = new runtime.wrtc.RTCPeerConnection();
+    const pc = new runtime.rtcPolyfill();
     const ch = pc.createDataChannel('x', { ordered: false });
     expect(FakePc.all[0].channels[0].closed).toBe(1);
     let closes = 0;
@@ -170,7 +170,7 @@ describe('bounded RTC runtime', () => {
   it('closes the owning connection and notifies it when the incoming-channel handler throws', () => {
     const errors: string[] = [];
     const { runtime } = make(errors);
-    const pc = new runtime.wrtc.RTCPeerConnection();
+    const pc = new runtime.rtcPolyfill();
     let iceNotices = 0; (pc as any).oniceconnectionstatechange = () => { iceNotices++; };
     pc.ondatachannel = () => { throw new Error('secret'); };
     const incoming = new FakeChannel();
@@ -184,7 +184,7 @@ describe('bounded RTC runtime', () => {
   it('isolates an invalid frame to the peer that sent it', () => {
     const errors: string[] = [];
     const { runtime } = make(errors);
-    const a = new runtime.wrtc.RTCPeerConnection(), b = new runtime.wrtc.RTCPeerConnection();
+    const a = new runtime.rtcPolyfill(), b = new runtime.rtcPolyfill();
     const ca = a.createDataChannel('x'), cb = b.createDataChannel('x');
     const [na, nb] = FakePc.all.map(p => p.channels[0]); na.open(); nb.open();
     const gotA: unknown[] = [], gotB: unknown[] = [];
@@ -205,7 +205,7 @@ describe('bounded RTC runtime', () => {
     vi.useFakeTimers();
     const errors: string[] = [];
     const { runtime } = make(errors);
-    const ch = new runtime.wrtc.RTCPeerConnection().createDataChannel('x');
+    const ch = new runtime.rtcPolyfill().createDataChannel('x');
     const n = FakePc.all[0].channels[0]; n.open();
     let closes = 0; ch.onclose = () => { closes++; };
     ch.onmessage = () => { throw new Error('secret-listener-detail'); };
@@ -220,14 +220,14 @@ describe('bounded RTC runtime', () => {
   it('closes unordered or lossy channels', () => {
     const errors: string[] = [];
     const { runtime } = make(errors);
-    new runtime.wrtc.RTCPeerConnection().createDataChannel('x', { ordered: false });
+    new runtime.rtcPolyfill().createDataChannel('x', { ordered: false });
     expect(FakePc.all[0].channels[0].closed).toBe(1);
     expect(errors).toEqual(['Peer channel is not ordered and reliable.']);
   });
 
   it('wraps channels received through ondatachannel', () => {
     const { runtime } = make();
-    const pc = new runtime.wrtc.RTCPeerConnection();
+    const pc = new runtime.rtcPolyfill();
     let received: any;
     pc.ondatachannel = (e: any) => { received = e.channel; };
     const incoming = new FakeChannel();
@@ -240,14 +240,14 @@ describe('bounded RTC runtime', () => {
 
   it('refuses a 32nd concurrent native connection', () => {
     const { runtime } = make();
-    for (let i = 0; i < 31; i++) new runtime.wrtc.RTCPeerConnection();
-    expect(() => new runtime.wrtc.RTCPeerConnection()).toThrow();
+    for (let i = 0; i < 31; i++) new runtime.rtcPolyfill();
+    expect(() => new runtime.rtcPolyfill()).toThrow();
   });
 
   it('closes every native object once, leaves no timers, and tolerates repeated close', () => {
     vi.useFakeTimers();
     const { runtime } = make();
-    const pcs = [0, 1, 2].map(() => new runtime.wrtc.RTCPeerConnection());
+    const pcs = [0, 1, 2].map(() => new runtime.rtcPolyfill());
     pcs.forEach(p => p.createDataChannel('x'));
     FakePc.all.forEach(p => p.channels[0].open());
     expect(runtime.getOpenCount()).toBe(3);
@@ -255,15 +255,34 @@ describe('bounded RTC runtime', () => {
     expect(runtime.getOpenCount()).toBe(0);
     expect(FakePc.all.map(p => p.closed)).toEqual([1, 1, 1]);
     expect(vi.getTimerCount()).toBe(0);
-    expect(() => new runtime.wrtc.RTCPeerConnection()).toThrow();
+    expect(() => new runtime.rtcPolyfill()).toThrow();
   });
 
   it('does not report change callbacks after close', () => {
     const { runtime, changes } = make();
-    new runtime.wrtc.RTCPeerConnection().createDataChannel('x');
+    new runtime.rtcPolyfill().createDataChannel('x');
     runtime.close();
     const n = changes.n;
     FakePc.all[0].channels[0].open();
     expect(changes.n).toBe(n);
+  });
+});
+
+describe('open announcement', () => {
+  it('still delivers the open event to the owner when the incoming channel was already open at hand-off', () => {
+    const { runtime } = make();
+    const pc = new runtime.rtcPolyfill();
+    let received: any;
+    pc.ondatachannel = (e: any) => { received = e.channel; };
+    const incoming = new FakeChannel();
+    incoming.readyState = 'open';
+    FakePc.all[0].incoming(incoming);
+    expect(runtime.getOpenCount()).toBe(1);
+    let opens = 0;
+    received.onopen = () => { opens++; };
+    incoming.dispatchEvent(new Event('open'));
+    incoming.dispatchEvent(new Event('open'));
+    expect(opens).toBe(1);
+    expect(runtime.getOpenCount()).toBe(1);
   });
 });

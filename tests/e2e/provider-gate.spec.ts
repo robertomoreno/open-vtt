@@ -23,7 +23,7 @@ async function open(browser: Browser, link: string, participant: string, sockets
 const opens = (page: Page) => page.locator('#opens');
 
 for (const [a, b] of [['chromium', 'webkit'], ['webkit', 'chromium']]) {
-  test(`${a} ↔ ${b}: real y-webrtc signaling opens native channels that carry exact large binary values in both directions, survive signaling loss, and tear down`, async () => {
+  test(`${a} ↔ ${b}: real Trystero Core signaling over public WSS opens native channels that carry exact large binary values in both directions, survive signaling loss, and tear down`, async () => {
     test.setTimeout(150_000);
     const browserA = await engines[a].launch(), browserB = await engines[b].launch();
     try {

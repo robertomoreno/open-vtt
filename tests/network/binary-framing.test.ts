@@ -15,7 +15,7 @@ describe('binary framing', () => {
 
   it('frames and exactly reassembles a 2-MiB binary sync message', () => {
     const bytes = new Uint8Array(2 * MiB).fill(7);
-    const assembler = createBinaryAssembler(() => 0, createInboundBudget());
+    const assembler = createBinaryAssembler(() => 0, createInboundBudget(), vi.fn());
     let result: Uint8Array | undefined;
     for (const frame of encodeBinaryFrames(bytes, 1)) {
       expect(frame.byteLength).toBeLessThanOrEqual(16_384);
@@ -31,7 +31,7 @@ describe('binary framing', () => {
   });
 
   it('reassembles an empty message and out-of-order-free interleaved transfers', () => {
-    const assembler = createBinaryAssembler(() => 0, createInboundBudget());
+    const assembler = createBinaryAssembler(() => 0, createInboundBudget(), vi.fn());
     const a = frames(new Uint8Array(20_000).fill(1), 1), b = frames(new Uint8Array(20_000).fill(2), 2);
     expect(assembler.accept(a[0])).toBeUndefined();
     expect(assembler.accept(b[0])).toBeUndefined();
@@ -63,18 +63,18 @@ describe('binary framing', () => {
     ['short frame', good.subarray(0, 10)],
     ['oversized frame', new Uint8Array(16_385)],
   ])('rejects %s', (_name, frame) => {
-    expect(() => createBinaryAssembler(() => 0, createInboundBudget()).accept(frame)).toThrow();
+    expect(() => createBinaryAssembler(() => 0, createInboundBudget(), vi.fn()).accept(frame)).toThrow();
   });
 
   it('rejects a duplicate fragment', () => {
-    const assembler = createBinaryAssembler(() => 0, createInboundBudget());
+    const assembler = createBinaryAssembler(() => 0, createInboundBudget(), vi.fn());
     const [first] = frames(new Uint8Array(40_000), 1);
     assembler.accept(first);
     expect(() => assembler.accept(first)).toThrow();
   });
 
   it('rejects a transfer whose declared fragments exceed 2 MiB', () => {
-    const assembler = createBinaryAssembler(() => 0, createInboundBudget());
+    const assembler = createBinaryAssembler(() => 0, createInboundBudget(), vi.fn());
     const full = frames(new Uint8Array(2 * MiB), 1);
     const extra = header(full[0], v => { v.setUint16(10, 129); v.setUint16(12, 130); });
     const rest = full.slice(0, 128).map(f => header(f, v => v.setUint16(12, 130)));
@@ -82,14 +82,14 @@ describe('binary framing', () => {
   });
 
   it('rejects a fifth incomplete transfer on one connection', () => {
-    const assembler = createBinaryAssembler(() => 0, createInboundBudget());
+    const assembler = createBinaryAssembler(() => 0, createInboundBudget(), vi.fn());
     for (let id = 1; id <= 4; id++) assembler.accept(frames(new Uint8Array(40_000), id)[0]);
     expect(() => assembler.accept(frames(new Uint8Array(40_000), 5)[0])).toThrow();
   });
 
   it('rejects aggregate pending bytes above 8 MiB across connections and recovers after clear', () => {
     const budget = createInboundBudget();
-    const assemblers = Array.from({ length: 5 }, () => createBinaryAssembler(() => 0, budget));
+    const assemblers = Array.from({ length: 5 }, () => createBinaryAssembler(() => 0, budget, vi.fn()));
     const partial = (id: number) => frames(new Uint8Array(2 * MiB), id).slice(0, 128);
     for (const frame of partial(1)) assemblers[0].accept(frame);
     for (const frame of partial(2)) assemblers[1].accept(frame);
@@ -103,7 +103,7 @@ describe('binary framing', () => {
   it('expires an incomplete transfer after 10,000 ms and releases its bytes', () => {
     let now = 0;
     const budget = createInboundBudget();
-    const assembler = createBinaryAssembler(() => now, budget);
+    const assembler = createBinaryAssembler(() => now, budget, vi.fn());
     const [first, second, third] = frames(new Uint8Array(40_000), 1);
     assembler.accept(first);
     now = 10_000;
@@ -115,7 +115,7 @@ describe('binary framing', () => {
 
   it('expires and releases an idle incomplete transfer at 10,001 ms with no further input, then leaves no timer', () => {
     const budget = createInboundBudget();
-    const assembler = createBinaryAssembler(() => Date.now(), budget);
+    const assembler = createBinaryAssembler(() => Date.now(), budget, vi.fn());
     assembler.accept(frames(new Uint8Array(40_000), 1)[0]);
     expect(budget.reserved()).toBe(16_368);
     vi.advanceTimersByTime(10_000);
@@ -127,7 +127,7 @@ describe('binary framing', () => {
 
   it('clear() cancels the expiry timer and releases reservations', () => {
     const budget = createInboundBudget();
-    const assembler = createBinaryAssembler(() => Date.now(), budget);
+    const assembler = createBinaryAssembler(() => Date.now(), budget, vi.fn());
     assembler.accept(frames(new Uint8Array(40_000), 1)[0]);
     assembler.clear();
     expect(budget.reserved()).toBe(0);
@@ -136,7 +136,7 @@ describe('binary framing', () => {
 
   it('expires each incomplete transfer by its own start time', () => {
     const budget = createInboundBudget();
-    const assembler = createBinaryAssembler(() => Date.now(), budget);
+    const assembler = createBinaryAssembler(() => Date.now(), budget, vi.fn());
     assembler.accept(frames(new Uint8Array(40_000), 1)[0]);
     vi.advanceTimersByTime(6_000);
     assembler.accept(frames(new Uint8Array(40_000), 2)[0]);
@@ -149,12 +149,14 @@ describe('binary framing', () => {
   it('signals the owner exactly once when a transfer expires with no further input', () => {
     const budget = createInboundBudget();
     let expired = 0;
-    const assembler = createBinaryAssembler(() => Date.now(), budget, () => { expired++; });
+    const ids: number[] = [];
+    const assembler = createBinaryAssembler(() => Date.now(), budget, id => { expired++; ids.push(id); });
     assembler.accept(frames(new Uint8Array(40_000), 1)[0]);
     vi.advanceTimersByTime(10_000);
     expect(expired).toBe(0);
     vi.advanceTimersByTime(1);
     expect(expired).toBe(1);
+    expect(ids).toEqual([1]);
     expect(budget.reserved()).toBe(0);
     vi.advanceTimersByTime(60_000);
     expect(expired).toBe(1);
@@ -162,7 +164,7 @@ describe('binary framing', () => {
 
   it('fails the next frame when any other transfer expired, instead of silently dropping it', () => {
     let now = 0;
-    const assembler = createBinaryAssembler(() => now, createInboundBudget());
+    const assembler = createBinaryAssembler(() => now, createInboundBudget(), vi.fn());
     assembler.accept(frames(new Uint8Array(40_000), 1)[0]);
     now = 10_001;
     expect(() => assembler.accept(frames(new Uint8Array(40_000), 2)[0])).toThrow();

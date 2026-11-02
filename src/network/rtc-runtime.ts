@@ -1,17 +1,13 @@
 import { createBinaryAssembler, createInboundBudget, encodeBinaryFrames } from './binary-framing';
 import { MESSAGE_BYTES, NATIVE_BUFFERED_BYTES, NATIVE_BUFFER_LOW_BYTES, NATIVE_REMOTE_CONNECTIONS, OUTBOUND_QUEUE_CONNECTION_BYTES, OUTBOUND_QUEUE_TOTAL_BYTES } from './limits';
 
-export type RtcConstructors = Pick<typeof globalThis, 'RTCPeerConnection' | 'RTCSessionDescription' | 'RTCIceCandidate'>;
+export type RtcConstructors = Pick<typeof globalThis, 'RTCPeerConnection'>;
 type Options = { native?: RtcConstructors; now: () => number; onChange: () => void; onError: (message: string) => void };
 type Handler = ((event: any) => void) | null;
 type Frames = { iterator: Iterator<Uint8Array>; bytes: number; held?: Uint8Array };
 
 export function createBoundedRtcRuntime(options: Options) {
-  const native: RtcConstructors = options.native ?? {
-    RTCPeerConnection: globalThis.RTCPeerConnection,
-    RTCSessionDescription: globalThis.RTCSessionDescription,
-    RTCIceCandidate: globalThis.RTCIceCandidate,
-  };
+  const native: RtcConstructors = options.native ?? { RTCPeerConnection: globalThis.RTCPeerConnection };
   const NativePc = native.RTCPeerConnection as unknown as new (config?: RTCConfiguration) => any;
   const inbound = createInboundBudget();
   const connections = new Set<any>();
@@ -35,8 +31,12 @@ export function createBoundedRtcRuntime(options: Options) {
     let threshold = 0;
     const handlers: Record<'onopen' | 'onclose' | 'onerror' | 'onmessage' | 'onbufferedamountlow', Handler> = { onopen: null, onclose: null, onerror: null, onmessage: null, onbufferedamountlow: null };
 
+    const bus = new EventTarget();
     const call = (name: keyof typeof handlers, event: unknown): boolean => {
-      try { handlers[name]?.(event); return true; } catch { return false; }
+      let ok = true;
+      try { handlers[name]?.(event); } catch { ok = false; }
+      try { bus.dispatchEvent(new Event(name.slice(2))); } catch { /* listener errors are reported by the platform */ }
+      return ok;
     };
     const notifyClose = (event: unknown) => {
       if (handlers.onclose) call('onclose', event);
@@ -100,6 +100,8 @@ export function createBoundedRtcRuntime(options: Options) {
         pump();
       },
       close() { api.shutdown(); },
+      addEventListener: (type: string, fn: EventListenerOrEventListenerObject, options?: AddEventListenerOptions | boolean) => bus.addEventListener(type, fn, options),
+      removeEventListener: (type: string, fn: EventListenerOrEventListenerObject, options?: EventListenerOptions | boolean) => bus.removeEventListener(type, fn, options),
     };
     for (const name of Object.keys(handlers) as (keyof typeof handlers)[]) {
       Object.defineProperty(api, name, {
@@ -120,7 +122,14 @@ export function createBoundedRtcRuntime(options: Options) {
     }
     channel.binaryType = 'arraybuffer';
     channel.bufferedAmountLowThreshold = NATIVE_BUFFER_LOW_BYTES;
-    listen('open', event => { if (done || opened) return; opened = true; openCount++; changed(); if (!call('onopen', event)) { fail('Peer handler failed.'); return; } pump(); });
+    let announced = false;
+    listen('open', event => {
+      if (done || announced) return;
+      announced = true;
+      if (!opened) { opened = true; openCount++; changed(); }
+      if (!call('onopen', event)) { fail('Peer handler failed.'); return; }
+      pump();
+    });
     listen('close', event => { const wasDone = done; markClosed(); if (!wasDone) notifyClose(event); });
     listen('error', event => { if (!call('onerror', event)) fail('Peer handler failed.'); });
     listen('bufferedamountlow', () => {
@@ -177,7 +186,7 @@ export function createBoundedRtcRuntime(options: Options) {
       this.#wrapped.push(wrapped);
       return wrapped;
     }
-    // Close this connection and tell its owner (simple-peer reacts to iceConnectionState 'closed').
+    // Close this connection and tell its owner (Trystero reacts to iceConnectionState 'closed').
     abort() {
       if (this.#aborted) return;
       this.#aborted = true;
@@ -194,7 +203,7 @@ export function createBoundedRtcRuntime(options: Options) {
   }
 
   return {
-    wrtc: { RTCPeerConnection: GuardedPeerConnection, RTCSessionDescription: native.RTCSessionDescription, RTCIceCandidate: native.RTCIceCandidate } as unknown as RtcConstructors,
+    rtcPolyfill: GuardedPeerConnection as unknown as RtcConstructors['RTCPeerConnection'],
     getOpenCount: () => openCount,
     close() {
       if (closed) return;
