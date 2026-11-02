@@ -62,7 +62,7 @@ Everything above is the history of the stock `y-webrtc@10.3.0` attempt, which wa
 | `npm run check:signaling -- wss://y-webrtc-eu.fly.dev` (revised random-topic subscribe/publish probe) | **fail**, 8+ attempts between 08:58 and 09:07 UTC: "could not connect" (TCP/TLS/WebSocket handshake stalls; `curl` to the host timed out after 8 s; DNS resolves). `wss://signaling.yjs.dev` and the two `y-webrtc-signaling-*.herokuapp.com` hosts also did not connect |
 | Public gate, `interoperability` project, `provider-gate.spec.ts`, Chromium→WebKit and WebKit→Chromium | **fail, both directions** (09:01 and 09:04–09:06 UTC): native opens stayed 0 on the first page for 60 s because discovery never reached the relay |
 
-**The technical gate is not green and Task 3 must not assume it is.** The failure is environmental (the public endpoint did not answer), not an observed application failure; it also means the endpoint's support for the custom topic/publish protocol is *unproven*, not disproven. Earlier (y-webrtc era) runs showed the same endpoint working intermittently, so a rerun when it answers is the next step.
+**The technical gate is not green and Task 3 must not assume it is.** The WSS probe could not connect and both browser runs had zero native opens. This is consistent with endpoint unavailability, but it does not prove the adapter is correct; support for the custom topic/publish protocol remains unproven. Earlier (y-webrtc era) runs showed the endpoint working intermittently, so rerun the probe and provider gate when reachable.
 
 ## Diagnostic that is NOT gate evidence
 
@@ -71,3 +71,12 @@ To separate "endpoint down" from "application bug", an uncommitted temporary spe
 ## Hooks check (amended after review)
 
 Implemented checks (unit-tested against fakes only; **not** verified all-path against the public endpoint or real browser Core): `rtcPolyfill` wraps the native `RTCPeerConnection` (16,384-byte physical frames, 1 MiB native buffer, one ordered/reliable channel per peer, ≤31 connections, 4/8 MiB outbound queues, 4 incomplete physical-frame transfers with 10 s *inactivity* expiry per last valid fragment, 8 MiB pending inbound); one shared `onReceive` admission serves both sync (2 MiB) and presence (8 KiB) actions: 4 pending per peer, 8 MiB aggregate, idempotent single settlement (abort, peer leave, timeout, close). The documented hooks give `onReceive`/`onReceiveProgress` context without a transfer ID, so each outbound message carries a small `metadata: {t}` that the receiver uses to key a transfer; progress that cannot be attributed (missing/unknown/duplicate `t`) extends nothing, so a peer gains no extra time. This relies on Core delivering sender metadata in both contexts (read from the 0.26.0 source, not yet observed in a browser run). Signaling envelopes are limited to 128 KiB UTF-8 on the complete message in both directions, with pending publishes bounded (64 queued, 8 s) and rejected on close/error. Real Core abort/leave ordering and mixed sync/presence behavior have not been exercised against actual Core peers because the gate is blocked. Not implemented: automatic signaling-socket reconnection.
+
+
+## Additional verification after final listener fix (2026-11-02; controller rerun)
+
+- `npm test`: 26 files / 193 tests passed. Node v26.5.0 emitted its existing experimental localStorage warning.
+- `npm run typecheck` and `npm run build`: passed.
+- `npm run check:signaling -- wss://y-webrtc-eu.fly.dev`: failed with `signaling probe failed: could not connect to wss://y-webrtc-eu.fly.dev`.
+- `npm run test:e2e -- --project=interoperability tests/e2e/provider-gate.spec.ts`: both Chromium→WebKit and WebKit→Chromium failed; `#opens` remained `0` through the 60-second assertion. No native connection was established, so large-payload, post-signaling-loss, and teardown assertions were not reached. This does not establish protocol compatibility or rule out an application issue.
+- No Firefox, shipping Safari, branded Edge, or broader network matrix was tested. Failure traces remain in ignored `test-results/`; no trace or room link was published.
