@@ -408,3 +408,53 @@ describe('native EventTarget semantics on the wrapper', () => {
     expect(fn).toHaveBeenCalledTimes(1);
   });
 });
+
+describe('close replay with no live listener', () => {
+  // the guard failure happens only after the stale registration, which is the edge case
+  const failed = () => {
+    const { runtime } = make();
+    const ch: any = new runtime.rtcPolyfill().createDataChannel('x');
+    const native = FakePc.all[0].channels[0]; native.open();
+    return { ch, native, fail: () => native.receive(new Uint8Array(40)) };
+  };
+  const stale: Array<[string, (ch: any, fn: () => void) => void]> = [
+    ['an already-aborted signal', (ch, fn) => { const c = new AbortController(); c.abort(); ch.addEventListener('close', fn, { signal: c.signal }); }],
+    ['a removed listener', (ch, fn) => { ch.addEventListener('close', fn); ch.removeEventListener('close', fn); }],
+    ['a listener whose signal aborted later', (ch, fn) => { const c = new AbortController(); ch.addEventListener('close', fn, { signal: c.signal }); c.abort(); }],
+  ];
+  for (const [label, register] of stale) {
+    it(`still replays the close to a later onclose after ${label}`, async () => {
+      const { ch, fail } = failed();
+      const stale = vi.fn(), later = vi.fn();
+      register(ch, stale);
+      fail();
+      await Promise.resolve();
+      ch.onclose = later;
+      await Promise.resolve(); await Promise.resolve();
+      expect(stale).not.toHaveBeenCalled();
+      expect(later).toHaveBeenCalledTimes(1);
+      expect((later.mock.calls[0] as any)[0]).toBeInstanceOf(Event);
+    });
+    it(`still replays the close once to a later addEventListener after ${label}`, async () => {
+      const { ch, fail } = failed();
+      const stale = vi.fn(), later = vi.fn();
+      register(ch, stale);
+      fail();
+      ch.addEventListener('close', later);
+      await Promise.resolve(); await Promise.resolve();
+      expect(stale).not.toHaveBeenCalled();
+      expect(later).toHaveBeenCalledTimes(1);
+      expect((later.mock.calls[0] as any)[0].target).toBe(ch);
+    });
+  }
+
+  it('delivers the close to a live once listener exactly once and does not replay it', async () => {
+    const { ch, fail } = failed();
+    const once = vi.fn();
+    ch.addEventListener('close', once, { once: true });
+    fail();
+    ch.onclose = vi.fn();
+    await Promise.resolve(); await Promise.resolve();
+    expect(once).toHaveBeenCalledTimes(1);
+  });
+});
