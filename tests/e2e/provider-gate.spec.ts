@@ -3,6 +3,14 @@ import { createRoomLink, roomLink } from '../../src/network/room-link';
 
 const engines: Record<string, BrowserType> = { chromium, webkit };
 const FIXTURE = '/tests/e2e/fixtures/provider-gate.html';
+const localRelayUrl = process.env.GATHER_LOCAL_SIGNALING_WS;
+
+if (localRelayUrl) {
+  const parsed = new URL(localRelayUrl);
+  if (parsed.protocol !== 'ws:' || !['127.0.0.1', 'localhost'].includes(parsed.hostname)) {
+    throw new Error('GATHER_LOCAL_SIGNALING_WS must point to a loopback ws:// server.');
+  }
+}
 
 function expectedLarge(seed: number): string {
   const bytes = Buffer.alloc(1_500_000);
@@ -10,10 +18,47 @@ function expectedLarge(seed: number): string {
   return bytes.toString('base64');
 }
 
+async function bridgeLocalRelay(route: WebSocketRoute, url: string): Promise<void> {
+  const relay = new WebSocket(url);
+  await new Promise<void>((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error('Timed out connecting to the local signaling relay.')), 3_000);
+    relay.addEventListener('open', () => { clearTimeout(timer); resolve(); }, { once: true });
+    relay.addEventListener('error', () => { clearTimeout(timer); reject(new Error('Could not connect to the local signaling relay.')); }, { once: true });
+  });
+
+  let closing = false;
+  route.onMessage(message => {
+    if (relay.readyState === WebSocket.OPEN) relay.send(message);
+  });
+  route.onClose(() => {
+    closing = true;
+    if (relay.readyState < WebSocket.CLOSING) relay.close();
+  });
+  relay.addEventListener('message', event => {
+    if (!closing) route.send(String(event.data));
+  });
+  relay.addEventListener('close', () => {
+    if (!closing) {
+      closing = true;
+      void route.close();
+    }
+  });
+  relay.addEventListener('error', () => {
+    if (!closing) {
+      closing = true;
+      void route.close();
+    }
+  });
+}
+
 async function open(browser: Browser, link: string, participant: string, sockets: WebSocketRoute[]): Promise<Page> {
   const context = await browser.newContext({ baseURL: 'http://localhost:5173' });
   const page = await context.newPage();
-  await page.routeWebSocket(/^wss:/, ws => { ws.connectToServer(); sockets.push(ws); });
+  await page.routeWebSocket(/^wss:/, async ws => {
+    sockets.push(ws);
+    if (localRelayUrl) await bridgeLocalRelay(ws, localRelayUrl);
+    else ws.connectToServer();
+  });
   await page.goto(FIXTURE);
   await page.getByLabel('Room link').fill(link);
   await page.getByLabel('Participant').fill(participant);
@@ -23,7 +68,8 @@ async function open(browser: Browser, link: string, participant: string, sockets
 const opens = (page: Page) => page.locator('#opens');
 
 for (const [a, b] of [['chromium', 'webkit'], ['webkit', 'chromium']]) {
-  test(`${a} ↔ ${b}: real Trystero Core signaling over public WSS opens native channels that carry exact large binary values in both directions, survive signaling loss, and tear down`, async () => {
+  const signalingPath = localRelayUrl ? 'a local y-webrtc-compatible relay' : 'public WSS';
+  test(`${a} ↔ ${b}: real Trystero Core signaling over ${signalingPath} opens native channels that carry exact large binary values in both directions, survive signaling loss, and tear down`, async () => {
     test.setTimeout(150_000);
     const browserA = await engines[a].launch(), browserB = await engines[b].launch();
     try {
