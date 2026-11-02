@@ -71,17 +71,24 @@ export function createBoundedRtcRuntime(options: Options) {
       registration.signal?.removeEventListener('abort', registration.onAbort!);
       EventTarget.prototype.removeEventListener.call(api, 'close', registration.wrapper, { capture });
     };
+    // signal.aborted is authoritative: an earlier abort listener may have stopped our cleanup listener from running
+    const pruneAborted = () => {
+      for (const [fn, registrations] of [...liveClose]) {
+        for (const [capture, registration] of [...registrations]) if (registration.signal?.aborted) removeClose(fn, capture, registration);
+      }
+    };
+    const hasLiveClose = () => { pruneAborted(); return handlers.onclose || liveClose.size > 0; };
     // a close recorded while nobody was listening is delivered once to the first live handler or listener that appears
     const replayClose = () => {
       if (!pendingClose) return;
       pendingClose = false;
       queueMicrotask(() => {
-        if (handlers.onclose || liveClose.size > 0) call('onclose', new Event('close'));
+        if (hasLiveClose()) call('onclose', new Event('close'));
         else pendingClose = true;
       });
     };
     const notifyClose = (event: unknown) => {
-      if (handlers.onclose || liveClose.size > 0) call('onclose', event);
+      if (hasLiveClose()) call('onclose', event);
       else pendingClose = true;
     };
     const markClosed = () => {
@@ -147,11 +154,13 @@ export function createBoundedRtcRuntime(options: Options) {
         if (type === 'close') {
           const capture = typeof options === 'boolean' ? options : options?.capture === true;
           const signal = typeof options === 'object' && options !== null ? options.signal : undefined;
+          pruneAborted();
           if (signal?.aborted || liveClose.get(fn)?.has(capture)) return;
           const once = typeof options === 'object' && options !== null && options.once === true;
           const registration: CloseRegistration = {
             signal,
             wrapper: function (this: unknown, event: Event) {
+              if (signal?.aborted) { removeClose(fn, capture, registration); return; }
               if (once) removeClose(fn, capture, registration);
               try { typeof fn === 'function' ? fn.call(this, event) : fn.handleEvent(event); } catch { listenerFailed = true; }
             },

@@ -448,6 +448,21 @@ describe('close replay with no live listener', () => {
     });
   }
 
+  it('ignores an aborted listener whose abort cleanup was suppressed and replays the close once', async () => {
+    const { ch, fail } = failed();
+    const controller = new AbortController();
+    controller.signal.addEventListener('abort', event => event.stopImmediatePropagation());
+    const stale = vi.fn(), later = vi.fn();
+    ch.addEventListener('close', stale, { signal: controller.signal });
+    controller.abort();
+    fail();
+    await Promise.resolve();
+    ch.onclose = later;
+    await Promise.resolve(); await Promise.resolve();
+    expect(stale).not.toHaveBeenCalled();
+    expect(later).toHaveBeenCalledTimes(1);
+  });
+
   it('delivers the close to a live once listener exactly once and does not replay it', async () => {
     const { ch, fail } = failed();
     const once = vi.fn();
