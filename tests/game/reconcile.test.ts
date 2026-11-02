@@ -423,4 +423,48 @@ describe('granular reconciliation', () => {
       expect(projectHistory(result.history)).toEqual(result.game);
     });
   });
+
+  it('quarantines concurrent renames of an already-withheld player instead of crashing', () => {
+    const { alice, bob, carol, priority } = castle();
+    addPlayer(bob, { id: 'dee-b', name: 'Dee', role: 'pj' }, 'bob-add');
+    addPlayer(carol, { id: 'dee-c', name: 'Dee', role: 'pj' }, 'carol-add');
+    const first = reconcileHistories([alice.getHistory(), bob.getHistory(), carol.getHistory()], priority, namedRuntime('r'));
+    const bob2 = forkTestWorkspace(bob, 'bob2');
+    bob.applyLocal({ type: 'set-player-name', playerId: 'dee-b', name: 'Dot' });
+    bob2.applyLocal({ type: 'set-player-name', playerId: 'dee-b', name: 'Dax' });
+    bob.applyLocal({ type: 'roll', playerId: 'alex', sides: 20 });
+    carol.applyLocal({ type: 'set-player-name', playerId: 'bea', name: 'Bee' });
+    const second = reconcileHistories([first.history, bob.getHistory(), bob2.getHistory(), carol.getHistory()], priority, namedRuntime('r2'));
+    expect(second.game.players.map(p => [p.id, p.name])).toEqual([['alex', 'Alex'], ['bea', 'Bee'], ['cy', 'Cy']]);
+    expect(second.game.rolls.map(r => r.playerId)).toEqual(['alex']);
+    expect(projectHistory(second.history)).toEqual(second.game);
+    expect(second.notices.some(n => n.reason === 'invariant' && n.candidates.some(c => c.operationId === 'bob-1') && n.candidates.some(c => c.operationId === 'bob2-1'))).toBe(true);
+    expect(reconcileHistories([second.history], priority, namedRuntime('r3')).history).toEqual(second.history);
+  });
+
+  it('orders more than 128 roll removals causally after the rolls they remove', () => {
+    const { alice, bob, carol, priority } = castle();
+    const add = addPlayer(bob, { id: 'dee-b', name: 'Dee', role: 'pj' }, 'bob-add');
+    addPlayer(carol, { id: 'dee-c', name: 'Dee', role: 'pj' }, 'carol-add');
+    bob.applyLocal({ type: 'roll', playerId: 'alex', sides: 20 });
+    carol.applyLocal({ type: 'roll', playerId: 'alex', sides: 8 });
+    // 140 mutually concurrent dependent rolls: none is an ancestor of another.
+    const h = bob.getHistory(), at = '2026-01-01T00:00:00.000Z', rolls: GameHistory['operations'] = {};
+    for (let i = 0; i < 140; i++) rolls[`d-${String(i).padStart(3, '0')}`] = { type: 'roll', id: `d-${String(i).padStart(3, '0')}`, authorId: `p${i}`, parents: [add.id], at, playerId: 'dee-b', sides: 6, value: 1 };
+    const result = reconcileHistories([alice.getHistory(), { ...h, operations: { ...h.operations, ...rolls } }, carol.getHistory()], priority, namedRuntime('r'));
+    expect(projectHistory(result.history)).toEqual(result.game);
+    expect(result.game.rolls.map(r => r.playerId)).toEqual(['alex', 'alex']);
+    const ops = result.history.operations;
+    const ancestors = (id: string) => { const seen = new Set<string>(), stack = [...(ops[id]?.parents ?? [])]; while (stack.length) { const x = stack.pop()!; if (!seen.has(x)) { seen.add(x); stack.push(...(ops[x]?.parents ?? [])); } } return seen; };
+    let removals = 0;
+    for (const op of resolutions(result.history)) {
+      if (op.type !== 'resolution') continue;
+      expect(op.patches.length).toBeLessThanOrEqual(128);
+      expect(op.parents.length).toBeLessThanOrEqual(128);
+      expect(op.candidateHeads.length).toBeLessThanOrEqual(128);
+      const past = ancestors(op.id);
+      for (const p of op.patches) if (p.type === 'remove-roll') { removals++; if (ops[p.rollId]) expect(past.has(p.rollId)).toBe(true); }
+    }
+    expect(removals).toBeGreaterThanOrEqual(140);
+  }, 60000);
 });

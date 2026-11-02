@@ -164,7 +164,7 @@ class Graph {
 
 type Deferred = { id: string; kind: 'roll' | 'add' | 'player'; key: string };
 /** Unvalidated projection mirroring `projectHistory`, reporting collisions no resolution accounts for yet. */
-function materialize(history: GameHistory): { game: Game; deferred: Deferred[]; rollOwner: Map<string, string> } {
+function materialize(history: GameHistory): { game: Game; deferred: Deferred[]; rollOwner: Map<string, string>; accounted: Set<string> } {
   const seedKeys = Object.keys(history.seeds).sort(byId), first = history.seeds[seedKeys[0]];
   const players = new Map<string, Player>(), rolls = new Map<string, Game['rolls'][number]>(), rollOwner = new Map<string, string>();
   const accounted = new Set<string>(), deferred: Deferred[] = [];
@@ -196,7 +196,7 @@ function materialize(history: GameHistory): { game: Game; deferred: Deferred[]; 
     else if (op.type === 'resolution') op.patches.forEach(p => apply(p, op.id));
     else apply(op, op.id);
   }
-  return { game: { ...first, name, players: [...players.values()], rolls: [...rolls.values()] }, deferred: deferred.filter(d => !accounted.has(d.id)), rollOwner };
+  return { game: { ...first, name, players: [...players.values()], rolls: [...rolls.values()] }, deferred: deferred.filter(d => !accounted.has(d.id)), rollOwner, accounted };
 }
 function orderOps(history: GameHistory): Node[] {
   const depth = new Map<string, number>();
@@ -216,6 +216,12 @@ function describe(value: unknown): string { return typeof value === 'string' ? `
  * candidates. Priority comes solely from `priority`, never from array order. Invalid baselines or
  * histories for another game fail closed; malformed operations are isolated in `rejectedIds`.
  * Inputs are never mutated.
+ *
+ * `pendingIds` name operations whose causal parents are missing; their payloads are deliberately
+ * left out of the returned `history`. The caller (Task 8's staging bridge, `readCandidates()`)
+ * remains their owner and must keep the original candidate histories/transient stage while an ID
+ * is pending, so a later reconciliation can admit it once its parents arrive. Never discard an
+ * operation merely because it appears in `pendingIds`.
  */
 export function reconcileHistories(histories: readonly GameHistory[], priority: PriorityContext, runtime: Runtime): Reconciliation {
   check(Array.isArray(histories) && histories.length > 0, 'Nothing to reconcile.');
@@ -264,34 +270,48 @@ export function reconcileHistories(histories: readonly GameHistory[], priority: 
     operations: sortedRecord(nodes.filter(n => n.op).map(n => [n.id, n.op!])),
   };
   const fallbackFrontier = frontier(baseline);
-  // Causal lists are bounded, so a component whose evidence exceeds the bound is published as a chain:
-  // each link cites the previous link plus the next bounded slice of evidence; the final link carries
-  // the full fallback evidence (all causal ancestors through the chain). Parents are the cited evidence
-  // only, never the whole frontier, which may itself exceed the bound.
+  // Causal lists are bounded, so a component whose evidence exceeds the bound is published as a chain.
+  // Each link's parents are the previous link plus the next bounded slice of evidence (baseline frontier,
+  // fallback base, candidate heads, then removed rolls). Each patch is carried by the first link whose
+  // ancestry contains what it changes: a `remove-roll` after its roll operation, every other patch after
+  // all candidate heads. Links that would otherwise carry no patch repeat an idempotent player/name patch,
+  // which the final link reapplies after every head. Parents are cited evidence only, never the whole
+  // frontier, which may itself exceed the bound. The final link holds the full fallback evidence.
   const publish = (patches: ResolutionPatch[], candidateHeads: number[], base: number[]) => {
     const heads = new Set(candidateHeads.map(i => nodes[i].id)), fallbackBase = base.map(i => nodes[i].id).sort(byId);
     check(fallbackBase.length <= CAUSAL_PARENTS, 'Conflict base exceeds the causal bound.');
-    // Removed rolls must be projected before the patch that removes them.
-    const removed = patches.flatMap(p => p.type === 'remove-roll' && Object.hasOwn(history.operations, p.rollId) ? [p.rollId] : []);
-    const queue = [...new Set([...fallbackFrontier, ...fallbackBase, ...[...heads].sort(byId), ...removed.sort(byId)])];
-    const chunks: ResolutionPatch[][] = [];
-    for (let k = 0; k < patches.length; k += CAUSAL_PARENTS) chunks.push(patches.slice(k, k + CAUSAL_PARENTS));
+    const opRoll = (p: ResolutionPatch) => p.type === 'remove-roll' && Object.hasOwn(history.operations, p.rollId) ? p.rollId : undefined;
+    const evidence = [...new Set([...fallbackFrontier, ...fallbackBase, ...[...heads].sort(byId)])];
+    const queue = [...new Set([...evidence, ...patches.flatMap(p => opRoll(p) ?? []).sort(byId)])];
+    const plans: string[][] = [];
+    for (let k = 0; k < queue.length || !plans.length;) { const n = plans.length ? CAUSAL_PARENTS - 1 : CAUSAL_PARENTS; plans.push(queue.slice(k, k + n)); k += n; }
+    const linkOf = new Map<string, number>();
+    plans.forEach((plan, i) => plan.forEach(id => linkOf.set(id, i)));
+    const ready = Math.max(0, ...evidence.map(id => linkOf.get(id)!));
+    const loads: ResolutionPatch[][] = plans.map(() => []);
+    for (const p of patches) {
+      let k = opRoll(p) !== undefined ? linkOf.get(opRoll(p)!)! : p.type === 'remove-roll' ? 0 : ready;
+      while ((loads[k]?.length ?? 0) >= CAUSAL_PARENTS) k++;
+      while (loads.length <= k) { loads.push([]); plans.push([]); }
+      loads[k].push(p);
+    }
+    const filler = patches.find(p => p.type !== 'remove-roll' && p.type !== 'put-roll');
     let link: string | undefined;
-    for (let step = 0; queue.length || step < chunks.length; step++) {
-      const taken = queue.splice(0, link ? CAUSAL_PARENTS - 1 : CAUSAL_PARENTS);
-      const parents = [...(link ? [link] : []), ...taken].sort(byId);
+    plans.forEach((plan, i) => {
+      if (!loads[i].length) { check(filler, 'Resolution chain has no idempotent patch.'); loads[i].push(filler); }
+      const parents = [...(link ? [link] : []), ...plan].sort(byId);
       const cited = parents.filter(id => id === link || heads.has(id));
-      const last = !queue.length;
+      const last = i === plans.length - 1;
       const op = validateOperation({
         type: 'resolution', id: runtime.id(), authorId: priority.participantId, parents, at: runtime.now(),
-        patches: chunks[Math.min(step, chunks.length - 1)], candidateHeads: cited,
+        patches: loads[i], candidateHeads: cited,
         fallbackBase: last ? fallbackBase : [], fallbackFrontier: last ? fallbackFrontier : [],
         extendedResolutionIds: cited.filter(id => (history.operations[id] ?? graph.node(id)?.op)?.type === 'resolution'),
       }) as Resolution;
       check(!Object.hasOwn(history.operations, op.id) && !Object.hasOwn(history.seeds, op.id), 'Operation ID collision.');
       history = { ...history, operations: { ...history.operations, [op.id]: op } };
       link = op.id;
-    }
+    });
   };
 
   // Field conflicts: only competing register heads with different values.
@@ -302,8 +322,11 @@ export function reconcileHistories(histories: readonly GameHistory[], priority: 
   nodes.forEach((node, i) => { for (const p of node.seed?.players ?? (node.op?.type === 'add-player' ? [node.op.player] : [])) creators.set(p.id, [...(creators.get(p.id) ?? []), i]); });
   const contested = new Set([...creators].filter(([, list]) => list.length > 1).map(([id]) => id));
   const all = new Uint32Array(inBaseline.length).fill(0xffffffff);
+  // Fields of players absent from the materialized roster (e.g. withheld by an earlier resolution) are
+  // dependent proposals: the invariant pass quarantines them instead of resolving a value.
+  const present = new Set(materialize(history).game.players.map(p => p.id));
   for (const reg of [...registers].sort(byId)) {
-    if (reg.startsWith('player:') && contested.has(reg.slice(7, reg.lastIndexOf('.')))) continue;
+    if (reg.startsWith('player:') && (contested.has(reg.slice(7, reg.lastIndexOf('.'))) || !present.has(reg.slice(7, reg.lastIndexOf('.'))))) continue;
     const heads = graph.maximal(graph.members(all).filter(i => i < nodes.length && graph.writes[i].has(reg)));
     if (new Set(heads.map(i => graph.writes[i].get(reg))).size <= 1) continue;
     const { value, base } = decide(reg, graph.expand(heads, reg));
@@ -328,7 +351,11 @@ export function reconcileHistories(histories: readonly GameHistory[], priority: 
     }
   };
   for (let round = 0; round <= 4 * GAME_OPERATIONS; round++) {
-    const { game, deferred, rollOwner } = materialize(history);
+    const { game, deferred, rollOwner, accounted } = materialize(history);
+    const onPresent = new Set(game.players.map(p => p.id));
+    const stray = nodes.filter(n => (n.op?.type === 'set-player-name' || n.op?.type === 'set-player-role') && !accounted.has(n.id) && !onPresent.has(n.op.playerId))
+      .map(n => ({ id: n.id, kind: 'player' as const, key: (n.op as Extract<GameOperation, { type: 'set-player-name' | 'set-player-role' }>).playerId }));
+    for (const d of stray) if (!deferred.some(x => x.id === d.id)) deferred.push(d);
     const patches: ResolutionPatch[] = [];
     let candidates: number[] = [];
     const collision = deferred.find(d => d.kind === 'roll'), duplicate = deferred.find(d => d.kind === 'add');
@@ -419,8 +446,16 @@ export function reconcileHistories(histories: readonly GameHistory[], priority: 
   };
 }
 
-function noticeFor(op: Resolution, graph: Graph): ConflictNotice | undefined {
-  if (!op.candidateHeads.every(id => graph.has(id))) return undefined;
+function noticeFor(final: Resolution, graph: Graph): ConflictNotice | undefined {
+  if (!final.candidateHeads.every(id => graph.has(id))) return undefined;
+  // A chain's patches are spread across its links; report their union.
+  const all: ResolutionPatch[] = [], seenPatch = new Set<string>(), stack = [final];
+  while (stack.length) {
+    const r = stack.pop()!;
+    for (const p of r.patches) { const k = JSON.stringify(p); if (!seenPatch.has(k)) { seenPatch.add(k); all.push(p); } }
+    for (const id of r.extendedResolutionIds) { const x = graph.node(id)?.op; if (x?.type === 'resolution') stack.push(x); }
+  }
+  const op = { ...final, patches: all };
   const heads = op.candidateHeads.map(id => graph.idx(id));
   const setters = op.patches.filter(p => p.type === 'set-game-name' || p.type === 'set-player-name' || p.type === 'set-player-role');
   const key = (p: ResolutionPatch) => p.type === 'set-game-name' ? 'game.name' : p.type === 'set-player-name' ? `player:${p.playerId}.name` : p.type === 'set-player-role' ? `player:${p.playerId}.role` : p.type === 'remove-player' ? `player:${p.playerId}` : p.type === 'put-player' ? `player:${p.player.id}` : p.type === 'put-roll' ? `roll:${p.roll.id}` : '';
