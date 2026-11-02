@@ -21,6 +21,7 @@ export function createBoundedRtcRuntime(options: Options) {
 
   function wrapChannel(channel: any) {
     let pendingClose = false;
+    let hasCloseListener = false;
     const abort = new AbortController();
     const assembler = createBinaryAssembler(options.now, inbound, () => fail('Peer transfer expired.'));
     const queue: Frames[] = [];
@@ -31,20 +32,38 @@ export function createBoundedRtcRuntime(options: Options) {
     let threshold = 0;
     const handlers: Record<'onopen' | 'onclose' | 'onerror' | 'onmessage' | 'onbufferedamountlow', Handler> = { onopen: null, onclose: null, onerror: null, onmessage: null, onbufferedamountlow: null };
 
-    // Own listener registry: EventTarget reports listener exceptions asynchronously and cannot be contained here.
-    const listeners = new Map<string, Array<{ fn: EventListenerOrEventListenerObject; once: boolean }>>();
-    const call = (name: keyof typeof handlers, event: any): boolean => {
-      let ok = true;
-      try { handlers[name]?.(event); } catch { ok = false; }
-      const type = name.slice(2);
-      for (const entry of [...(listeners.get(type) ?? [])]) {
-        if (entry.once) listeners.set(type, (listeners.get(type) ?? []).filter(other => other !== entry));
-        try { typeof entry.fn === 'function' ? entry.fn.call(api, event) : entry.fn.handleEvent(event); } catch { ok = false; }
+    // The wrapper is a real EventTarget so signal/once/dedupe and target/currentTarget keep native semantics; each registered
+    // listener is wrapped so an exception is contained (EventTarget would otherwise report it asynchronously and uncatchably).
+    const wrapped = new WeakMap<object, EventListener>();
+    const wrappers = new WeakSet<object>();
+    let listenerFailed = false;
+    const containing = (fn: EventListenerOrEventListenerObject): EventListener => {
+      if (wrappers.has(fn)) return fn as EventListener; // the platform calls removeEventListener with our wrapper on AbortSignal abort
+      let wrapper = wrapped.get(fn);
+      if (!wrapper) {
+        wrapper = function (this: unknown, event: Event) {
+          try { typeof fn === 'function' ? fn.call(this, event) : fn.handleEvent(event); } catch { listenerFailed = true; }
+        };
+        wrapped.set(fn, wrapper);
+        wrappers.add(wrapper);
       }
-      return ok;
+      return wrapper;
+    };
+    const retarget = (event: any): Event => {
+      if (event.target === null || event.target === undefined) return event;
+      const copy: any = new Event(event.type);
+      if ('error' in event) copy.error = event.error;
+      return copy;
+    };
+    const call = (name: keyof typeof handlers, original: any): boolean => {
+      const event = retarget(original);
+      let ok = true;
+      listenerFailed = false;
+      try { EventTarget.prototype.dispatchEvent.call(api, event); } catch { ok = false; }
+      return ok && !listenerFailed;
     };
     const notifyClose = (event: unknown) => {
-      if (handlers.onclose || (listeners.get('close')?.length ?? 0) > 0) call('onclose', event);
+      if (handlers.onclose || hasCloseListener) call('onclose', event);
       else pendingClose = true;
     };
     const markClosed = () => {
@@ -83,7 +102,7 @@ export function createBoundedRtcRuntime(options: Options) {
     };
     const total = () => channel.bufferedAmount + queued;
 
-    const api: any = {
+    const members: any = {
       shutdown() { const was = done; markClosed(); if (!was) { try { channel.close(); } catch { /* already closed */ } } },
       get label() { return channel.label; },
       get readyState() { return channel.readyState; },
@@ -105,20 +124,24 @@ export function createBoundedRtcRuntime(options: Options) {
         pump();
       },
       close() { api.shutdown(); },
-      addEventListener(type: string, fn: EventListenerOrEventListenerObject, options?: AddEventListenerOptions | boolean) {
-        const list = listeners.get(type) ?? [];
-        if (!list.some(entry => entry.fn === fn)) list.push({ fn, once: typeof options === 'object' && options.once === true });
-        listeners.set(type, list);
+      addEventListener(type: string, fn: EventListenerOrEventListenerObject | null, options?: AddEventListenerOptions | boolean) {
+        if (!fn) return;
+        if (type === 'close') hasCloseListener = true;
+        EventTarget.prototype.addEventListener.call(api, type, containing(fn), options);
       },
-      removeEventListener(type: string, fn: EventListenerOrEventListenerObject) {
-        listeners.set(type, (listeners.get(type) ?? []).filter(entry => entry.fn !== fn));
+      removeEventListener(type: string, fn: EventListenerOrEventListenerObject | null, options?: EventListenerOptions | boolean) {
+        if (fn) EventTarget.prototype.removeEventListener.call(api, type, containing(fn), options);
       },
     };
+    const api: any = Object.defineProperties(new EventTarget(), Object.getOwnPropertyDescriptors(members));
     for (const name of Object.keys(handlers) as (keyof typeof handlers)[]) {
+      let attached = false;
       Object.defineProperty(api, name, {
         get: () => handlers[name],
         set: (fn: Handler) => {
           handlers[name] = fn;
+          // the on* attribute is itself a listener (attached on first use), so it sees the wrapper as target/currentTarget
+          if (fn && !attached) { attached = true; EventTarget.prototype.addEventListener.call(api, name.slice(2), containing(event => handlers[name]?.(event))); }
           if (name === 'onclose' && fn && pendingClose) { pendingClose = false; queueMicrotask(() => call('onclose', new Event('close'))); }
         },
         enumerable: true,

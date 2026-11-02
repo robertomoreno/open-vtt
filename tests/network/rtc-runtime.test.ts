@@ -351,3 +351,60 @@ describe('channel listener API', () => {
     } finally { process.off('uncaughtException', uncaught); }
   });
 });
+
+describe('native EventTarget semantics on the wrapper', () => {
+  const open = () => {
+    const { runtime } = make();
+    const ch: any = new runtime.rtcPolyfill().createDataChannel('x');
+    const n = FakePc.all[0].channels[0]; n.open();
+    return { ch, n };
+  };
+
+  it('honours an already-aborted and a later-aborted AbortSignal registration', () => {
+    const { ch, n } = open();
+    const late = new AbortController(), early = new AbortController(); early.abort();
+    const lateSeen = vi.fn(), earlySeen = vi.fn(), plain = vi.fn();
+    ch.addEventListener('message', earlySeen, { signal: early.signal });
+    ch.addEventListener('message', lateSeen, { signal: late.signal });
+    ch.addEventListener('message', plain);
+    for (const f of frame(4)) n.receive(f);
+    late.abort();
+    for (const f of frame(4)) n.receive(f);
+    expect(earlySeen).not.toHaveBeenCalled();
+    expect(lateSeen).toHaveBeenCalledTimes(1);
+    expect(plain).toHaveBeenCalledTimes(2);
+  });
+
+  it('uses the wrapper, not the native channel, as target and currentTarget for every forwarded event', () => {
+    const { ch, n } = open();
+    const seen: Array<{ type: string; target: unknown; current: unknown }> = [];
+    for (const type of ['message', 'bufferedamountlow', 'close']) ch.addEventListener(type, (e: Event) => seen.push({ type, target: e.target, current: e.currentTarget }));
+    for (const f of frame(4)) n.receive(f);
+    n.drain();
+    n.dispatchEvent(new Event('close'));
+    expect(seen.map(entry => entry.type)).toEqual(['message', 'bufferedamountlow', 'close']);
+    for (const entry of seen) { expect([entry.type, entry.target === ch]).toEqual([entry.type, true]); expect([entry.type, entry.current === ch]).toEqual([entry.type, true]); expect(entry.target === n).toBe(false); }
+  });
+
+  it('gives an on* attribute handler the wrapper as target and currentTarget', () => {
+    const { ch, n } = open();
+    const seen: unknown[][] = [];
+    ch.onmessage = (e: Event) => seen.push([e.target, e.currentTarget]);
+    for (const f of frame(4)) n.receive(f);
+    expect(seen).toHaveLength(1);
+    expect(seen[0].every(t => t === ch)).toBe(true);
+  });
+
+  it('deduplicates the same listener, supports capture-insensitive removal, and handleEvent objects', () => {
+    const { ch, n } = open();
+    const fn = vi.fn(), obj = { handleEvent: vi.fn() };
+    ch.addEventListener('message', fn); ch.addEventListener('message', fn);
+    ch.addEventListener('message', obj);
+    for (const f of frame(4)) n.receive(f);
+    expect(fn).toHaveBeenCalledTimes(1);
+    expect(obj.handleEvent).toHaveBeenCalledTimes(1);
+    ch.removeEventListener('message', fn);
+    for (const f of frame(4)) n.receive(f);
+    expect(fn).toHaveBeenCalledTimes(1);
+  });
+});

@@ -145,15 +145,20 @@ export function createRoomTransport(doc: Y.Doc, link: RoomLink, participantId: s
         clearTimeout(timer);
         signal.removeEventListener('abort', transfer.settle);
         pendingBytes -= bytes;
+        const wasHead = peerTransfers.keys().next().value === key;
         peerTransfers.delete(key);
         if (peerTransfers.size === 0 && pendingByPeer.get(peerId) === peerTransfers) pendingByPeer.delete(peerId);
+        else if (wasHead && !closed) peerTransfers.values().next().value?.restart();
       },
     };
+    // Core runs one bulk transfer per peer at a time and queues the rest in arrival order, so only the head can make progress:
+    // its inactivity deadline runs from admission; a queued transfer's starts when it becomes head (or when its own progress arrives).
+    const isHead = peerTransfers.size === 0;
     peerTransfers.set(key, transfer);
     pendingByPeer.set(peerId, peerTransfers);
     pendingBytes += bytes;
     if (signal.aborted) { transfer.settle(); return true; }
-    transfer.restart();
+    if (isHead) transfer.restart();
     signal.addEventListener('abort', transfer.settle, { once: true });
     return true;
   }
