@@ -145,10 +145,13 @@ export function projectHistory(value: GameHistory): Game {
   const first = seeds[0];
   const players = new Map(first.players.map(p => [p.id, { ...p }]));
   const rolls = new Map(first.rolls.map(r => [r.id, { ...r }]));
+  // Collisions are deferred (first projected version kept) only when a resolution lists
+  // the colliding seed/operation among its candidate heads; otherwise projection fails.
+  const deferred = new Map<string, string>(), accounted = new Set<string>();
   for (const seed of seeds.slice(1)) {
     for (const player of seed.players) if (!players.has(player.id)) players.set(player.id, { ...player });
     for (const roll of seed.rolls) {
-      const existing = rolls.get(roll.id); if (existing) check(same(existing, roll), 'Roll ID collision.'); else rolls.set(roll.id, { ...roll });
+      const existing = rolls.get(roll.id); if (!existing) rolls.set(roll.id, { ...roll }); else if (!same(existing, roll)) deferred.set(seedKeys[seeds.indexOf(seed)], 'Roll ID collision.');
     }
   }
   let name = first.name, updatedAt = seeds.reduce((max, s) => s.updatedAt > max ? s.updatedAt : max, first.updatedAt);
@@ -167,12 +170,14 @@ export function projectHistory(value: GameHistory): Game {
   for (const op of operations) {
     if (op.at > updatedAt) updatedAt = op.at;
     switch (op.type) {
-      case 'set-game-name': case 'set-player-name': case 'set-player-role': apply(op); break;
-      case 'add-player': check(!players.has(op.player.id), 'Duplicate player ID.'); apply({ type: 'put-player', player: op.player }); break;
+      case 'set-game-name': apply(op); break;
+      case 'set-player-name': case 'set-player-role': if (players.has(op.playerId)) apply(op); else deferred.set(op.id, 'Unknown player reference.'); break;
+      case 'add-player': if (!players.has(op.player.id)) apply({ type: 'put-player', player: op.player }); else deferred.set(op.id, 'Duplicate player ID.'); break;
       case 'roll': apply({ type: 'put-roll', roll: { id: op.id, playerId: op.playerId, sides: op.sides, value: op.value, at: op.at } }); break;
-      case 'resolution': for (const p of op.patches) apply(p); break;
+      case 'resolution': for (const p of op.patches) apply(p); for (const head of op.candidateHeads) accounted.add(head); break;
     }
   }
+  for (const [key, message] of deferred) check(accounted.has(key), message);
   // Validate all retained roll references, even those outside the visible last 100.
   for (const roll of rolls.values()) check(players.has(roll.playerId), 'Unknown roll player reference.');
   return validateGame({ ...first, name, updatedAt, revision: Math.max(...seeds.map(s => s.revision)) + operations.filter(op => op.type !== 'resolution').length, players: [...players.values()], rolls: [...rolls.values()].slice(-100) });

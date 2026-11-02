@@ -68,4 +68,22 @@ describe('causal history', () => {
     expect(left.rolls.map(roll => roll.value)).toEqual([7, 6]);
     expect(left.revision).toBe(2);
   });
+
+  it('defers projection collisions only while a descendant resolution accounts for them', () => {
+    const base = fixtureRoster(), at = base.createdAt;
+    const history = {
+      modelVersion: 1 as const, gameId: 'game',
+      seeds: { s1: { ...base, rolls: [{ id: 'r1', playerId: 'alex', sides: 6 as const, value: 3, at }] }, s2: { ...base, rolls: [{ id: 'r1', playerId: 'alex', sides: 6 as const, value: 5, at }] } },
+      operations: {
+        a: { type: 'add-player' as const, id: 'a', authorId: 'x', parents: ['s1'], at, player: { id: 'cy', name: 'Cyrus', role: 'gm' as const } },
+        b: { type: 'set-player-name' as const, id: 'b', authorId: 'x', parents: ['s1'], at, playerId: 'ghost', name: 'Boo' },
+      },
+    };
+    expect(() => projectHistory(history)).toThrow(/collision|duplicate|unknown/i);
+    const resolve = { type: 'resolution' as const, id: 'z', authorId: 'x', parents: ['a', 'b', 's2'], at, patches: [{ type: 'put-roll' as const, roll: { id: 'r1', playerId: 'alex', sides: 6 as const, value: 3, at } }], candidateHeads: ['a', 'b', 's2'], fallbackBase: [], fallbackFrontier: ['s1'], extendedResolutionIds: [] };
+    const game = projectHistory({ ...history, operations: { ...history.operations, z: resolve } });
+    expect(game.players.find(p => p.id === 'cy')?.name).toBe('Cy');
+    expect(game.rolls).toEqual([{ id: 'r1', playerId: 'alex', sides: 6, value: 3, at }]);
+    expect(() => projectHistory({ ...history, operations: { ...history.operations, z: { ...resolve, candidateHeads: ['a', 's2'] } } })).toThrow(/unknown/i);
+  });
 });

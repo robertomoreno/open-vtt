@@ -1,4 +1,4 @@
-import { CAUSAL_PARENTS, MISSING_DEPENDENCY_OPERATIONS } from '../network/limits';
+import { CAUSAL_PARENTS, GAME_OPERATIONS, MISSING_DEPENDENCY_OPERATIONS } from '../network/limits';
 import type { Game, Player, Runtime } from './types';
 import type { ConflictNotice, GameHistory, GameOperation, PriorityContext, Reconciliation, ResolutionPatch } from './sync-types';
 import { frontier, projectHistory, validateHistory, validateOperation } from './history';
@@ -95,7 +95,7 @@ function collect(histories: readonly GameHistory[], baseline: GameHistory) {
     const accepted = [...ops.keys()].filter(key => status.get(key) === 'ok').sort((a, b) => depth.get(a)! - depth.get(b)! || byId(a, b));
     const nodes: Node[] = [...[...seeds.keys()].sort(byId).map(id => ({ id, seed: seeds.get(id)! })), ...accepted.map(id => ({ id, op: ops.get(id)! }))];
     const graph = new Graph(nodes);
-    // Incompatible evidence or duplicate player creations cannot be projected; reject them and their descendants.
+    // Resolutions citing evidence outside their causal past are invalid; reject them and their descendants.
     const invalid = new Set<string>();
     for (const node of nodes) {
       const op = node.op;
@@ -103,13 +103,6 @@ function collect(histories: readonly GameHistory[], baseline: GameHistory) {
         for (const ref of [...op.candidateHeads, ...op.fallbackBase, ...op.fallbackFrontier, ...op.extendedResolutionIds]) if (!graph.has(ref) || !graph.isAncestor(ref, op.id)) invalid.add(op.id);
         for (const ref of op.extendedResolutionIds) if (graph.node(ref)?.op?.type !== 'resolution') invalid.add(op.id);
       }
-    }
-    const creators = new Map<string, Node[]>();
-    for (const node of nodes) for (const player of node.seed?.players ?? (node.op?.type === 'add-player' ? [node.op.player] : [])) creators.set(player.id, [...(creators.get(player.id) ?? []), node]);
-    for (const list of creators.values()) {
-      if (list.length < 2) continue;
-      const keep = list.some(node => node.seed) ? undefined : list.find(node => Object.hasOwn(baseline.operations, node.id));
-      for (const node of list) if (node.op && node !== keep) invalid.add(node.id);
     }
     if (!invalid.size) return { gameId, seeds, nodes, graph, pending: pending.slice(0, MISSING_DEPENDENCY_OPERATIONS), rejected };
     for (const key of invalid) { rejected.add(key); ops.delete(key); }
@@ -169,33 +162,41 @@ class Graph {
   }
 }
 
-function materialize(history: GameHistory): Game {
-  try { return projectHistory(history); } catch { /* fall through to an unvalidated projection */ }
+type Deferred = { id: string; kind: 'roll' | 'add' | 'player'; key: string };
+/** Unvalidated projection mirroring `projectHistory`, reporting collisions no resolution accounts for yet. */
+function materialize(history: GameHistory): { game: Game; deferred: Deferred[]; rollOwner: Map<string, string> } {
   const seedKeys = Object.keys(history.seeds).sort(byId), first = history.seeds[seedKeys[0]];
-  const players = new Map<string, Player>(), rolls = new Map<string, Game['rolls'][number]>();
-  for (const key of seedKeys) { for (const p of history.seeds[key].players) if (!players.has(p.id)) players.set(p.id, { ...p }); for (const r of history.seeds[key].rolls) rolls.set(r.id, { ...r }); }
+  const players = new Map<string, Player>(), rolls = new Map<string, Game['rolls'][number]>(), rollOwner = new Map<string, string>();
+  const accounted = new Set<string>(), deferred: Deferred[] = [];
+  for (const op of Object.values(history.operations)) if (op.type === 'resolution') op.candidateHeads.forEach(id => accounted.add(id));
+  for (const key of seedKeys) {
+    for (const p of history.seeds[key].players) if (!players.has(p.id)) players.set(p.id, { ...p });
+    for (const r of history.seeds[key].rolls) {
+      const old = rolls.get(r.id);
+      if (!old) { rolls.set(r.id, { ...r }); rollOwner.set(r.id, key); } else if (!same(old, r)) deferred.push({ id: key, kind: 'roll', key: r.id });
+    }
+  }
   let name = first.name;
-  const apply = (p: ResolutionPatch) => {
+  const apply = (p: ResolutionPatch, owner: string) => {
     switch (p.type) {
       case 'set-game-name': name = p.name; break;
       case 'set-player-name': { const x = players.get(p.playerId); if (x) x.name = p.name; break; }
       case 'set-player-role': { const x = players.get(p.playerId); if (x) x.role = p.role; break; }
       case 'put-player': players.set(p.player.id, { ...p.player }); break;
       case 'remove-player': players.delete(p.playerId); break;
-      case 'put-roll': rolls.set(p.roll.id, { ...p.roll }); break;
+      case 'put-roll': if (!rolls.has(p.roll.id)) { rolls.set(p.roll.id, { ...p.roll }); rollOwner.set(p.roll.id, owner); } break;
       case 'remove-roll': rolls.delete(p.rollId); break;
     }
   };
-  const graph = new Graph([...seedKeys.map(id => ({ id, seed: history.seeds[id] })), ...orderOps(history)]);
-  for (const node of graph.nodes) {
-    const op = node.op;
+  for (const { op } of orderOps(history)) {
     if (!op) continue;
-    if (op.type === 'add-player') apply({ type: 'put-player', player: op.player });
-    else if (op.type === 'roll') apply({ type: 'put-roll', roll: { id: op.id, playerId: op.playerId, sides: op.sides, value: op.value, at: op.at } });
-    else if (op.type === 'resolution') op.patches.forEach(apply);
-    else apply(op);
+    if (op.type === 'add-player') { if (players.has(op.player.id)) deferred.push({ id: op.id, kind: 'add', key: op.player.id }); else apply({ type: 'put-player', player: op.player }, op.id); }
+    else if (op.type === 'set-player-name' || op.type === 'set-player-role') { if (players.has(op.playerId)) apply(op, op.id); else deferred.push({ id: op.id, kind: 'player', key: op.playerId }); }
+    else if (op.type === 'roll') apply({ type: 'put-roll', roll: { id: op.id, playerId: op.playerId, sides: op.sides, value: op.value, at: op.at } }, op.id);
+    else if (op.type === 'resolution') op.patches.forEach(p => apply(p, op.id));
+    else apply(op, op.id);
   }
-  return { ...first, name, players: [...players.values()], rolls: [...rolls.values()] };
+  return { game: { ...first, name, players: [...players.values()], rolls: [...rolls.values()] }, deferred: deferred.filter(d => !accounted.has(d.id)), rollOwner };
 }
 function orderOps(history: GameHistory): Node[] {
   const depth = new Map<string, number>();
@@ -209,6 +210,13 @@ function orderOps(history: GameHistory): Node[] {
 
 function describe(value: unknown): string { return typeof value === 'string' ? `“${value}”` : value === null ? 'nothing' : JSON.stringify(value); }
 
+/**
+ * `histories[0]` is this caller's current accepted local history; it only determines which
+ * resolutions are new to this caller (and so produce notices). Later entries are unordered peer
+ * candidates. Priority comes solely from `priority`, never from array order. Invalid baselines or
+ * histories for another game fail closed; malformed operations are isolated in `rejectedIds`.
+ * Inputs are never mutated.
+ */
 export function reconcileHistories(histories: readonly GameHistory[], priority: PriorityContext, runtime: Runtime): Reconciliation {
   check(Array.isArray(histories) && histories.length > 0, 'Nothing to reconcile.');
   const baseline = validateHistory(priority.baseline);
@@ -235,6 +243,16 @@ export function reconcileHistories(histories: readonly GameHistory[], priority: 
     const own = leaves.filter(i => graph.authors[i] === priority.participantId);
     if (own.length) return { value: graph.writes[own[0]].get(reg)!, base };
     const mask = commonMask.map((w, k) => w | inBaseline[k]);
+    // A losing proposal shared by the branches is not the priority contribution: the
+    // resolution that overruled it (seen by one branch) is the checkpoint for that group.
+    const set = (m: Uint32Array, i: number) => (m[i >>> 5] & (1 << (i & 31))) !== 0;
+    for (let changed = true; changed;) {
+      changed = false;
+      for (let r = 0; r < nodes.length; r++) {
+        if (set(mask, r) || nodes[r].op?.type !== 'resolution' || !graph.writes[r].has(reg) || !leaves.some(l => graph.below(r, l))) continue;
+        if (graph.expand([r], reg).some(c => c !== r && set(mask, c))) { mask[r >>> 5] |= 1 << (r & 31); changed = true; }
+      }
+    }
     const containsAll = leaves.every(i => mask[i >>> 5] & (1 << (i & 31)));
     const value = guard > 64 || containsAll ? baselineValue(reg) : valueIn(reg, mask, guard);
     return { value: value ?? baselineValue(reg) ?? graph.writes[leaves[0]].get(reg)!, base };
@@ -266,8 +284,13 @@ export function reconcileHistories(histories: readonly GameHistory[], priority: 
   // Field conflicts: only competing register heads with different values.
   const registers = new Set<string>();
   for (const w of graph.writes) for (const reg of w.keys()) registers.add(reg);
+  // Players created by more than one seed/operation are an indivisible invariant component.
+  const creators = new Map<string, number[]>();
+  nodes.forEach((node, i) => { for (const p of node.seed?.players ?? (node.op?.type === 'add-player' ? [node.op.player] : [])) creators.set(p.id, [...(creators.get(p.id) ?? []), i]); });
+  const contested = new Set([...creators].filter(([, list]) => list.length > 1).map(([id]) => id));
   const all = new Uint32Array(inBaseline.length).fill(0xffffffff);
   for (const reg of [...registers].sort(byId)) {
+    if (reg.startsWith('player:') && contested.has(reg.slice(7, reg.lastIndexOf('.')))) continue;
     const heads = graph.maximal(graph.members(all).filter(i => i < nodes.length && graph.writes[i].has(reg)));
     if (new Set(heads.map(i => graph.writes[i].get(reg))).size <= 1) continue;
     const { value, base } = decide(reg, graph.expand(heads, reg));
@@ -278,29 +301,69 @@ export function reconcileHistories(histories: readonly GameHistory[], priority: 
     publish([patch], heads, base);
   }
 
-  // Invariant conflicts: duplicate player names. Retain the priority version, revert or withhold the rest.
-  for (let round = 0; round <= 64; round++) {
-    const game = materialize(history);
+  // Invariant components, one per round: legacy roll-ID collisions, duplicate player IDs, edits/rolls
+  // depending on an absent player, duplicate names, then the roster bound. Retain the priority
+  // version; withhold the rest with explicit patches so the proposals stay in history.
+  const inMask = (m: Uint32Array, i: number) => (m[i >>> 5] & (1 << (i & 31))) !== 0;
+  const upTo = (a: number, b: number) => a === b || graph.below(a, b);
+  const baselineRoll = (rollId: string) => Object.values(baseline.seeds).flatMap(g => g.rolls).find(r => r.id === rollId)
+    ?? Object.values(baseline.operations).flatMap(op => op.type === 'roll' && op.id === rollId ? [{ id: op.id, playerId: op.playerId, sides: op.sides, value: op.value, at: op.at }] : []).find(Boolean);
+  const withdraw = (game: Game, playerId: string, patches: ResolutionPatch[], dependent: (owner: number | undefined) => boolean, rollOwner: Map<string, string>) => {
+    for (const roll of game.rolls) if (roll.playerId === playerId) {
+      const owner = rollOwner.get(roll.id);
+      if (dependent(owner !== undefined && graph.has(owner) ? graph.idx(owner) : undefined)) patches.push({ type: 'remove-roll', rollId: roll.id });
+    }
+  };
+  for (let round = 0; round <= 4 * GAME_OPERATIONS; round++) {
+    const { game, deferred, rollOwner } = materialize(history);
+    const patches: ResolutionPatch[] = [];
+    let candidates: number[] = [];
+    const collision = deferred.find(d => d.kind === 'roll'), duplicate = deferred.find(d => d.kind === 'add');
+    const absent = deferred.find(d => d.kind === 'player')?.key ?? game.rolls.find(r => !game.players.some(p => p.id === r.playerId))?.playerId;
     const groups = new Map<string, Player[]>();
     for (const p of game.players) groups.set(p.name.toLowerCase(), [...(groups.get(p.name.toLowerCase()) ?? []), p]);
     const group = [...groups.entries()].sort(([a], [b]) => byId(a, b)).find(([, list]) => list.length > 1)?.[1];
-    if (!group) break;
-    const producers = (p: Player) => graph.maximal(nodes.map((_, i) => i).filter(i => graph.writes[i].get(`player:${p.id}.name`)?.toLowerCase() === p.name.toLowerCase()));
-    const kept = group.filter(p => baselineGame.players.some(b => b.id === p.id && b.name.toLowerCase() === p.name.toLowerCase())
-      || producers(p).some(i => graph.authors[i] === priority.participantId)).slice(0, 1);
-    const patches: ResolutionPatch[] = [], candidates: number[] = [];
-    for (const p of group) {
-      candidates.push(...producers(p));
-      if (kept.includes(p)) continue;
-      const before = baselineGame.players.find(b => b.id === p.id);
-      if (before) patches.push({ type: 'set-player-name', playerId: p.id, name: before.name });
-      else {
-        patches.push({ type: 'remove-player', playerId: p.id });
-        for (const roll of game.rolls) if (roll.playerId === p.id) patches.push({ type: 'remove-roll', rollId: roll.id });
+    if (collision) {
+      const rollId = collision.key, retained = baselineRoll(rollId), current = game.rolls.find(r => r.id === rollId);
+      candidates = nodes.flatMap((node, i) => node.seed?.rolls.some(r => r.id === rollId) ? [i] : []);
+      if (!retained) patches.push({ type: 'remove-roll', rollId });
+      else { if (!same(current, retained)) patches.push({ type: 'remove-roll', rollId }); patches.push({ type: 'put-roll', roll: retained }); }
+    } else if (duplicate) {
+      const playerId = duplicate.key, list = creators.get(playerId) ?? [];
+      const kept = list.find(i => inMask(inBaseline, i)) ?? list.find(i => graph.authors[i] === priority.participantId);
+      const record = kept === undefined ? undefined : baselineGame.players.find(p => p.id === playerId) ?? (nodes[kept].seed?.players.find(p => p.id === playerId) ?? (nodes[kept].op as Extract<GameOperation, { type: 'add-player' }>).player);
+      const losers = list.filter(i => i !== kept);
+      candidates = list;
+      patches.push(record ? { type: 'put-player', player: record } : { type: 'remove-player', playerId });
+      withdraw(game, playerId, patches, owner => kept === undefined || (owner !== undefined && losers.some(l => upTo(l, owner))), rollOwner);
+    } else if (absent !== undefined) {
+      candidates = [
+        ...deferred.filter(d => d.kind === 'player' && d.key === absent).map(d => graph.idx(d.id)),
+        ...game.rolls.flatMap(r => r.playerId === absent && graph.has(rollOwner.get(r.id) ?? '') ? [graph.idx(rollOwner.get(r.id)!)] : []),
+      ];
+      patches.push({ type: 'remove-player', playerId: absent });
+      withdraw(game, absent, patches, () => true, rollOwner);
+    } else if (group) {
+      const producers = (p: Player) => graph.maximal(nodes.map((_, i) => i).filter(i => graph.writes[i].get(`player:${p.id}.name`)?.toLowerCase() === p.name.toLowerCase()));
+      const kept = group.filter(p => baselineGame.players.some(b => b.id === p.id && b.name.toLowerCase() === p.name.toLowerCase())
+        || producers(p).some(i => graph.authors[i] === priority.participantId)).slice(0, 1);
+      for (const p of group) {
+        candidates.push(...producers(p));
+        if (kept.includes(p)) continue;
+        const before = baselineGame.players.find(b => b.id === p.id);
+        if (before) patches.push({ type: 'set-player-name', playerId: p.id, name: before.name });
+        else { patches.push({ type: 'remove-player', playerId: p.id }); withdraw(game, p.id, patches, () => true, rollOwner); }
       }
-    }
-    const heads = graph.maximal(candidates);
-    publish(patches, heads, graph.maximal(graph.members(graph.common(heads))));
+    } else if (game.players.length > 32) {
+      const extra = game.players.filter(p => !baselineGame.players.some(b => b.id === p.id)).map(p => p.id).sort(byId).slice(-(game.players.length - 32));
+      for (const playerId of extra) {
+        candidates.push(...(creators.get(playerId) ?? []));
+        patches.push({ type: 'remove-player', playerId });
+        withdraw(game, playerId, patches, () => true, rollOwner);
+      }
+    } else break;
+    candidates = [...new Set(candidates)].sort((a, b) => a - b);
+    publish(patches, candidates, candidates.length ? graph.maximal(graph.members(graph.common(candidates))) : []);
   }
 
   history = validateHistory(history);
@@ -324,19 +387,26 @@ function noticeFor(op: Resolution, graph: Graph): ConflictNotice | undefined {
   if (!op.candidateHeads.every(id => graph.has(id))) return undefined;
   const heads = op.candidateHeads.map(id => graph.idx(id));
   const setters = op.patches.filter(p => p.type === 'set-game-name' || p.type === 'set-player-name' || p.type === 'set-player-role');
-  const key = (p: ResolutionPatch) => p.type === 'set-game-name' ? 'game.name' : p.type === 'set-player-name' ? `player:${p.playerId}.name` : p.type === 'set-player-role' ? `player:${p.playerId}.role` : p.type === 'remove-player' ? `player:${p.playerId}` : p.type === 'put-player' ? `player:${p.player.id}` : '';
+  const key = (p: ResolutionPatch) => p.type === 'set-game-name' ? 'game.name' : p.type === 'set-player-name' ? `player:${p.playerId}.name` : p.type === 'set-player-role' ? `player:${p.playerId}.role` : p.type === 'remove-player' ? `player:${p.playerId}` : p.type === 'put-player' ? `player:${p.player.id}` : p.type === 'put-roll' ? `roll:${p.roll.id}` : '';
   const patchValue = (p: ResolutionPatch) => p.type === 'set-game-name' || p.type === 'set-player-name' ? p.name : p.type === 'set-player-role' ? p.role : p.type === 'put-player' ? p.player : null;
   const reg = setters.length === 1 && op.patches.length === 1 ? key(setters[0]) : undefined;
   const single = reg !== undefined && heads.every(i => graph.writes[i].has(reg));
   const reason: ConflictNotice['reason'] = op.fallbackBase.length === 0 ? 'limited-history' : single ? 'concurrent-value' : 'invariant';
   const leaves = graph.expand(heads, single ? reg : undefined);
-  const affected = single ? [reg!] : [...new Set(op.patches.map(key).filter(Boolean))].sort(byId);
+  const keys = [...new Set(op.patches.map(key).filter(Boolean))];
+  const affected = single ? [reg!] : (keys.length ? keys : [...new Set(op.patches.flatMap(p => p.type === 'remove-roll' ? [`roll:${p.rollId}`] : []))]).sort(byId);
   const candidates = leaves.map(i => {
     const w = graph.writes[i];
-    const value = single ? w.get(reg!) : [...w.entries()].filter(([k]) => k.endsWith('.name') && k.startsWith('player:')).map(([k, v]) => ({ playerId: k.slice(7, -5), name: v }));
+    const node = graph.nodes[i], op = node.op, rollIds = affected.filter(a => a.startsWith('roll:')).map(a => a.slice(5));
+    const value = single ? w.get(reg!)
+      : node.seed && rollIds.length ? node.seed.rolls.filter(r => rollIds.includes(r.id))
+      : op?.type === 'add-player' ? op.player
+      : op?.type === 'set-player-name' || op?.type === 'set-player-role' ? { playerId: op.playerId, ...(op.type === 'set-player-name' ? { name: op.name } : { role: op.role }) }
+      : op?.type === 'roll' ? { rollId: op.id, playerId: op.playerId }
+      : [...w.entries()].filter(([k]) => k.endsWith('.name') && k.startsWith('player:')).map(([k, v]) => ({ playerId: k.slice(7, -5), name: v }));
     return { operationId: graph.nodes[i].id, value };
   });
-  const retained = single ? patchValue(op.patches[0]) : Object.fromEntries(op.patches.filter(p => p.type !== 'remove-roll').map(p => [key(p), patchValue(p)]));
+  const retained = single ? patchValue(op.patches[0]) : Object.fromEntries(op.patches.filter(p => p.type !== 'remove-roll').map(p => [key(p), p.type === 'put-roll' ? p.roll : patchValue(p)]));
   const id = `conflict-${hash(JSON.stringify([reason, affected, candidates.map(c => c.operationId)]))}`;
   const competing = candidates.map(c => `${c.operationId} proposed ${describe(c.value)}`).join('; ');
   const explanation = reason === 'invariant'

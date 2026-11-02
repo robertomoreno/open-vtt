@@ -242,4 +242,123 @@ describe('granular reconciliation', () => {
     expect(left.notices.map(n => n.affected[0]).sort()).toEqual(['game.name', 'player:bea.name']);
     expect(left.game.players[1].name).toBe('Bea');
   });
+
+  it('uses the first participant’s fallback when an observed write competes with an unobserved losing-branch descendant', () => {
+    const { alice, bob, carol, priority } = castle();
+    bob.applyLocal({ type: 'set-game-name', name: 'Red Castle' });
+    carol.applyLocal({ type: 'set-game-name', name: 'Blue Castle' });
+    const first = reconcileHistories([alice.getHistory(), bob.getHistory(), carol.getHistory()], priority, namedRuntime('r'));
+    bob.accept(first.history);
+    bob.applyLocal({ type: 'set-game-name', name: 'Purple Castle' });
+    carol.applyLocal({ type: 'set-game-name', name: 'Navy Castle' });
+    const result = reconcileHistories([first.history, bob.getHistory(), carol.getHistory()], priority, namedRuntime('r2'));
+    expect(result.game.name).toBe('Old Castle');
+    expect(result.notices).toHaveLength(1);
+  });
+
+  it('isolates duplicate player-ID creations without discarding unrelated descendants', () => {
+    const { alice, bob, carol, priority } = castle();
+    const bobAdd = addPlayer(bob, { id: 'dee', name: 'Dee', role: 'pj' }, 'bob-add');
+    const carolAdd = addPlayer(carol, { id: 'dee', name: 'Dina', role: 'gm' }, 'carol-add');
+    bob.applyLocal({ type: 'roll', playerId: 'dee', sides: 20 });
+    bob.applyLocal({ type: 'roll', playerId: 'alex', sides: 20 });
+    carol.applyLocal({ type: 'set-player-name', playerId: 'bea', name: 'Bee' });
+    const result = reconcileHistories([alice.getHistory(), bob.getHistory(), carol.getHistory()], priority, namedRuntime('r'));
+    expect(result.rejectedIds).toEqual([]);
+    expect(result.game.players.map(p => [p.id, p.name])).toEqual([['alex', 'Alex'], ['bea', 'Bee'], ['cy', 'Cy']]);
+    expect(result.game.rolls.map(r => r.playerId)).toEqual(['alex']);
+    expect(result.history.operations[bobAdd.id]).toEqual(bobAdd);
+    expect(result.history.operations[carolAdd.id]).toEqual(carolAdd);
+    expect(result.notices.some(n => n.reason === 'invariant' && n.candidates.some(c => c.operationId === bobAdd.id))).toBe(true);
+    expect(projectHistory(result.history)).toEqual(result.game);
+  });
+
+  it('keeps the seed player when an operation re-creates its ID, quarantining only dependent rolls', () => {
+    const { alice, bob, priority } = castle();
+    const h = bob.getHistory(), seed = Object.keys(h.seeds)[0], at = '2026-01-01T00:00:00.000Z';
+    const forged: GameHistory = { ...h, operations: {
+      'x-1': { type: 'add-player', id: 'x-1', authorId: 'bob', parents: [seed], at, player: { id: 'cy', name: 'Cyrus', role: 'gm' } },
+      'x-2': { type: 'roll', id: 'x-2', authorId: 'bob', parents: ['x-1'], at, playerId: 'alex', sides: 20, value: 5 },
+      'x-3': { type: 'roll', id: 'x-3', authorId: 'bob', parents: ['x-2'], at, playerId: 'cy', sides: 20, value: 6 },
+    } };
+    const result = reconcileHistories([alice.getHistory(), forged], priority, namedRuntime('r'));
+    expect(result.rejectedIds).toEqual([]);
+    expect(result.game.players.find(p => p.id === 'cy')).toEqual({ id: 'cy', name: 'Cy', role: 'pj' });
+    expect(result.game.rolls.map(r => r.id)).toEqual(['x-2']);
+    expect(result.history.operations['x-3']).toBeDefined();
+    expect(projectHistory(result.history)).toEqual(result.game);
+  });
+
+  it('resolves a legacy seed union beyond 32 players and keeps unrelated rolls', () => {
+    const base = fixtureRoster(), extra = (p: string) => Array.from({ length: 17 }, (_, i) => ({ id: `${p}${i + 1}`, name: `${p.toUpperCase()} ${i + 1}`, role: 'pj' as const }));
+    const a = { ...base, players: [...base.players, ...extra('a')] };
+    const b = { ...base, players: [...base.players, ...extra('b')], rolls: [{ id: 'rb-alex', playerId: 'alex', sides: 6 as const, value: 2, at: base.createdAt }, { id: 'rb-b9', playerId: 'b9', sides: 6 as const, value: 4, at: base.createdAt }] };
+    const ha: GameHistory = { modelVersion: 1, gameId: 'game', seeds: { 'legacy-a': a }, operations: {} };
+    const hb: GameHistory = { modelVersion: 1, gameId: 'game', seeds: { 'legacy-b': b }, operations: {} };
+    const result = reconcileHistories([ha, hb], capturePriority(ha, 'opener', 'room'), namedRuntime('r'));
+    expect(result.game.players).toHaveLength(32);
+    expect(result.game.players.map(p => p.id)).not.toContain('b9');
+    expect(result.game.players.map(p => p.id)).toEqual(expect.arrayContaining(a.players.map(p => p.id)));
+    expect(result.game.rolls.map(r => r.id)).toEqual(['rb-alex']);
+    expect(result.notices.length).toBeGreaterThan(0);
+  });
+
+  it('quarantines later operations on a withheld player and keeps unrelated work', () => {
+    const { alice, bob, carol, priority } = castle();
+    addPlayer(bob, { id: 'dee-b', name: 'Dee', role: 'pj' }, 'bob-add');
+    addPlayer(carol, { id: 'dee-c', name: 'Dee', role: 'pj' }, 'carol-add');
+    const first = reconcileHistories([alice.getHistory(), bob.getHistory(), carol.getHistory()], priority, namedRuntime('r'));
+    expect(first.game.players.map(p => p.id)).toEqual(['alex', 'bea', 'cy']);
+    bob.applyLocal({ type: 'roll', playerId: 'dee-b', sides: 20 });
+    bob.applyLocal({ type: 'set-player-name', playerId: 'dee-b', name: 'Deedee' });
+    bob.applyLocal({ type: 'set-player-role', playerId: 'dee-b', role: 'gm' });
+    bob.applyLocal({ type: 'roll', playerId: 'alex', sides: 20 });
+    const second = reconcileHistories([first.history, bob.getHistory()], priority, namedRuntime('r2'));
+    expect(second.game.players.map(p => p.id)).toEqual(['alex', 'bea', 'cy']);
+    expect(second.game.rolls.map(r => r.playerId)).toEqual(['alex']);
+    expect(second.rejectedIds).toEqual([]);
+    expect(projectHistory(second.history)).toEqual(second.game);
+    expect(reconcileHistories([second.history], priority, namedRuntime('r3')).notices).toEqual([]);
+  });
+
+  it('retains the priority version of a legacy roll-ID collision as limited-history', () => {
+    const base = fixtureRoster(), at = base.createdAt;
+    const a = { ...base, rolls: [{ id: 'r1', playerId: 'alex', sides: 6 as const, value: 3, at }] };
+    const b = { ...base, rolls: [{ id: 'r1', playerId: 'alex', sides: 6 as const, value: 5, at }, { id: 'r2', playerId: 'bea', sides: 4 as const, value: 1, at }] };
+    const ha: GameHistory = { modelVersion: 1, gameId: 'game', seeds: { 'z-legacy-a': a }, operations: {} };
+    const hb: GameHistory = { modelVersion: 1, gameId: 'game', seeds: { 'a-legacy-b': b }, operations: {} };
+    const result = reconcileHistories([hb, ha], capturePriority(ha, 'opener', 'room'), namedRuntime('r'));
+    expect(result.game.rolls.find(r => r.id === 'r1')?.value).toBe(3);
+    expect(result.game.rolls.map(r => r.id).sort()).toEqual(['r1', 'r2']);
+    expect(result.notices).toHaveLength(1);
+    expect(result.notices[0]).toMatchObject({ reason: 'limited-history', affected: ['roll:r1'] });
+    expect(projectHistory(result.history)).toEqual(result.game);
+  });
+
+  it('treats histories[0] as local and later peer histories as unordered', () => {
+    const { alice, bob, carol, priority } = castle();
+    bob.applyLocal({ type: 'set-game-name', name: 'Red Castle' });
+    carol.applyLocal({ type: 'set-game-name', name: 'Blue Castle' });
+    const dave = forkTestWorkspace(bob, 'dave');
+    dave.applyLocal({ type: 'set-player-name', playerId: 'bea', name: 'Bee' });
+    const peers = [bob.getHistory(), carol.getHistory(), dave.getHistory()];
+    const one = reconcileHistories([alice.getHistory(), ...peers], priority, namedRuntime('p'));
+    const two = reconcileHistories([alice.getHistory(), peers[2], peers[0], peers[1]], priority, namedRuntime('q'));
+    expect(two.game).toEqual(one.game);
+    expect(two.notices).toEqual(one.notices);
+    expect(reconcileHistories([one.history, ...peers.reverse()], priority, namedRuntime('s')).notices).toEqual([]);
+  });
+
+  it('fails closed on wrong-game histories, isolates malformed operations, and never mutates inputs', () => {
+    const { alice, bob, priority } = castle();
+    bob.applyLocal({ type: 'set-game-name', name: 'Red Castle' });
+    const good = bob.getHistory(), local = alice.getHistory();
+    expect(() => reconcileHistories([local, { ...good, gameId: 'other' }], priority, namedRuntime('r'))).toThrow(/game ID/);
+    const bad = { ...good, operations: { ...good.operations, junk: { id: 'junk', type: 'explode' } } } as unknown as GameHistory;
+    const snapshot = structuredClone([local, bad, priority]);
+    const result = reconcileHistories([local, bad], priority, namedRuntime('r'));
+    expect(result.rejectedIds).toEqual(['junk']);
+    expect(result.game.name).toBe('Red Castle');
+    expect([local, bad, priority]).toEqual(snapshot);
+  });
 });
