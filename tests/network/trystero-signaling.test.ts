@@ -85,4 +85,44 @@ describe('public WSS topic relay client', () => {
   it('rejects non-wss relay URLs', () => {
     expect(() => createRelayClient('ws://insecure.example', FakeSocket as unknown as typeof WebSocket)).toThrow();
   });
+
+  it('rejects every pending publish when the relay closes or the socket fails before opening', async () => {
+    const a = make();
+    a.subscribe('t', () => {});
+    const pending = a.publish('t', 'x');
+    a.close();
+    await expect(pending).rejects.toThrow();
+    const b = make();
+    b.subscribe('t', () => {});
+    const waiting = b.publish('t', 'x');
+    FakeSocket.all[1].dispatchEvent(new Event('error'));
+    FakeSocket.all[1].dispatchEvent(new Event('close'));
+    await expect(waiting).rejects.toThrow();
+  });
+
+  it('bounds the number of publishes queued for an unopened socket and the time they wait', async () => {
+    vi.useFakeTimers();
+    try {
+      const relay = make();
+      relay.subscribe('t', () => {});
+      const queued = Array.from({ length: 64 }, () => relay.publish('t', 'x').catch(e => e));
+      await expect(relay.publish('t', 'x')).rejects.toThrow();
+      await vi.advanceTimersByTimeAsync(8_001);
+      expect((await Promise.all(queued)).every(r => r instanceof Error)).toBe(true);
+      expect(vi.getTimerCount()).toBe(0);
+    } finally { vi.useRealTimers(); }
+  });
+
+  it('enforces 128 KiB on the complete UTF-8 inbound envelope', () => {
+    const relay = make();
+    const got: unknown[] = [];
+    relay.subscribe('t', (_t, d) => got.push(d));
+    const socket = FakeSocket.all[0]; socket.open();
+    const overhead = new TextEncoder().encode(JSON.stringify({ type: 'publish', topic: 't', data: '' })).byteLength;
+    socket.receive({ type: 'publish', topic: 't', data: '€'.repeat(Math.floor((CONTROL_BYTES - overhead) / 3) + 1) });
+    socket.receive({ type: 'publish', topic: 't', data: 'ok', pad: 'x'.repeat(CONTROL_BYTES) });
+    socket.receive({ type: 'publish', topic: 't', data: 'x'.repeat(CONTROL_BYTES - overhead) });
+    socket.receive({ type: 'publish', topic: 't', data: 'x'.repeat(CONTROL_BYTES - overhead + 1) });
+    expect(got).toEqual(['x'.repeat(CONTROL_BYTES - overhead)]);
+  });
 });

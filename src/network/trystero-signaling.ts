@@ -1,6 +1,8 @@
 import { createTopicStrategy, type JoinRoom, type JoinRoomConfig, type StrategyMessage } from '@trystero-p2p/core';
 import { check } from '../game/validation';
-import { CONTROL_BYTES } from './limits';
+import { CONTROL_BYTES, PROBE_TIMEOUT_MS } from './limits';
+
+const MAX_WAITING_PUBLISHES = 64;
 
 type TopicCallback = (topic: string, data: StrategyMessage) => void;
 export type RelayClient = {
@@ -10,7 +12,7 @@ export type RelayClient = {
 };
 
 const encoder = new TextEncoder();
-const encodedBytes = (value: unknown) => encoder.encode(JSON.stringify(value)).byteLength;
+const encodedBytes = (value: unknown) => encoder.encode(typeof value === 'string' ? value : JSON.stringify(value)).byteLength;
 
 // Generic WSS topic pub/sub (the y-webrtc-compatible endpoint): carries only discovery and encrypted SDP/ICE.
 export function createRelayClient(url: string, Socket: typeof WebSocket = WebSocket): RelayClient {
@@ -20,7 +22,14 @@ export function createRelayClient(url: string, Socket: typeof WebSocket = WebSoc
   let closed = false;
   let opened = false;
   let used = false;
-  const waiting: Array<() => void> = [];
+  const waiting = new Set<{ resolve(): void; reject(error: Error): void; timer: ReturnType<typeof setTimeout> }>();
+  const settleWaiting = (error?: Error) => {
+    for (const entry of [...waiting]) {
+      waiting.delete(entry);
+      clearTimeout(entry.timer);
+      if (error) entry.reject(error); else entry.resolve();
+    }
+  };
   const send = (message: unknown) => {
     const text = JSON.stringify(message);
     check(encoder.encode(text).byteLength <= CONTROL_BYTES, 'Signaling message is too large.');
@@ -30,26 +39,27 @@ export function createRelayClient(url: string, Socket: typeof WebSocket = WebSoc
     if (closed) return;
     closed = true;
     topics.clear();
-    waiting.length = 0;
+    settleWaiting(new Error('Signaling relay is closed.'));
     socket.close();
   };
   socket.addEventListener('open', () => {
     if (closed) return;
     opened = true;
     if (topics.size > 0) send({ type: 'subscribe', topics: [...topics.keys()] });
-    for (const resume of waiting.splice(0)) resume();
+    settleWaiting();
   });
   socket.addEventListener('message', event => {
-    if (closed || typeof event.data !== 'string' || event.data.length > CONTROL_BYTES) return;
+    if (closed || typeof event.data !== 'string' || event.data.length > CONTROL_BYTES || encodedBytes(event.data) > CONTROL_BYTES) return;
     let message: any;
     try { message = JSON.parse(event.data); } catch { return; }
     if (message === null || typeof message !== 'object' || message.type !== 'publish' || typeof message.topic !== 'string' || message.data === undefined) return;
     const callbacks = topics.get(message.topic);
-    if (!callbacks || encodedBytes(message.data) > CONTROL_BYTES) return;
+    if (!callbacks) return;
     if (typeof message.data !== 'string' && (message.data === null || typeof message.data !== 'object')) return;
     for (const callback of [...callbacks]) { try { callback(message.topic, message.data); } catch { /* one subscriber must not break another */ } }
   });
-  socket.addEventListener('close', () => { closed = true; topics.clear(); });
+  socket.addEventListener('error', () => close());
+  socket.addEventListener('close', () => close());
   return {
     subscribe(topic, callback) {
       check(!closed, 'Signaling relay is closed.');
@@ -74,7 +84,13 @@ export function createRelayClient(url: string, Socket: typeof WebSocket = WebSoc
       check(!closed, 'Signaling relay is closed.');
       const message = { type: 'publish', topic, data };
       check(encodedBytes(message) <= CONTROL_BYTES, 'Signaling message is too large.');
-      if (!opened) await new Promise<void>(resolve => waiting.push(resolve));
+      if (!opened) {
+        check(waiting.size < MAX_WAITING_PUBLISHES, 'Too many signaling messages are waiting.');
+        await new Promise<void>((resolve, reject) => {
+          const entry = { resolve, reject, timer: setTimeout(() => { waiting.delete(entry); reject(new Error('Signaling relay did not open in time.')); }, PROBE_TIMEOUT_MS) };
+          waiting.add(entry);
+        });
+      }
       check(!closed, 'Signaling relay is closed.');
       send(message);
     },

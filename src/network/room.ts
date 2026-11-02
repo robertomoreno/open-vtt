@@ -38,7 +38,10 @@ export function createRoomTransport(doc: Y.Doc, link: RoomLink, participantId: s
   const seen = new Map<string, { id: string; seenAt: number }>();
   const expiries = new Map<string, ReturnType<typeof setTimeout>>();
   const limiters = new Map<string, () => boolean>();
-  const pendingByPeer = new Map<string, Set<{ bytes: number; restart(): void; cancel(): void }>>();
+  type Transfer = { bytes: number; restart(): void; settle(): void };
+  const pendingByPeer = new Map<string, Map<string, Transfer>>();
+  let sequence = 0;
+  let anonymous = 0;
   let pendingBytes = 0;
   let pendingHandshakes = 0;
   let phase: 'looking' | 'failed' | 'closed' = 'looking';
@@ -119,34 +122,53 @@ export function createRoomTransport(doc: Y.Doc, link: RoomLink, participantId: s
     }
   }
 
-  function admission(peerId: string, bytes: number, signal: AbortSignal): boolean {
+  // One admission path for every action: a transfer is keyed by (action, sender-supplied id) so progress extends only its own deadline.
+  const transferId = (metadata: unknown): number | undefined => {
+    const t = metadata !== null && typeof metadata === 'object' ? (metadata as { t?: unknown }).t : undefined;
+    return typeof t === 'number' && Number.isSafeInteger(t) ? t : undefined;
+  };
+  function admission(action: string, limit: number, context: { peerId: string; byteLength: number; signal: AbortSignal; metadata?: unknown }): boolean {
+    const { peerId, byteLength: bytes, signal } = context;
     if (closed) return false;
-    const set = pendingByPeer.get(peerId) ?? new Set();
-    if (bytes > MESSAGE_BYTES || set.size >= INCOMPLETE_TRANSFERS || pendingBytes + bytes > PENDING_INBOUND_BYTES) { peerError('Peer sent too much pending data.'); return false; }
+    const id = transferId(context.metadata);
+    const key = id === undefined ? `${action}:anonymous-${anonymous++}` : `${action}:${id}`;
+    const peerTransfers = pendingByPeer.get(peerId) ?? new Map<string, Transfer>();
+    if (bytes > limit || peerTransfers.size >= INCOMPLETE_TRANSFERS || pendingBytes + bytes > PENDING_INBOUND_BYTES || peerTransfers.has(key)) { peerError('Peer sent too much pending data.'); return false; }
     let timer: ReturnType<typeof setTimeout> | undefined;
-    const entry = {
+    let settled = false;
+    const transfer: Transfer = {
       bytes,
-      restart() { clearTimeout(timer); timer = setTimeout(() => { settle(); peerError('Peer transfer expired.'); closePeer(peerId); }, TRANSFER_TIMEOUT_MS); },
-      cancel() { clearTimeout(timer); },
+      restart() { clearTimeout(timer); timer = setTimeout(() => { transfer.settle(); peerError('Peer transfer expired.'); closePeer(peerId); }, TRANSFER_TIMEOUT_MS); },
+      settle() {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        signal.removeEventListener('abort', transfer.settle);
+        pendingBytes -= bytes;
+        peerTransfers.delete(key);
+        if (peerTransfers.size === 0 && pendingByPeer.get(peerId) === peerTransfers) pendingByPeer.delete(peerId);
+      },
     };
-    const settle = () => {
-      if (!set.delete(entry)) return;
-      clearTimeout(timer);
-      pendingBytes -= bytes;
-      if (set.size === 0) pendingByPeer.delete(peerId);
-    };
-    set.add(entry);
-    pendingByPeer.set(peerId, set);
+    peerTransfers.set(key, transfer);
+    pendingByPeer.set(peerId, peerTransfers);
     pendingBytes += bytes;
-    entry.restart();
-    if (signal.aborted) settle(); else signal.addEventListener('abort', settle, { once: true });
+    if (signal.aborted) { transfer.settle(); return true; }
+    transfer.restart();
+    signal.addEventListener('abort', transfer.settle, { once: true });
     return true;
   }
+  const progressed = (action: string) => (_progress: number, context: { peerId: string; metadata?: unknown }) => {
+    const id = transferId(context.metadata);
+    if (id !== undefined) pendingByPeer.get(context.peerId)?.get(`${action}:${id}`)?.restart();
+  };
+  const settleAll = (peerId?: string) => {
+    for (const [id, transfers] of [...pendingByPeer]) if (peerId === undefined || id === peerId) for (const transfer of [...transfers.values()]) transfer.settle();
+  };
 
   function wire(joined: Room) {
     const sync = joined.makeAction<Uint8Array>(SYNC_ACTION, {
-      onReceive: context => admission(context.peerId, context.byteLength, context.signal),
-      onReceiveProgress: (_progress, context) => { for (const entry of pendingByPeer.get(context.peerId) ?? []) entry.restart(); },
+      onReceive: context => admission(SYNC_ACTION, MESSAGE_BYTES, context),
+      onReceiveProgress: progressed(SYNC_ACTION),
       onMessage: (data, context) => {
         if (closed || !peers.has(context.peerId)) return;
         if (!(data instanceof Uint8Array) || data.byteLength > MESSAGE_BYTES) { peerError('Peer sent an invalid update.'); return; }
@@ -154,7 +176,8 @@ export function createRoomTransport(doc: Y.Doc, link: RoomLink, participantId: s
       },
     }) as MessageAction<Uint8Array>;
     const presence = joined.makeAction<any>(PRESENCE_ACTION, {
-      onReceive: context => context.byteLength <= AWARENESS_BYTES,
+      onReceive: context => admission(PRESENCE_ACTION, AWARENESS_BYTES, context),
+      onReceiveProgress: progressed(PRESENCE_ACTION),
       onMessage: (data, context) => {
         if (closed || !peers.has(context.peerId)) return;
         if (!(limiters.get(context.peerId) ?? (limiters.set(context.peerId, bucket(() => Date.now())), limiters.get(context.peerId)!))()) return;
@@ -171,7 +194,7 @@ export function createRoomTransport(doc: Y.Doc, link: RoomLink, participantId: s
     }) as MessageAction<any>;
     const targets = (except?: unknown) => [...peers].filter(peer => peer !== except);
     const send = (action: MessageAction<any>, data: unknown, target: string | string[]) => {
-      Promise.resolve(action.send(data, { target })).catch(() => peerError('Peer send failed.'));
+      Promise.resolve(action.send(data, { target, metadata: { t: sequence++ } })).catch(() => peerError('Peer send failed.'));
     };
     sendPresence = () => { const target = targets(); if (target.length > 0) send(presence, { id: participantId }, target); };
     doc.on('update', onUpdate);
@@ -196,8 +219,7 @@ export function createRoomTransport(doc: Y.Doc, link: RoomLink, participantId: s
       seen.delete(peerId);
       clearTimeout(expiries.get(peerId));
       expiries.delete(peerId);
-      for (const entry of pendingByPeer.get(peerId) ?? []) { entry.cancel(); pendingBytes -= entry.bytes; }
-      pendingByPeer.delete(peerId);
+      settleAll(peerId);
       if (!closed) notify();
     };
   }
@@ -231,13 +253,11 @@ export function createRoomTransport(doc: Y.Doc, link: RoomLink, participantId: s
       phase = 'closed';
       if (heartbeat !== undefined) clearInterval(heartbeat);
       removeUpdate();
-      for (const set of pendingByPeer.values()) for (const entry of set) entry.cancel();
+      settleAll();
       const owned = room;
       room = undefined;
       try { void Promise.resolve(owned?.leave()).catch(() => {}); } catch { /* leaving is best effort */ }
       runtime?.close();
-      for (const set of pendingByPeer.values()) set.clear();
-      pendingByPeer.clear();
       peers.clear();
       seen.clear();
       for (const timer of expiries.values()) clearTimeout(timer);

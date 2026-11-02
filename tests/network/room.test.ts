@@ -46,7 +46,7 @@ const start = async (doc = new Y.Doc(), participant = 'me') => {
   const join = (peerId: string) => { fake.state.peers[peerId] = { close: vi.fn() }; fake.state.room.onPeerJoin?.(peerId); };
   return { doc, t, ...fake, join };
 };
-const ctx = (peerId: string, byteLength: number) => { const controller = new AbortController(); return { peerId, byteLength, kind: 'message', signal: controller.signal, controller }; };
+const ctx = (peerId: string, byteLength: number, t?: number) => { const controller = new AbortController(); return { peerId, byteLength, kind: 'message', signal: controller.signal, controller, ...(t === undefined ? {} : { metadata: { t } }) }; };
 afterEach(() => { vi.unstubAllGlobals(); vi.useRealTimers(); FakePc.all = []; });
 
 describe('room transport', () => {
@@ -84,14 +84,14 @@ describe('room transport', () => {
     const sync = state.actions['gather-sync-v2'];
     join('peer-a');
     expect(sync.send).toHaveBeenCalledTimes(1);
-    expect(sync.send.mock.calls[0][1]).toEqual({ target: 'peer-a' });
+    expect(sync.send.mock.calls[0][1]).toMatchObject({ target: 'peer-a', metadata: { t: expect.any(Number) } });
     const copy = new Y.Doc(); Y.applyUpdate(copy, sync.send.mock.calls[0][0]);
     expect(copy.getMap('m').get('before')).toBe(1);
     join('peer-b');
     sync.send.mockClear();
     doc.getMap('m').set('local', 2);
     expect(sync.send).toHaveBeenCalledTimes(1);
-    expect(sync.send.mock.calls[0][1]).toEqual({ target: ['peer-a', 'peer-b'] });
+    expect(sync.send.mock.calls[0][1]).toMatchObject({ target: ['peer-a', 'peer-b'], metadata: { t: expect.any(Number) } });
     sync.send.mockClear();
     const remote = new Y.Doc(); remote.getMap('m').set('remote', 3);
     sync.onMessage!(Y.encodeStateAsUpdate(remote), { peerId: 'peer-a' });
@@ -204,10 +204,10 @@ describe('room transport', () => {
       const { state, join, t } = await start();
       join('peer-a'); join('peer-b');
       const sync = state.actions['gather-sync-v2'];
-      sync.onReceive!(ctx('peer-a', 100_000));
-      sync.onReceive!(ctx('peer-b', 100_000));
+      sync.onReceive!(ctx('peer-a', 100_000, 1));
+      sync.onReceive!(ctx('peer-b', 100_000, 1));
       await vi.advanceTimersByTimeAsync(9_000);
-      sync.onReceiveProgress!(0.5, { peerId: 'peer-b' });
+      sync.onReceiveProgress!(0.5, { peerId: 'peer-b', metadata: { t: 1 } } as any);
       await vi.advanceTimersByTimeAsync(1_001);
       expect(state.peers['peer-a'].close).toHaveBeenCalledTimes(1);
       expect(state.peers['peer-b'].close).not.toHaveBeenCalled();
@@ -229,6 +229,85 @@ describe('room transport', () => {
       expect(vi.getTimerCount()).toBe(before - 1);
       t.close();
     });
+  });
+
+
+  describe('shared admission across every action path', () => {
+    const setup = async () => {
+      const r = await start();
+      for (const id of ['a', 'b', 'c', 'd', 'e']) r.join('peer-' + id);
+      return { ...r, sync: r.state.actions['gather-sync-v2'], presence: r.state.actions['gather-presence-v2'] };
+    };
+
+    it('counts presence and sync transfers against the same four-per-peer and 8 MiB budgets', async () => {
+      const { sync, presence, t } = await setup();
+      expect([sync.onReceive!(ctx('peer-a', 10, 1)), sync.onReceive!(ctx('peer-a', 10, 2)), presence.onReceive!(ctx('peer-a', 10, 3)), presence.onReceive!(ctx('peer-a', 10, 4))]).toEqual([true, true, true, true]);
+      expect(presence.onReceive!(ctx('peer-a', 10, 5))).toBe(false);
+      expect(sync.onReceive!(ctx('peer-a', 10, 6))).toBe(false);
+      expect(presence.onReceive!(ctx('peer-b', 8 * 1024 + 1, 1))).toBe(false);
+      expect([sync.onReceive!(ctx('peer-b', 2 * 1024 * 1024, 1)), sync.onReceive!(ctx('peer-c', 2 * 1024 * 1024, 1)), sync.onReceive!(ctx('peer-d', 2 * 1024 * 1024, 1))]).toEqual([true, true, true]);
+      expect(sync.onReceive!(ctx('peer-e', 2 * 1024 * 1024 - 100, 1))).toBe(true);
+      expect(presence.onReceive!(ctx('peer-e', 1024, 2))).toBe(false);
+      t.close();
+    });
+
+    it('expires a silent presence transfer and closes only that peer', async () => {
+      vi.useFakeTimers({ toFake: ['setInterval', 'clearInterval', 'setTimeout', 'clearTimeout', 'Date'] });
+      const { state, presence, t } = await setup();
+      presence.onReceive!(ctx('peer-a', 100, 1));
+      await vi.advanceTimersByTimeAsync(10_001);
+      expect(state.peers['peer-a'].close).toHaveBeenCalledTimes(1);
+      expect(state.peers['peer-b'].close).not.toHaveBeenCalled();
+      t.close();
+    });
+
+    it('extends only the transfer that made progress, never its stalled siblings', async () => {
+      vi.useFakeTimers({ toFake: ['setInterval', 'clearInterval', 'setTimeout', 'clearTimeout', 'Date'] });
+      const { state, sync, t } = await setup();
+      const stalled = ctx('peer-a', 1000, 1), moving = ctx('peer-a', 1000, 2);
+      sync.onReceive!(stalled); sync.onReceive!(moving);
+      for (let i = 0; i < 4; i++) {
+        await vi.advanceTimersByTimeAsync(4_000);
+        sync.onReceiveProgress!(0.5, { peerId: 'peer-a', metadata: { t: 2 } } as any);
+      }
+      expect(state.peers['peer-a'].close).toHaveBeenCalledTimes(1);
+      expect(stalled.signal.aborted).toBe(false);
+      t.close();
+    });
+
+    it('does not extend any deadline for progress it cannot attribute', async () => {
+      vi.useFakeTimers({ toFake: ['setInterval', 'clearInterval', 'setTimeout', 'clearTimeout', 'Date'] });
+      const { state, sync, t } = await setup();
+      sync.onReceive!(ctx('peer-a', 1000, 1));
+      await vi.advanceTimersByTimeAsync(9_000);
+      sync.onReceiveProgress!(0.5, { peerId: 'peer-a' });
+      sync.onReceiveProgress!(0.5, { peerId: 'peer-a', metadata: { t: 99 } } as any);
+      await vi.advanceTimersByTimeAsync(1_001);
+      expect(state.peers['peer-a'].close).toHaveBeenCalledTimes(1);
+      t.close();
+    });
+
+    it('rejects a transfer that reuses a pending transfer id from the same peer', async () => {
+      const { sync, t } = await setup();
+      expect(sync.onReceive!(ctx('peer-a', 10, 1))).toBe(true);
+      expect(sync.onReceive!(ctx('peer-a', 10, 1))).toBe(false);
+      t.close();
+    });
+
+    for (const order of ['leave-then-abort', 'abort-then-leave'] as const) {
+      it(`releases a reservation exactly once (${order})`, async () => {
+        const { state, sync, t } = await setup();
+        const first = ctx('peer-a', 2 * 1024 * 1024, 1);
+        sync.onReceive!(first);
+        if (order === 'leave-then-abort') { state.room.onPeerLeave('peer-a'); first.controller.abort(); }
+        else { first.controller.abort(); state.room.onPeerLeave('peer-a'); }
+        const admitted = ['b', 'c', 'd', 'e'].map(id => sync.onReceive!(ctx('peer-' + id, 2 * 1024 * 1024, 1)));
+        expect(admitted).toEqual([true, true, true, true]);
+        state.room.onPeerJoin('peer-f');
+        expect(sync.onReceive!(ctx('peer-f', 2 * 1024 * 1024, 1))).toBe(false);
+        t.close();
+      });
+    }
   });
 
   describe('lifecycle', () => {

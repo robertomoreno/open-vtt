@@ -37,7 +37,7 @@ export function* encodeBinaryFrames(data: Uint8Array, transferId: number): Itera
   }
 }
 
-type Transfer = { count: number; startedAt: number; parts: Map<number, Uint8Array>; bytes: number };
+type Transfer = { count: number; lastAt: number; parts: Map<number, Uint8Array>; bytes: number };
 
 export function createBinaryAssembler(now: () => number, budget: InboundBudget, onExpire: (transferId: number) => void) {
   const transfers = new Map<number, Transfer>();
@@ -46,13 +46,13 @@ export function createBinaryAssembler(now: () => number, budget: InboundBudget, 
   const expire = (): number[] => {
     const time = now();
     const expired: number[] = [];
-    for (const [id, transfer] of [...transfers]) if (time - transfer.startedAt > TRANSFER_TIMEOUT_MS) { drop(id); expired.push(id); }
+    for (const [id, transfer] of [...transfers]) if (time - transfer.lastAt > TRANSFER_TIMEOUT_MS) { drop(id); expired.push(id); }
     return expired;
   };
   const schedule = () => {
     cancel();
     if (transfers.size === 0) return;
-    const earliest = Math.min(...[...transfers.values()].map(transfer => transfer.startedAt));
+    const earliest = Math.min(...[...transfers.values()].map(transfer => transfer.lastAt));
     timer = setTimeout(() => { timer = undefined; const expired = expire(); schedule(); for (const id of expired) onExpire(id); }, Math.max(0, earliest + TRANSFER_TIMEOUT_MS + 1 - now()));
   };
   const drop = (id: number) => {
@@ -77,7 +77,7 @@ export function createBinaryAssembler(now: () => number, budget: InboundBudget, 
     let transfer = transfers.get(id);
     if (!transfer) {
       check(transfers.size < INCOMPLETE_TRANSFERS, 'Too many incomplete transfers.');
-      transfer = { count, startedAt: time, parts: new Map(), bytes: 0 };
+      transfer = { count, lastAt: time, parts: new Map(), bytes: 0 };
       transfers.set(id, transfer);
     }
     try {
@@ -89,6 +89,7 @@ export function createBinaryAssembler(now: () => number, budget: InboundBudget, 
       drop(id);
       throw error;
     }
+    transfer.lastAt = time;
     transfer.bytes += length;
     transfer.parts.set(index, frame.slice(FRAME_HEADER_BYTES));
     if (transfer.parts.size < transfer.count) return undefined;

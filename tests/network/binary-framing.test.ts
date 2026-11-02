@@ -100,7 +100,7 @@ describe('binary framing', () => {
     expect(() => assemblers[4].accept(frames(new Uint8Array(40_000), 6)[0])).not.toThrow();
   });
 
-  it('expires an incomplete transfer after 10,000 ms and releases its bytes', () => {
+  it('expires an incomplete transfer 10,001 ms after its last fragment and releases its bytes', () => {
     let now = 0;
     const budget = createInboundBudget();
     const assembler = createBinaryAssembler(() => now, budget, vi.fn());
@@ -108,7 +108,7 @@ describe('binary framing', () => {
     assembler.accept(first);
     now = 10_000;
     expect(assembler.accept(second)).toBeUndefined();
-    now = 10_001;
+    now = 20_001;
     expect(() => assembler.accept(third)).toThrow();
     expect(budget.reserved()).toBe(0);
   });
@@ -168,5 +168,44 @@ describe('binary framing', () => {
     assembler.accept(frames(new Uint8Array(40_000), 1)[0]);
     now = 10_001;
     expect(() => assembler.accept(frames(new Uint8Array(40_000), 2)[0])).toThrow();
+  });
+
+  it('measures inactivity, not total age: an actively progressing transfer lasting over 10 s is accepted', () => {
+    let now = 0;
+    const expired = vi.fn();
+    const budget = createInboundBudget();
+    const assembler = createBinaryAssembler(() => now, budget, expired);
+    const all = frames(new Uint8Array(2 * MiB), 5);
+    let result: Uint8Array | undefined;
+    for (const frame of all) { now += 100; result = assembler.accept(frame); }
+    expect(now).toBeGreaterThan(10_000);
+    expect(result?.byteLength).toBe(2 * MiB);
+    expect(expired).not.toHaveBeenCalled();
+    expect(budget.reserved()).toBe(0);
+  });
+
+  it('expires a transfer 10,001 ms after its last valid fragment even if it started long ago', () => {
+    let now = 0;
+    const expired = vi.fn();
+    const assembler = createBinaryAssembler(() => now, createInboundBudget(), expired);
+    const all = frames(new Uint8Array(100_000), 6);
+    assembler.accept(all[0]);
+    now = 9_000; assembler.accept(all[1]);
+    now = 19_000; expect(() => assembler.accept(all[2])).not.toThrow();
+    now = 29_001;
+    expect(() => assembler.accept(all[3])).toThrow();
+  });
+
+  it('timer-expires a silent transfer relative to its last valid fragment', () => {
+    vi.useFakeTimers();
+    const expired = vi.fn();
+    const assembler = createBinaryAssembler(() => Date.now(), createInboundBudget(), expired);
+    const all = frames(new Uint8Array(100_000), 7);
+    assembler.accept(all[0]);
+    vi.advanceTimersByTime(6_000); assembler.accept(all[1]);
+    vi.advanceTimersByTime(10_000);
+    expect(expired).not.toHaveBeenCalled();
+    vi.advanceTimersByTime(1);
+    expect(expired).toHaveBeenCalledWith(7);
   });
 });

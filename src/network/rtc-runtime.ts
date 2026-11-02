@@ -31,15 +31,20 @@ export function createBoundedRtcRuntime(options: Options) {
     let threshold = 0;
     const handlers: Record<'onopen' | 'onclose' | 'onerror' | 'onmessage' | 'onbufferedamountlow', Handler> = { onopen: null, onclose: null, onerror: null, onmessage: null, onbufferedamountlow: null };
 
-    const bus = new EventTarget();
-    const call = (name: keyof typeof handlers, event: unknown): boolean => {
+    // Own listener registry: EventTarget reports listener exceptions asynchronously and cannot be contained here.
+    const listeners = new Map<string, Array<{ fn: EventListenerOrEventListenerObject; once: boolean }>>();
+    const call = (name: keyof typeof handlers, event: any): boolean => {
       let ok = true;
       try { handlers[name]?.(event); } catch { ok = false; }
-      try { bus.dispatchEvent(new Event(name.slice(2))); } catch { /* listener errors are reported by the platform */ }
+      const type = name.slice(2);
+      for (const entry of [...(listeners.get(type) ?? [])]) {
+        if (entry.once) listeners.set(type, (listeners.get(type) ?? []).filter(other => other !== entry));
+        try { typeof entry.fn === 'function' ? entry.fn.call(api, event) : entry.fn.handleEvent(event); } catch { ok = false; }
+      }
       return ok;
     };
     const notifyClose = (event: unknown) => {
-      if (handlers.onclose) call('onclose', event);
+      if (handlers.onclose || (listeners.get('close')?.length ?? 0) > 0) call('onclose', event);
       else pendingClose = true;
     };
     const markClosed = () => {
@@ -100,8 +105,14 @@ export function createBoundedRtcRuntime(options: Options) {
         pump();
       },
       close() { api.shutdown(); },
-      addEventListener: (type: string, fn: EventListenerOrEventListenerObject, options?: AddEventListenerOptions | boolean) => bus.addEventListener(type, fn, options),
-      removeEventListener: (type: string, fn: EventListenerOrEventListenerObject, options?: EventListenerOptions | boolean) => bus.removeEventListener(type, fn, options),
+      addEventListener(type: string, fn: EventListenerOrEventListenerObject, options?: AddEventListenerOptions | boolean) {
+        const list = listeners.get(type) ?? [];
+        if (!list.some(entry => entry.fn === fn)) list.push({ fn, once: typeof options === 'object' && options.once === true });
+        listeners.set(type, list);
+      },
+      removeEventListener(type: string, fn: EventListenerOrEventListenerObject) {
+        listeners.set(type, (listeners.get(type) ?? []).filter(entry => entry.fn !== fn));
+      },
     };
     for (const name of Object.keys(handlers) as (keyof typeof handlers)[]) {
       Object.defineProperty(api, name, {

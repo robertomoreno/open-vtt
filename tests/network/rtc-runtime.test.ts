@@ -286,3 +286,68 @@ describe('open announcement', () => {
     expect(runtime.getOpenCount()).toBe(1);
   });
 });
+
+describe('channel listener API', () => {
+  const open = () => {
+    const errors: string[] = [];
+    const { runtime } = make(errors);
+    const ch: any = new runtime.rtcPolyfill().createDataChannel('x');
+    const n = FakePc.all[0].channels[0]; n.open();
+    return { ch, n, errors, runtime };
+  };
+
+  it('delivers the reconstructed MessageEvent, with its data, to addEventListener consumers', () => {
+    const { ch, n } = open();
+    const events: any[] = [];
+    ch.addEventListener('message', (e: any) => events.push(e));
+    for (const f of frame(10)) n.receive(f);
+    expect(events).toHaveLength(1);
+    expect(events[0]).toBeInstanceOf(MessageEvent);
+    expect(new Uint8Array(events[0].data)).toEqual(new Uint8Array(10).fill(3));
+  });
+
+  it('delivers close and bufferedamountlow events to listeners and honours removeEventListener and once', () => {
+    const { ch, n } = open();
+    const seen: string[] = [];
+    const low = () => seen.push('low');
+    ch.addEventListener('bufferedamountlow', low);
+    ch.addEventListener('close', () => seen.push('close'), { once: true });
+    n.drain();
+    ch.removeEventListener('bufferedamountlow', low);
+    n.drain();
+    n.close(); n.dispatchEvent(new Event('close'));
+    expect(seen).toEqual(['low', 'close']);
+  });
+
+  it('contains a throwing listener without throwing, without crashing the process, and fails only that peer', async () => {
+    const uncaught = vi.fn();
+    process.on('uncaughtException', uncaught);
+    try {
+      const { ch, n, errors } = open();
+      const later = vi.fn();
+      ch.addEventListener('message', () => { throw new Error('secret-listener-detail'); });
+      ch.addEventListener('message', later);
+      expect(() => frame(5).forEach(f => n.receive(f))).not.toThrow();
+      await new Promise(resolve => setTimeout(resolve, 10));
+      expect(uncaught).not.toHaveBeenCalled();
+      expect(later).toHaveBeenCalledTimes(1);
+      expect(errors).toEqual(['Peer message handler failed.']);
+      expect(n.closed).toBe(1);
+    } finally { process.off('uncaughtException', uncaught); }
+  });
+
+  it('still notifies the remaining close listeners when one close listener throws', async () => {
+    const uncaught = vi.fn();
+    process.on('uncaughtException', uncaught);
+    try {
+      const { ch, n } = open();
+      const second = vi.fn();
+      ch.addEventListener('close', () => { throw new Error('boom'); });
+      ch.addEventListener('close', second);
+      n.dispatchEvent(new Event('close'));
+      await new Promise(resolve => setTimeout(resolve, 10));
+      expect(second).toHaveBeenCalledTimes(1);
+      expect(uncaught).not.toHaveBeenCalled();
+    } finally { process.off('uncaughtException', uncaught); }
+  });
+});
