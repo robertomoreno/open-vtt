@@ -1,4 +1,6 @@
 import { test, expect, chromium, webkit, type Browser, type BrowserType, type Page, type WebSocketRoute } from '@playwright/test';
+import { createServer, type Socket } from 'node:net';
+import WebSocket from 'ws';
 import { createRoomLink, roomLink } from '../../src/network/room-link';
 
 const engines: Record<string, BrowserType> = { chromium, webkit };
@@ -20,36 +22,108 @@ function expectedLarge(seed: number): string {
 
 async function bridgeLocalRelay(route: WebSocketRoute, url: string): Promise<void> {
   const relay = new WebSocket(url);
-  await new Promise<void>((resolve, reject) => {
-    const timer = setTimeout(() => reject(new Error('Timed out connecting to the local signaling relay.')), 3_000);
-    relay.addEventListener('open', () => { clearTimeout(timer); resolve(); }, { once: true });
-    relay.addEventListener('error', () => { clearTimeout(timer); reject(new Error('Could not connect to the local signaling relay.')); }, { once: true });
+  let routeClosed = false;
+  let relayOpen = false;
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  let settleStart: ((error?: Error) => void) | undefined;
+  const closeRelay = () => {
+    if (relay.readyState === WebSocket.CONNECTING || relay.readyState === WebSocket.CLOSING) relay.terminate();
+    else if (relay.readyState === WebSocket.OPEN) relay.close();
+  };
+  const closeRoute = () => {
+    if (routeClosed) return;
+    routeClosed = true;
+    void route.close();
+  };
+
+  route.onClose(() => {
+    routeClosed = true;
+    if (timer) clearTimeout(timer);
+    closeRelay();
+    if (!relayOpen) settleStart?.();
   });
 
-  let closing = false;
+  await new Promise<void>((resolve, reject) => {
+    let settled = false;
+    const finish = (error?: Error) => {
+      if (settled) return;
+      settled = true;
+      if (timer) clearTimeout(timer);
+      if (error) reject(error); else resolve();
+    };
+    settleStart = finish;
+    timer = setTimeout(() => {
+      closeRelay();
+      finish(new Error('Timed out connecting to the local signaling relay.'));
+      closeRoute();
+    }, 3_000);
+    relay.addEventListener('open', () => {
+      relayOpen = true;
+      finish();
+    }, { once: true });
+    relay.addEventListener('error', () => {
+      if (routeClosed) { finish(); return; }
+      if (relayOpen) { closeRoute(); return; }
+      closeRelay();
+      finish(new Error('Could not connect to the local signaling relay.'));
+      closeRoute();
+    });
+    relay.addEventListener('close', () => {
+      if (routeClosed) { finish(); return; }
+      if (relayOpen) { closeRoute(); return; }
+      finish(new Error('Local signaling relay closed before opening.'));
+      closeRoute();
+    });
+  });
+
+  if (routeClosed) return;
   route.onMessage(message => {
     if (relay.readyState === WebSocket.OPEN) relay.send(message);
   });
-  route.onClose(() => {
-    closing = true;
-    if (relay.readyState < WebSocket.CLOSING) relay.close();
-  });
   relay.addEventListener('message', event => {
-    if (!closing) route.send(String(event.data));
-  });
-  relay.addEventListener('close', () => {
-    if (!closing) {
-      closing = true;
-      void route.close();
-    }
-  });
-  relay.addEventListener('error', () => {
-    if (!closing) {
-      closing = true;
-      void route.close();
-    }
+    if (!routeClosed) route.send(String(event.data));
   });
 }
+
+test('local relay bridge closes a pending loopback connection when the browser route closes', async () => {
+  const sockets: Socket[] = [];
+  let acceptConnection!: () => void;
+  const accepted = new Promise<void>(resolve => { acceptConnection = resolve; });
+  const server = createServer(socket => { sockets.push(socket); acceptConnection(); });
+  const port = await new Promise<number>((resolve, reject) => {
+    server.once('error', reject);
+    server.listen(0, '127.0.0.1', () => {
+      const address = server.address();
+      if (!address || typeof address === 'string') { reject(new Error('Local test server has no TCP address.')); return; }
+      resolve(address.port);
+    });
+  });
+  let onClose: Parameters<WebSocketRoute['onClose']>[0] | undefined;
+  const route = {
+    onMessage() {},
+    onClose(handler: Parameters<WebSocketRoute['onClose']>[0]) { onClose = handler; },
+    close: async () => {},
+    send() {},
+  } as unknown as WebSocketRoute;
+  const pending = bridgeLocalRelay(route, `ws://127.0.0.1:${port}`);
+  const settled = pending.then(() => undefined, () => undefined);
+
+  try {
+    await accepted;
+    expect(onClose).toBeDefined();
+    const closed = new Promise<void>((resolve, reject) => {
+      const timer = setTimeout(() => reject(new Error('Local bridge kept its pending socket open after route closure.')), 1_000);
+      sockets[0].once('close', () => { clearTimeout(timer); resolve(); });
+    });
+    onClose?.(1000, 'browser closed');
+    await expect(closed).resolves.toBeUndefined();
+    await expect(pending).resolves.toBeUndefined();
+  } finally {
+    sockets.forEach(socket => socket.destroy());
+    await new Promise<void>(resolve => server.close(() => resolve()));
+    await settled;
+  }
+});
 
 async function open(browser: Browser, link: string, participant: string, sockets: WebSocketRoute[]): Promise<Page> {
   const context = await browser.newContext({ baseURL: 'http://localhost:5173' });
