@@ -1,7 +1,8 @@
 import { describe, expect, it } from 'vitest';
 import { createMembership, type MembershipEvent } from '../../src/session/membership';
-import { EXPIRY_MS } from '../../src/network/limits';
-import { createTestWorkspace } from '../helpers/workspace';
+import { ADMITTED_PARTICIPANTS, CONTROL_ENTRIES, EXPIRY_MS } from '../../src/network/limits';
+import { createWorkspace } from '../../src/game/workspace';
+import { createTestWorkspace, namedRuntime } from '../helpers/workspace';
 
 type Clock = { at: number; now: () => number; advance: (ms: number) => void };
 
@@ -203,12 +204,52 @@ describe('transient logical membership', () => {
   });
 
   it('supplies no membership from a reloaded game snapshot', () => {
-    // A participant that opens a restored game holds no position and no tenure until the
-    // room's leader grants one: membership never comes from saved game data.
-    const restored = peer('restored');
-    expect(restored.membership.getView().members).toEqual([]);
-    expect(restored.membership.getView().tenure).toBeNull();
-    expect(restored.membership.getView().ambiguous).toBe(false);
+    // A durable game is written, snapshotted and restored; the restored copy must not carry
+    // any membership, order or tenure into the session layer.
+    const source = createTestWorkspace('alice');
+    source.applyLocal({ type: 'set-game-name', name: 'Restored Castle' });
+    const snapshot = source.getSnapshot();
+    const restored = createWorkspace(snapshot, namedRuntime('restored'), 'restored');
+    expect(restored.getSnapshot().game.name).toBe('Restored Castle');
+
+    const membership = peer('restored');
+    expect(membership.membership.getView().members).toEqual([]);
+    expect(membership.membership.getView().tenure).toBeNull();
+    expect(membership.membership.getView().ambiguous).toBe(false);
+
+    // Restoring the same snapshot again still supplies no membership.
+    const again = createWorkspace(snapshot, namedRuntime('restored-again'), 'restored-again');
+    expect(again.getSnapshot().game.name).toBe('Restored Castle');
+    expect(membership.membership.getView().members).toEqual([]);
+    expect(membership.membership.getView().tenure).toBeNull();
+  });
+
+  it('supplies no membership when a room with history is restored', () => {
+    // The durable side records real gameplay and the session side records a real room; only
+    // the gameplay survives the snapshot.
+    const source = createTestWorkspace('alice');
+    source.applyLocal({ type: 'set-game-name', name: 'Old Castle' });
+    source.applyLocal({ type: 'roll', playerId: 'alex', sides: 20 });
+
+    const alice = peer('alice', { founder: true });
+    const bob = peer('bob');
+    alice.membership.observe([{ type: 'admission-request', id: 'r-bob', requesterId: 'bob', at: 0 }], presence(alice, 'bob'));
+    const bobGrant = grantFor(alice.published, 'bob');
+    alice.membership.observe([bobGrant], presence(alice, 'alice', 'bob'));
+    bob.membership.observe([bobGrant], presence(bob, 'bob', 'alice'));
+    expect(alice.membership.getView().members.map(m => m.id)).toEqual(['alice', 'bob']);
+    expect(alice.membership.getView().tenure!.leaderId).toBe('alice');
+
+    const snapshot = source.getSnapshot();
+    const restored = createWorkspace(snapshot, namedRuntime('restored'), 'restored');
+    expect(restored.getSnapshot().game.name).toBe('Old Castle');
+    expect(restored.getSnapshot().game.rolls).toHaveLength(1);
+
+    // The restored copy carries the gameplay and none of the room state.
+    const reopened = peer('reopened');
+    expect(reopened.membership.getView().members).toEqual([]);
+    expect(reopened.membership.getView().tenure).toBeNull();
+    expect(reopened.membership.getView().ambiguous).toBe(false);
   });
 
   it('rejects stale-term control requests', () => {
@@ -392,5 +433,128 @@ describe('transient logical membership', () => {
     alice.membership.observe([], presence(alice));
     expect(calls).toBe(seen);
     alice.membership.destroy();
+  });
+
+  it('checkpoints the control view so churn does not lose admitted members', () => {
+    const alice = peer('alice', { founder: true });
+    const bob = peer('bob');
+    // Bob is admitted and stays in the room for the whole churn.
+    alice.membership.observe([{ type: 'admission-request', id: 'r-bob', requesterId: 'bob', at: 0 }], presence(alice, 'bob'));
+    const bobGrant = grantFor(alice.published, 'bob');
+    alice.membership.observe([bobGrant], presence(alice, 'alice', 'bob'));
+    bob.membership.observe([bobGrant], presence(bob, 'bob', 'alice'));
+    expect(alice.membership.getView().members.map(m => m.id)).toEqual(['alice', 'bob']);
+
+    // Churn: more grants and leaves than the control view can hold, while the admitted
+    // membership stays within the participant bound.
+    for (let n = 0; n < CONTROL_ENTRIES + 40; n++) {
+      const joiner = `p${n}`;
+      alice.membership.observe([{ type: 'admission-request', id: `r-${joiner}`, requesterId: joiner, at: 0 }], presence(alice, 'alice', 'bob'));
+      alice.membership.observe([], presence(alice, 'alice', 'bob'));
+      alice.membership.tick();
+      const grant = alice.published.find(event => event.type === 'admission-grant' && event.participantId === joiner);
+      if (!grant) continue;
+      alice.membership.observe([{ type: 'leave', id: `l-${joiner}`, participantId: joiner, at: 0 }], presence(alice, 'alice', 'bob'));
+      alice.membership.tick();
+    }
+
+    const view = alice.membership.getView();
+    // The churned participants are gone, but the two real members and the tenure survive.
+    expect(view.members.map(m => m.id)).toEqual(['alice', 'bob']);
+    expect(view.members.map(m => m.order)).toEqual([0, 1]);
+    expect(view.tenure!.leaderId).toBe('alice');
+    expect(view.tenure!.term).toBe(1);
+    expect(view.members.length).toBeLessThanOrEqual(ADMITTED_PARTICIPANTS);
+  });
+
+  it('checkpoints the control view without restoring a rejoined old position', () => {
+    const alice = peer('alice', { founder: true });
+    const bob = peer('bob');
+    alice.membership.observe([{ type: 'admission-request', id: 'r-bob', requesterId: 'bob', at: 0 }], presence(alice, 'bob'));
+    const bobGrant = grantFor(alice.published, 'bob');
+    alice.membership.observe([bobGrant], presence(alice, 'alice', 'bob'));
+    bob.membership.observe([bobGrant], presence(bob, 'bob', 'alice'));
+    expect(alice.membership.getView().members.map(m => m.order)).toEqual([0, 1]);
+
+    // Bob leaves and rejoins under a new identity at the end of the order.
+    alice.membership.observe([{ type: 'leave', id: 'l-bob', participantId: 'bob', at: 0 }], presence(alice, 'alice'));
+    const rejoin: MembershipEvent = {
+      type: 'admission-grant', id: 'g-rejoin', participantId: 'bob-new',
+      order: 2, grantorId: 'alice', grantorOrder: 0, term: 1,
+    };
+    alice.membership.observe([rejoin], presence(alice, 'alice', 'bob-new'));
+    expect(alice.membership.getView().members.map(m => m.id)).toEqual(['alice', 'bob-new']);
+    expect(alice.membership.getView().members.map(m => m.order)).toEqual([0, 2]);
+
+    // Churn past the control bound; the rejoined position must not fall back to the old one.
+    for (let n = 0; n < CONTROL_ENTRIES + 40; n++) {
+      const joiner = `p${n}`;
+      alice.membership.observe([{ type: 'admission-request', id: `r-${joiner}`, requesterId: joiner, at: 0 }], presence(alice, 'alice', 'bob-new'));
+      alice.membership.observe([], presence(alice, 'alice', 'bob-new'));
+      alice.membership.tick();
+      const grant = alice.published.find(event => event.type === 'admission-grant' && event.participantId === joiner);
+      if (!grant) continue;
+      alice.membership.observe([{ type: 'leave', id: `l-${joiner}`, participantId: joiner, at: 0 }], presence(alice, 'alice', 'bob-new'));
+      alice.membership.tick();
+    }
+
+    const view = alice.membership.getView();
+    expect(view.members.map(m => m.id)).toEqual(['alice', 'bob-new']);
+    expect(view.members.map(m => m.order)).toEqual([0, 2]);
+    expect(view.tenure!.leaderId).toBe('alice');
+  });
+
+  it('expires a member whose presence was never observed', () => {
+    const alice = peer('alice', { founder: true });
+    // Bob is admitted but Alice never hears from him: no presence is ever observed.
+    alice.membership.observe([{ type: 'admission-request', id: 'r-bob', requesterId: 'bob', at: 0 }], presence(alice, 'alice'));
+    const bobGrant = grantFor(alice.published, 'bob');
+    alice.membership.observe([bobGrant], presence(alice, 'alice'));
+    expect(alice.membership.getView().members.map(m => m.id)).toEqual(['alice', 'bob']);
+
+    // Within the grace period the unobserved member keeps its position.
+    alice.clock.advance(EXPIRY_MS - 1);
+    alice.membership.observe([], presence(alice, 'alice'));
+    alice.membership.tick();
+    expect(alice.membership.getView().members.map(m => m.id)).toEqual(['alice', 'bob']);
+
+    // Past the grace period the unobserved member is expired.
+    alice.clock.advance(2);
+    alice.membership.observe([], presence(alice, 'alice'));
+    alice.membership.tick();
+    expect(alice.membership.getView().members.map(m => m.id)).toEqual(['alice']);
+    expect(alice.membership.getView().tenure!.leaderId).toBe('alice');
+  });
+
+  it('does not resurrect an expired member after control churn', () => {
+    const alice = peer('alice', { founder: true });
+    const bob = peer('bob');
+    alice.membership.observe([{ type: 'admission-request', id: 'r-bob', requesterId: 'bob', at: 0 }], presence(alice, 'bob'));
+    const bobGrant = grantFor(alice.published, 'bob');
+    alice.membership.observe([bobGrant], presence(alice, 'alice', 'bob'));
+    bob.membership.observe([bobGrant], presence(bob, 'bob', 'alice'));
+    expect(alice.membership.getView().members.map(m => m.id)).toEqual(['alice', 'bob']);
+
+    // Bob's presence expires.
+    alice.clock.advance(EXPIRY_MS + 1);
+    alice.membership.observe([], presence(alice, 'alice'));
+    alice.membership.tick();
+    expect(alice.membership.getView().members.map(m => m.id)).toEqual(['alice']);
+
+    // Churn past the control bound; the expired member must not come back from the checkpoint.
+    for (let n = 0; n < CONTROL_ENTRIES + 40; n++) {
+      const joiner = `p${n}`;
+      alice.membership.observe([{ type: 'admission-request', id: `r-${joiner}`, requesterId: joiner, at: 0 }], presence(alice, 'alice'));
+      alice.membership.observe([], presence(alice, 'alice'));
+      alice.membership.tick();
+      const grant = alice.published.find(event => event.type === 'admission-grant' && event.participantId === joiner);
+      if (!grant) continue;
+      alice.membership.observe([{ type: 'leave', id: `l-${joiner}`, participantId: joiner, at: 0 }], presence(alice, 'alice'));
+      alice.membership.tick();
+    }
+
+    const view = alice.membership.getView();
+    expect(view.members.map(m => m.id)).toEqual(['alice']);
+    expect(view.tenure!.leaderId).toBe('alice');
   });
 });

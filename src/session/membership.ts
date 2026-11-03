@@ -128,27 +128,33 @@ export function createMembership(options: MembershipOptions): Membership {
   const retired = new Set<string>();
   /** Last locally observed presence time per participant. */
   const reachable = new Map<string, number>();
+  /** Local time each participant was admitted, used as the grace reference for unobserved peers. */
+  const admittedAt = new Map<string, number>();
+  /**
+   * Checkpoint of the projected positions, taken before the grant log is trimmed. It keeps the
+   * admitted members and their logical orders alive when older grants fall out of the bounded log.
+   */
+  const checkpoint = new Map<string, number>();
 
   let tenure: Tenure | null = null;
   let ambiguous = false;
   let destroyed = false;
 
   const notify = () => { for (const fn of [...listeners]) fn(); };
-  /** Keeps a control log within the shared entry budget by dropping its oldest entry. */
-  const trim = (log: Grant[]) => { while (log.length > CONTROL_ENTRIES) log.shift(); };
 
   if (options.founder) {
     tenure = { id: tenureId(1, localId), term: 1, leaderId: localId };
     reachable.set(localId, now());
+    admittedAt.set(localId, now());
   }
 
   /**
-   * Projects the roster from the accepted grants. A grant records the position of the new
-   * member and of the granting leader; a member that left and rejoins holds a new position
-   * rather than the old one.
+   * Projects the roster from the checkpoint and the surviving grant log. A grant records the
+   * position of the new member and of the granting leader; a member that left and rejoins holds
+   * a new position rather than the old one.
    */
   const roster = () => {
-    const positions = new Map<string, number>();
+    const positions = new Map(checkpoint);
     for (const grant of grants) {
       if (!positions.has(grant.grantorId)) positions.set(grant.grantorId, grant.grantorOrder);
       positions.set(grant.participantId, grant.order);
@@ -162,10 +168,43 @@ export function createMembership(options: MembershipOptions): Membership {
   const orderOf = (participantId: string) => roster().find(member => member.id === participantId)?.order;
   const maxOrder = () => roster().reduce((max, member) => Math.max(max, member.order), -1);
 
-  /** Whether a participant was heard from recently enough to still count as reachable. */
+  /**
+   * Keeps a control log within the shared entry budget. Before an entry is dropped, the
+   * projected positions are checkpointed so no admitted member or logical order is lost.
+   */
+  const trim = (log: Grant[]) => {
+    while (log.length > CONTROL_ENTRIES) {
+      for (const member of roster()) checkpoint.set(member.id, member.order);
+      log.shift();
+    }
+    // The checkpoint is transient: retired positions are dropped and the map stays within the
+    // participant bound, so churn cannot grow it without limit.
+    for (const participantId of checkpoint.keys()) {
+      if (retired.has(participantId)) checkpoint.delete(participantId);
+    }
+    while (checkpoint.size > ADMITTED_PARTICIPANTS) {
+      const oldest = checkpoint.keys().next().value as string | undefined;
+      if (oldest === undefined) break;
+      checkpoint.delete(oldest);
+    }
+    // The retired set only has to outlast the checkpoint entries it protects.
+    while (retired.size > CONTROL_ENTRIES) {
+      const oldest = retired.values().next().value as string | undefined;
+      if (oldest === undefined) break;
+      retired.delete(oldest);
+    }
+  };
+
+  /**
+   * Whether a participant was heard from recently enough to still count as reachable. A
+   * participant whose presence was never observed is unreachable; its grace period runs from the
+   * local time it was admitted, so it is never dropped the instant it is admitted.
+   */
   const isReachable = (participantId: string) => {
     const last = reachable.get(participantId);
-    return last !== undefined && now() - last <= EXPIRY_MS;
+    if (last !== undefined) return now() - last <= EXPIRY_MS;
+    const admitted = admittedAt.get(participantId);
+    return admitted !== undefined && now() - admitted <= EXPIRY_MS;
   };
 
   /** The successor is the least ordered admitted member that is still locally reachable. */
@@ -179,18 +218,20 @@ export function createMembership(options: MembershipOptions): Membership {
   };
 
   /**
-   * Drops members whose locally observed presence expired past the grace period. A member that
-   * is unreachable but still within the grace period keeps its position, so a transient
-   * interruption does not create a new admission.
+   * Drops members that are no longer locally reachable. A member that is unreachable but still
+   * within the grace period keeps its position, so a transient interruption does not create a
+   * new admission. Members whose presence was never observed expire on the same grace clock.
    */
   const expireUnreachable = () => {
     const at = now();
     let changed = false;
     for (const member of roster()) {
       const last = reachable.get(member.id);
-      if (last === undefined) continue;
-      if (at - last <= EXPIRY_MS) continue;
+      const reference = last ?? admittedAt.get(member.id);
+      if (reference === undefined) continue;
+      if (at - reference <= EXPIRY_MS) continue;
       retired.add(member.id);
+      checkpoint.delete(member.id);
       changed = true;
     }
     return changed;
@@ -272,6 +313,8 @@ export function createMembership(options: MembershipOptions): Membership {
     grants.push(grant);
     trim(grants);
     retired.delete(grant.participantId);
+    // A re-admission is a new admission, so the grace period starts again.
+    admittedAt.set(grant.participantId, now());
     if (grant.term > (tenure?.term ?? 0)) {
       setTenure(grant.term, grant.grantorId);
       candidates.clear();
@@ -337,6 +380,8 @@ export function createMembership(options: MembershipOptions): Membership {
             if (retired.has(event.participantId)) break;
             retired.add(event.participantId);
             reachable.delete(event.participantId);
+            admittedAt.delete(event.participantId);
+            checkpoint.delete(event.participantId);
             changed = true;
             break;
           }
@@ -382,6 +427,8 @@ export function createMembership(options: MembershipOptions): Membership {
       publish({ type: 'leave', id: nextId(), participantId: localId, at: now() });
       retired.add(localId);
       reachable.delete(localId);
+      admittedAt.delete(localId);
+      checkpoint.delete(localId);
       notify();
     },
     destroy() {
@@ -389,11 +436,14 @@ export function createMembership(options: MembershipOptions): Membership {
       destroyed = true;
       listeners.clear();
       grants.length = 0;
+      pending.length = 0;
       requests.clear();
       candidates.clear();
       seenEvents.clear();
       reachable.clear();
       retired.clear();
+      admittedAt.clear();
+      checkpoint.clear();
     },
   };
   return controller;
