@@ -152,21 +152,45 @@ export function createMembership(options: MembershipOptions): Membership {
    * Projects the roster from the checkpoint and the surviving grant log. A grant records the
    * position of the new member and of the granting leader; a member that left and rejoins holds
    * a new position rather than the old one.
+   *
+   * At most `ADMITTED_PARTICIPANTS` members are admitted: the room keeps the best-positioned
+   * ones, so an over-cap flood of remote grants cannot grow the roster.
    */
-  const roster = () => {
+  const roster = (extra?: Grant) => {
     const positions = new Map(checkpoint);
     for (const grant of grants) {
       if (!positions.has(grant.grantorId)) positions.set(grant.grantorId, grant.grantorOrder);
       positions.set(grant.participantId, grant.order);
     }
+    if (extra) {
+      if (!positions.has(extra.grantorId)) positions.set(extra.grantorId, extra.grantorOrder);
+      positions.set(extra.participantId, extra.order);
+    }
     if (tenure && options.founder && !positions.has(localId)) positions.set(localId, 0);
     return [...positions.entries()]
       .filter(([participantId]) => !retired.has(participantId))
       .map(([participantId, order]) => ({ id: participantId, order }))
-      .sort((a, b) => a.order - b.order || byId(a.id, b.id));
+      .sort((a, b) => a.order - b.order || byId(a.id, b.id))
+      .slice(0, ADMITTED_PARTICIPANTS);
   };
   const orderOf = (participantId: string) => roster().find(member => member.id === participantId)?.order;
   const maxOrder = () => roster().reduce((max, member) => Math.max(max, member.order), -1);
+
+  /**
+   * Keeps the admission clocks aligned with the roster. Every admitted member holds a clock —
+   * including a leader learned only from a grant — and a clock is released as soon as its member
+   * leaves the roster, so the transient state cannot grow without bound.
+   */
+  const syncAdmissionClocks = () => {
+    const members = new Set(roster().map(member => member.id));
+    for (const participantId of [...admittedAt.keys()]) {
+      if (!members.has(participantId)) admittedAt.delete(participantId);
+    }
+    const at = now();
+    for (const participantId of members) {
+      if (!admittedAt.has(participantId)) admittedAt.set(participantId, at);
+    }
+  };
 
   /**
    * Keeps a control log within the shared entry budget. Before an entry is dropped, the
@@ -232,6 +256,8 @@ export function createMembership(options: MembershipOptions): Membership {
       if (at - reference <= EXPIRY_MS) continue;
       retired.add(member.id);
       checkpoint.delete(member.id);
+      // The admission clock is released with the position it belongs to.
+      admittedAt.delete(member.id);
       changed = true;
     }
     return changed;
@@ -310,9 +336,18 @@ export function createMembership(options: MembershipOptions): Membership {
       // still a fact, so it is recorded; only the leadership claim is left to the candidates.
       propose(grant.grantorId, grant.term);
     }
+    // A grant that the bounded roster would not keep is ignored, so a remote flood cannot
+    // push the room past the participant limit. Keeping the best-positioned members makes the
+    // outcome independent of the order the grants arrive in.
+    // A re-admission revives the position first: the member's old rank is not restored, only
+    // its membership in the room.
+    const revived = retired.delete(grant.participantId);
+    if (!roster(grant).some(member => member.id === grant.participantId)) {
+      if (revived) retired.add(grant.participantId);
+      return;
+    }
     grants.push(grant);
     trim(grants);
-    retired.delete(grant.participantId);
     // A re-admission is a new admission, so the grace period starts again.
     admittedAt.set(grant.participantId, now());
     if (grant.term > (tenure?.term ?? 0)) {
@@ -320,6 +355,7 @@ export function createMembership(options: MembershipOptions): Membership {
       candidates.clear();
       ambiguous = false;
     }
+    syncAdmissionClocks();
   };
 
   /** Applies the grants that were held back until the room was established. */
@@ -405,6 +441,7 @@ export function createMembership(options: MembershipOptions): Membership {
         }
       }
       drainPending();
+      syncAdmissionClocks();
       if (changed) notify();
     },
     tick() {
@@ -412,6 +449,7 @@ export function createMembership(options: MembershipOptions): Membership {
       const before = JSON.stringify({ members: roster(), tenure, ambiguous });
       const expired = expireUnreachable();
       succeed();
+      syncAdmissionClocks();
       const after = JSON.stringify({ members: roster(), tenure, ambiguous });
       if (expired || before !== after) notify();
     },

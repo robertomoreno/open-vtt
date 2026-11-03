@@ -557,4 +557,83 @@ describe('transient logical membership', () => {
     expect(view.members.map(m => m.id)).toEqual(['alice']);
     expect(view.tenure!.leaderId).toBe('alice');
   });
+
+  it('releases the admission clock of a member that expires', () => {
+    // Carol hears Alice's grant to Bob but never observes Alice's presence. Alice still holds a
+    // position in Carol's roster, and that position must expire like any other.
+    const alice = peer('alice', { founder: true });
+    const carol = peer('carol');
+    alice.membership.observe([{ type: 'admission-request', id: 'r-bob', requesterId: 'bob', at: 0 }], presence(alice, 'bob'));
+    const bobGrant = grantFor(alice.published, 'bob');
+    // Bob is granted a position too, so Carol's own grant establishes the room for her.
+    const carolGrant: MembershipEvent = {
+      type: 'admission-grant', id: 'g-carol', participantId: 'carol',
+      order: 2, grantorId: 'alice', grantorOrder: 0, term: 1,
+    };
+    carol.membership.observe([bobGrant, carolGrant], presence(carol, 'carol'));
+    expect(carol.membership.getView().members.map(m => m.id)).toEqual(['alice', 'bob', 'carol']);
+
+    // Past the grace period Carol has heard from neither Alice nor Bob, so both expire.
+    carol.clock.advance(EXPIRY_MS + 1);
+    carol.membership.observe([], presence(carol, 'carol'));
+    carol.membership.tick();
+    expect(carol.membership.getView().members.map(m => m.id)).toEqual(['carol']);
+  });
+
+  it('gives a member re-admitted after expiry a fresh grace period', () => {
+    const alice = peer('alice', { founder: true });
+    const bob = peer('bob');
+    alice.membership.observe([{ type: 'admission-request', id: 'r-bob', requesterId: 'bob', at: 0 }], presence(alice, 'alice'));
+    const bobGrant = grantFor(alice.published, 'bob');
+    alice.membership.observe([bobGrant], presence(alice, 'alice'));
+    expect(alice.membership.getView().members.map(m => m.id)).toEqual(['alice', 'bob']);
+
+    // Bob is never observed, so his admission expires.
+    alice.clock.advance(EXPIRY_MS + 1);
+    alice.membership.observe([], presence(alice, 'alice'));
+    alice.membership.tick();
+    expect(alice.membership.getView().members.map(m => m.id)).toEqual(['alice']);
+
+    // A re-admission starts a new grace period rather than inheriting the expired one.
+    const rejoin: MembershipEvent = {
+      type: 'admission-grant', id: 'g-rejoin', participantId: 'bob',
+      order: 2, grantorId: 'alice', grantorOrder: 0, term: 1,
+    };
+    alice.membership.observe([rejoin], presence(alice, 'alice'));
+    expect(alice.membership.getView().members.map(m => m.id)).toEqual(['alice', 'bob']);
+    alice.clock.advance(EXPIRY_MS - 1);
+    alice.membership.observe([], presence(alice, 'alice'));
+    alice.membership.tick();
+    expect(alice.membership.getView().members.map(m => m.id)).toEqual(['alice', 'bob']);
+  });
+
+  it('bounds remote admissions at the participant limit and converges across delivery orders', () => {
+    // A flood of remote grants from the same leader; the room keeps at most 32 admitted members.
+    const build = (reverse: boolean) => {
+      const alice = peer('alice', { founder: true });
+      const carol = peer('carol');
+      const grants: MembershipEvent[] = Array.from({ length: ADMITTED_PARTICIPANTS + 8 }, (_, n) => ({
+        type: 'admission-grant', id: `g-${n}`, participantId: `p${n}`,
+        order: n + 1, grantorId: 'alice', grantorOrder: 0, term: 1,
+      }));
+      // Carol is admitted by one of the grants, so her view covers the same room.
+      grants.push({ type: 'admission-grant', id: 'g-carol', participantId: 'carol', order: 100, grantorId: 'alice', grantorOrder: 0, term: 1 });
+      const events = reverse ? [...grants].reverse() : grants;
+      for (const peer of [alice, carol]) peer.membership.observe(events, presence(peer, 'alice', 'carol'));
+      return { alice, carol };
+    };
+    const a = build(false);
+    const b = build(true);
+    for (const view of [a.alice.membership.getView(), a.carol.membership.getView(), b.alice.membership.getView(), b.carol.membership.getView()]) {
+      expect(view.members.length).toBeLessThanOrEqual(ADMITTED_PARTICIPANTS);
+    }
+    // Both delivery orders converge on the same bounded roster.
+    expect(a.alice.membership.getView()).toEqual(b.alice.membership.getView());
+    expect(a.carol.membership.getView()).toEqual(b.carol.membership.getView());
+    expect(a.alice.membership.getView()).toEqual(a.carol.membership.getView());
+    // The best-positioned members are the ones kept.
+    expect(a.alice.membership.getView().members.map(m => m.id)).toEqual(
+      ['alice', ...Array.from({ length: ADMITTED_PARTICIPANTS - 1 }, (_, n) => `p${n}`)],
+    );
+  });
 });
