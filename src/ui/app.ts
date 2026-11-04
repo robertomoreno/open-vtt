@@ -38,9 +38,9 @@ export function detectEnvironment(): Environment {
 }
 
 export type AppDependencies = {
-  repository?: any;
+  repository?: WorkspaceRepository;
   runtime?: Runtime;
-  parseFile?: (file: File) => Promise<any>;
+  parseFile?: (file: File) => Promise<WorkspaceSnapshot>;
   download?: (snapshot: WorkspaceSnapshot) => void;
   confirm?: (message: string) => boolean;
   environment?: Environment;
@@ -191,6 +191,7 @@ export function mountApp(root: HTMLElement, deps: AppDependencies = {}) {
   }
 
   function openSession(next: PeerSession) {
+    importGeneration++;
     sessionToken++;
     const thisToken = sessionToken;
     clearSession();
@@ -219,7 +220,7 @@ export function mountApp(root: HTMLElement, deps: AppDependencies = {}) {
     if (playerId) {
       try {
         const result = repository.rememberPlayer ? repository.rememberPlayer(snapshot.game.id, playerId) : { ok: true };
-        if (result && !result.ok) warning.textContent = result.message;
+        if (result && !result.ok) warning.textContent = (result as { message: string }).message;
       } catch {}
     }
   }
@@ -231,11 +232,12 @@ export function mountApp(root: HTMLElement, deps: AppDependencies = {}) {
     restoreView = createRestoreGameView(screen, { snapshot, replace, selectedId: rememberedId ?? snapshot.game.players[0]?.id ?? null }, {
       open(playerId: string) {
         if (destroyed) return;
+        const gen = importGeneration;
         (async () => {
           await drainSaves(snapshot.game.id);
-          if (destroyed) return;
+          if (destroyed || gen !== importGeneration) return;
           openHost(snapshot, playerId || snapshot.game.players[0]?.id || '');
-        })().catch(report);
+        })().catch((e) => { if (!destroyed && gen === importGeneration) report(e); });
       },
       cancel() { showStart(); },
     });
@@ -245,9 +247,10 @@ export function mountApp(root: HTMLElement, deps: AppDependencies = {}) {
   function handleJoinStart(code: string) {
     try {
       const link = decodeRoomLink(code);
+      const gen = importGeneration;
       (async () => {
         const loaded = await repository.load(link.gameId);
-        if (destroyed) return;
+        if (destroyed || gen !== importGeneration) return;
         const snapshot = loaded && loaded.snapshot ? loaded.snapshot : null;
         const create = deps.createSession ?? createPeerSession;
         const next = create({
@@ -257,9 +260,10 @@ export function mountApp(root: HTMLElement, deps: AppDependencies = {}) {
           now: () => Date.now(),
         });
         next.joinRoom(link);
+        if (destroyed || gen !== importGeneration) { next.close(); return; }
         openSession(next);
         initSaveChain(link.gameId);
-      })().catch(report);
+      })().catch((e) => { if (!destroyed && gen === importGeneration) report(e); });
     } catch (e) {
       report(e);
     }
@@ -307,7 +311,6 @@ export function mountApp(root: HTMLElement, deps: AppDependencies = {}) {
         clearFlow();
       },
     });
-    view = view; // keep
   }
 
   function renderSession() {
@@ -329,7 +332,7 @@ export function mountApp(root: HTMLElement, deps: AppDependencies = {}) {
         lastIdentity = key;
         try {
           const result = repository.rememberPlayer ? repository.rememberPlayer(game.id, state.localPlayerId) : { ok: true };
-          if (result && !result.ok) warning.textContent = result.message;
+          if (result && !result.ok) warning.textContent = (result as { message: string }).message;
         } catch {}
       }
     }
@@ -444,12 +447,14 @@ export function mountApp(root: HTMLElement, deps: AppDependencies = {}) {
         }
       },
       restore(game: Game) {
+        const gen = importGeneration;
         (async () => {
           const loaded = await repository.load(game.id);
-          if (destroyed) return;
+          if (destroyed || gen !== importGeneration) return;
           const snapshot = loaded && loaded.snapshot ? loaded.snapshot : normalizeSnapshot(game, runtime);
+          if (destroyed || gen !== importGeneration) return;
           showRestore(snapshot, false, repository.rememberedPlayer ? repository.rememberedPlayer(game.id) : null);
-        })().catch(report);
+        })().catch((e) => { if (!destroyed && gen === importGeneration) report(e); });
       },
       import(file: File) { handleImport(file); },
       join(code: string) { handleJoinStart(code); },
