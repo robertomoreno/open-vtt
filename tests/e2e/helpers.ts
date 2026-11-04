@@ -33,6 +33,9 @@ export async function joinSharedRoom(page: Page, link: string): Promise<void> {
 }
 
 export async function createConnectedPlayer(page: Page, name: string): Promise<void> {
+  const choose = page.getByRole('button', { name: 'Choose player' });
+  if (await choose.isVisible().catch(() => false)) await choose.click();
+  await page.getByLabel('Player name').waitFor({ state: 'visible', timeout: 60000 });
   await page.getByLabel('Player name').fill(name);
   await page.getByRole('button', { name: 'Create player' }).click();
   const option = page.locator('#player-existing option', { hasText: name }).first();
@@ -62,11 +65,4 @@ export async function forkBackupFile(path: string, edit: LocalEdit, label: strin
   };
 }
 
-// Retired legacy helpers kept as typed placeholders so older specs still compile.
-export async function exchange(_host: Page, _guest: Page, _delayBeforeReply = 0): Promise<void> {
-  throw new Error('Legacy exchange flow was retired; use openSharedRoom and joinSharedRoom.');
-}
 
-export async function claimNew(_host: Page, _guest: Page, _name: string): Promise<void> {
-  throw new Error('Legacy claim flow was retired; use createConnectedPlayer.');
-}
