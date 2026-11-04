@@ -71,7 +71,7 @@ for (const [hostEngine, guestEngine] of directions) {
 
       await guest1.locator('#roll').click();
       await countRolls(guest1, 4);
-      try { await countRolls(guest2, 4); } catch {}
+      await countRolls(guest2, 4);
 
       const downloadPromise = guest1.waitForEvent('download');
       await guest1.locator('#download').click();
