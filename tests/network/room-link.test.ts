@@ -1,6 +1,12 @@
 import { describe, expect, it } from 'vitest';
 import { createRoomLink, decodeRoomLink, roomLink } from '../../src/network/room-link';
-import { encodeSignal } from '../../src/network/signaling';
+
+const encodeSignal = (signal: unknown) => {
+  const data = new TextEncoder().encode(JSON.stringify(signal));
+  let binary = '';
+  for (const n of data) binary += String.fromCharCode(n);
+  return btoa(binary).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+};
 
 const encodePayload = (value: unknown) => Buffer.from(JSON.stringify(value)).toString('base64url');
 const linkWith = (payload: string) => `https://example.test/table#room=${payload}`;
