@@ -47,7 +47,10 @@ function send(conn, message) {
   }
 }
 
+let clientCount = 0;
 function onConnection(conn) {
+  const id = ++clientCount;
+  console.log(`[relay] client ${id} connected (total ${wss.clients.size})`);
   const subscribed = new Set();
   const pingInterval = setInterval(() => {
     if (conn.readyState === wsOpen) {
@@ -56,6 +59,7 @@ function onConnection(conn) {
   }, 30000);
   conn.on('pong', () => {});
   conn.on('close', () => {
+    console.log(`[relay] client ${id} disconnected`);
     clearInterval(pingInterval);
     subscribed.forEach((topicName) => {
       const subs = topics.get(topicName);
@@ -77,19 +81,23 @@ function onConnection(conn) {
         topics.get(t).add(conn);
         subscribed.add(t);
       }
+      console.log(`[relay] subscribe topics=${msg.topics.join(',')} (clients=${topics.size} topics)`);
     } else if (msg.type === 'unsubscribe' && Array.isArray(msg.topics)) {
       for (const t of msg.topics) {
         const subs = topics.get(t);
         if (subs) { subs.delete(conn); if (subs.size === 0) topics.delete(t); }
         subscribed.delete(t);
       }
+      console.log(`[relay] unsubscribe topics=${msg.topics.join(',')}`);
     } else if (msg.type === 'publish' && typeof msg.topic === 'string') {
       const subs = topics.get(msg.topic);
+      let delivered = 0;
       if (subs) {
         for (const c of subs) {
-          if (c !== conn) send(c, { type: 'publish', topic: msg.topic, data: msg.data });
+          if (c !== conn) { send(c, { type: 'publish', topic: msg.topic, data: msg.data }); delivered++; }
         }
       }
+      console.log(`[relay] publish topic=${msg.topic} -> ${delivered} client(s)`);
     }
   });
 }

@@ -211,6 +211,7 @@ export function createRoomTransport(doc: Y.Doc, link: RoomLink, participantId: s
     removeUpdate = () => doc.off('update', onUpdate);
     joined.onPeerJoin = peerId => {
       if (closed) return;
+      if (import.meta.env.DEV) console.info('[Gather room] peer join', peerId, 'peers=', peers.size + 1);
       if (peers.size >= NATIVE_REMOTE_CONNECTIONS) { closePeer(peerId); return; }
       peers.add(peerId);
       send(sync, Y.encodeStateAsUpdate(doc), peerId);
@@ -218,6 +219,7 @@ export function createRoomTransport(doc: Y.Doc, link: RoomLink, participantId: s
       notify();
     };
     joined.onPeerLeave = peerId => {
+      if (import.meta.env.DEV) console.info('[Gather room] peer leave', peerId);
       peers.delete(peerId);
       participants.delete(peerId);
       limiters.delete(peerId);

@@ -16,8 +16,11 @@ const encodedBytes = (value: unknown) => encoder.encode(typeof value === 'string
 
 // Generic WSS topic pub/sub (the y-webrtc-compatible endpoint): carries only discovery and encrypted SDP/ICE.
 export function createRelayClient(url: string, Socket: typeof WebSocket = WebSocket): RelayClient {
-  check(new URL(url).protocol === 'wss:', 'Signaling URLs must be valid wss:// URLs.');
+  const protocol = new URL(url).protocol;
+  const allowed = protocol === 'wss:' || (import.meta.env.DEV && protocol === 'ws:');
+  check(allowed, 'Signaling URLs must be valid wss:// URLs.');
   const socket = new Socket(url);
+  if (import.meta.env.DEV) console.info('[Gather signaling] connecting to', url);
   const topics = new Map<string, Set<TopicCallback>>();
   let closed = false;
   let opened = false;
@@ -45,9 +48,12 @@ export function createRelayClient(url: string, Socket: typeof WebSocket = WebSoc
   socket.addEventListener('open', () => {
     if (closed) return;
     opened = true;
+    if (import.meta.env.DEV) console.info('[Gather signaling] open', url, 'topics=', topics.size);
     if (topics.size > 0) send({ type: 'subscribe', topics: [...topics.keys()] });
     settleWaiting();
   });
+  socket.addEventListener('error', (e) => { if (import.meta.env.DEV) console.warn('[Gather signaling] socket error', url, e); });
+  socket.addEventListener('close', (e) => { if (import.meta.env.DEV) console.info('[Gather signaling] socket close', url, (e as CloseEvent).code, (e as CloseEvent).reason); });
   socket.addEventListener('message', event => {
     if (closed || typeof event.data !== 'string' || event.data.length > CONTROL_BYTES || encodedBytes(event.data) > CONTROL_BYTES) return;
     let message: any;
