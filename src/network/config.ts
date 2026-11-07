@@ -43,11 +43,15 @@ function devSignalingOverride(): string[] | null {
 }
 
 const devOverride = devSignalingOverride();
-if (import.meta.env.DEV && devOverride) {
-  // eslint-disable-next-line no-console
-  console.info('[Gather dev] Using signaling override:', devOverride.join(', '));
-}
 const signalingUrls = devOverride ?? parseSignalingUrls(import.meta.env.VITE_GATHER_SIGNALING_URLS || defaultSignalingUrls);
+if (import.meta.env.DEV) {
+  // eslint-disable-next-line no-console
+  console.info('[Gather dev] Resolved signaling URLs:', signalingUrls.join(', '));
+  if (devOverride) {
+    // eslint-disable-next-line no-console
+    console.info('[Gather dev] (override active)');
+  }
+}
 
 export const roomNetworkConfig: { signaling: string[]; rtc: RTCConfiguration } = {
   signaling: signalingUrls,
