@@ -12,7 +12,9 @@
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
     "test:e2e": "playwright test",
-    "check:signaling": "node scripts/check-signaling.mjs"
+    "check:signaling": "node scripts/check-signaling.mjs",
+    "signal:start": "node scripts/signaling-server.mjs",
+    "signal:stop": "node scripts/signal-stop.mjs"
   },
   "devDependencies": {
     "@playwright/test": "^1.56.1",
