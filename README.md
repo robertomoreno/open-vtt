@@ -50,18 +50,20 @@ A room closes when its participants leave. The host tab no longer owns all live 
 The app normally uses the public relay `wss://y-webrtc-eu.fly.dev`. For local development you can point the app at the bundled loopback relay instead:
 
 ```sh
-npm run signal:start          # terminal 1 (127.0.0.1:4444)
-npm run dev                   # terminal 2
+npm run signal:start                                    # terminal 1 (127.0.0.1:4444)
+VITE_GATHER_SIGNALING_URLS=ws://127.0.0.1:4444 npm run dev   # terminal 2
 ```
 
-Then, in the browser console of the dev app, run:
+Open a second tab or browser and join the room link. The `ws://` override is honored **only in dev builds**; production builds require `wss://`.
+
+Alternatively, set it once in the browser so it persists across reloads:
 
 ```js
 localStorage.setItem('gather:dev:signaling', 'ws://127.0.0.1:4444');
 location.reload();
 ```
 
-Open a second tab or browser and join the room link. This override is honored **only in dev builds** (`import.meta.env.DEV`); production builds ignore it. Stop the relay with `npm run signal:stop`.
+Stop the relay with `npm run signal:stop`.
 
 ### Conflict and reconciliation rules
 
