@@ -87,17 +87,18 @@ describe('binary framing', () => {
     expect(() => assembler.accept(frames(new Uint8Array(40_000), 5)[0])).toThrow();
   });
 
-  it('rejects aggregate pending bytes above 8 MiB across connections and recovers after clear', () => {
+  it('rejects aggregate pending bytes above 16 MiB across connections and recovers after clear', () => {
     const budget = createInboundBudget();
-    const assemblers = Array.from({ length: 5 }, () => createBinaryAssembler(() => 0, budget, vi.fn()));
+    const assemblers = Array.from({ length: 9 }, () => createBinaryAssembler(() => 0, budget, vi.fn()));
     const partial = (id: number) => frames(new Uint8Array(2 * MiB), id).slice(0, 128);
-    for (const frame of partial(1)) assemblers[0].accept(frame);
-    for (const frame of partial(2)) assemblers[1].accept(frame);
-    for (const frame of partial(3)) assemblers[2].accept(frame);
-    for (const frame of partial(4)) assemblers[3].accept(frame);
-    expect(() => partial(5).forEach(f => assemblers[4].accept(f))).toThrow();
+    // Eight nearly-2-MiB partial transfers fit under the 16 MiB aggregate; the ninth does not.
+    for (let i = 0; i < 8; i++) for (const frame of partial(i + 1)) assemblers[i].accept(frame);
+    expect(budget.reserved()).toBeGreaterThan(15 * MiB);
+    expect(budget.reserved()).toBeLessThanOrEqual(16 * MiB);
+    expect(() => partial(9).forEach(f => assemblers[8].accept(f))).toThrow();
     assemblers[0].clear();
-    expect(() => assemblers[4].accept(frames(new Uint8Array(40_000), 6)[0])).not.toThrow();
+    expect(() => assemblers[8].accept(frames(new Uint8Array(40_000), 10)[0])).not.toThrow();
+    for (const assembler of assemblers) assembler.clear();
   });
 
   it('expires an incomplete transfer 10,001 ms after its last fragment and releases its bytes', () => {

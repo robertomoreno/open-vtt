@@ -182,9 +182,9 @@ describe('room transport', () => {
   });
 
   describe('pending-transfer admission', () => {
-    it('rejects one payload over 2 MiB, a fifth pending transfer per peer, and over 8 MiB aggregate', async () => {
+    it('rejects one payload over 2 MiB, a fifth pending transfer per peer, and over 16 MiB aggregate', async () => {
       const { state, join, t } = await start();
-      join('peer-a'); join('peer-b'); join('peer-c'); join('peer-d'); join('peer-e');
+      join('peer-a'); join('peer-b'); join('peer-c');
       const receive = state.actions['gather-sync-v2'].onReceive!;
       expect(receive(ctx('peer-a', 2 * 1024 * 1024 + 1))).toBe(false);
       const held = Array.from({ length: 4 }, () => ctx('peer-a', 1024));
@@ -192,9 +192,10 @@ describe('room transport', () => {
       expect(receive(ctx('peer-a', 1024))).toBe(false);
       held[0].controller.abort();
       expect(receive(ctx('peer-a', 1024))).toBe(true);
-      const big = ['peer-b', 'peer-c', 'peer-d'].map(id => ctx(id, 2 * 1024 * 1024));
-      expect(big.map(c => receive(c))).toEqual([true, true, true]);
-      expect(receive(ctx('peer-e', 2 * 1024 * 1024))).toBe(false);
+      // Seven 2-MiB transfers plus peer-a's 4 KiB fit; the eighth 2-MiB transfer exceeds 16 MiB.
+      expect([1, 2, 3, 4].map(id => receive(ctx('peer-b', 2 * 1024 * 1024, id)))).toEqual([true, true, true, true]);
+      expect([1, 2, 3].map(id => receive(ctx('peer-c', 2 * 1024 * 1024, id)))).toEqual([true, true, true]);
+      expect(receive(ctx('peer-c', 2 * 1024 * 1024, 4))).toBe(false);
       expect(t.getView().phase).toBe('looking');
       t.close();
     });
@@ -239,7 +240,7 @@ describe('room transport', () => {
       return { ...r, sync: r.state.actions['gather-sync-v2'], presence: r.state.actions['gather-presence-v2'] };
     };
 
-    it('counts presence and sync transfers against the same four-per-peer and 8 MiB budgets', async () => {
+    it('counts presence and sync transfers against the same four-per-peer and 16 MiB budgets', async () => {
       const { sync, presence, t } = await setup();
       expect([sync.onReceive!(ctx('peer-a', 10, 1)), sync.onReceive!(ctx('peer-a', 10, 2)), presence.onReceive!(ctx('peer-a', 10, 3)), presence.onReceive!(ctx('peer-a', 10, 4))]).toEqual([true, true, true, true]);
       expect(presence.onReceive!(ctx('peer-a', 10, 5))).toBe(false);
@@ -247,7 +248,9 @@ describe('room transport', () => {
       expect(presence.onReceive!(ctx('peer-b', 8 * 1024 + 1, 1))).toBe(false);
       expect([sync.onReceive!(ctx('peer-b', 2 * 1024 * 1024, 1)), sync.onReceive!(ctx('peer-c', 2 * 1024 * 1024, 1)), sync.onReceive!(ctx('peer-d', 2 * 1024 * 1024, 1))]).toEqual([true, true, true]);
       expect(sync.onReceive!(ctx('peer-e', 2 * 1024 * 1024 - 100, 1))).toBe(true);
-      expect(presence.onReceive!(ctx('peer-e', 1024, 2))).toBe(false);
+      // A second 2-MiB transfer on each peer fills the 16 MiB aggregate; the next byte is refused.
+      expect([sync.onReceive!(ctx('peer-b', 2 * 1024 * 1024, 2)), sync.onReceive!(ctx('peer-c', 2 * 1024 * 1024, 2)), sync.onReceive!(ctx('peer-d', 2 * 1024 * 1024, 2)), sync.onReceive!(ctx('peer-e', 2 * 1024 * 1024, 2))]).toEqual([true, true, true, true]);
+      expect(presence.onReceive!(ctx('peer-e', 1024, 3))).toBe(false);
       t.close();
     });
 
@@ -301,8 +304,10 @@ describe('room transport', () => {
         sync.onReceive!(first);
         if (order === 'leave-then-abort') { state.room.onPeerLeave('peer-a'); first.controller.abort(); }
         else { first.controller.abort(); state.room.onPeerLeave('peer-a'); }
-        const admitted = ['b', 'c', 'd', 'e'].map(id => sync.onReceive!(ctx('peer-' + id, 2 * 1024 * 1024, 1)));
-        expect(admitted).toEqual([true, true, true, true]);
+        // Eight 2-MiB transfers exactly fill the 16 MiB aggregate; a stale reservation would
+        // make the last one fail, and the next peer's transfer must fail in either case.
+        const admitted = ['b', 'c', 'd', 'e'].flatMap(id => [sync.onReceive!(ctx('peer-' + id, 2 * 1024 * 1024, 1)), sync.onReceive!(ctx('peer-' + id, 2 * 1024 * 1024, 2))]);
+        expect(admitted).toEqual([true, true, true, true, true, true, true, true]);
         state.room.onPeerJoin('peer-f');
         expect(sync.onReceive!(ctx('peer-f', 2 * 1024 * 1024, 1))).toBe(false);
         t.close();
