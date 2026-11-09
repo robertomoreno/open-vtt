@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import * as Y from 'yjs';
+import { canSeeChat, type ChatImage, type ChatMessage } from '../../src/game/chat';
 import { validateOperation } from '../../src/game/history';
 import type { GameHistory, WorkspaceSnapshot } from '../../src/game/sync-types';
 import type { DieSides, Game } from '../../src/game/types';
@@ -510,6 +511,130 @@ describe('peer session', () => {
     unsubscribe();
     a.roll(6);
     expect(events[events.length - 1]).toBe(1);
+    h.destroy();
+  });
+});
+
+function chatSnapshot(label: string): WorkspaceSnapshot {
+  const game: Game = {
+    ...soloGame(),
+    players: [
+      { id: 'alex', name: 'Alex', role: 'gm' },
+      { id: 'bea', name: 'Bea', role: 'pj' },
+      { id: 'cy', name: 'Cy', role: 'pj' },
+    ],
+  };
+  const ws = createWorkspace(game, namedRuntime(label), label);
+  try { return ws.getSnapshot(); } finally { ws.destroy(); }
+}
+
+describe('peer chat', () => {
+  it('sends public chat to every participant and saves it', async () => {
+    const h = createSessionHarness();
+    const a = h.add('a', chatSnapshot('seed'), 'alex');
+    const b = h.add('b', null);
+    h.connect('a', 'b'); await h.flush();
+    expect(a.sendMessage({ text: 'Hello table', recipients: null })).toBe(true);
+    await h.flush();
+    expect(b.getView().messages.map(m => m.text)).toEqual(['Hello table']);
+    const restored = createWorkspace(b.getSnapshot()!, namedRuntime('restored'));
+    expect(restored.getMessages()[0].text).toBe('Hello table');
+    h.destroy();
+  });
+
+  it('merges staged chat before publishing a returning backlog', async () => {
+    const h = createSessionHarness();
+    const a = h.add('a', chatSnapshot('seed'), 'alex');
+    const b = h.add('b', null, 'bea');
+    h.connect('a', 'b'); await h.flush();
+    a.sendMessage({ text: 'older', recipients: null });
+    await h.flush();
+    h.disconnect('a');
+    b.sendMessage({ text: 'offline from b', recipients: null });
+    h.connect('a', 'b'); await h.flush();
+    expect(a.getView().messages.map(m => m.text)).toContain('offline from b');
+    expect(b.getView().messages.map(m => m.text)).toContain('older');
+    h.destroy();
+  });
+
+  it('keeps private records in every copy but filters the audience', async () => {
+    const h = createSessionHarness();
+    const a = h.add('a', chatSnapshot('seed'), 'alex');
+    const b = h.add('b', null, 'bea');
+    const c = h.add('c', null, 'cy');
+    h.connect('a', 'b', 'c'); await h.flush();
+    a.sendMessage({ text: 'for bea', recipients: ['bea'] });
+    await h.flush();
+    const fromA = a.getView().messages.find(m => m.text === 'for bea')!;
+    const fromB = b.getView().messages.find(m => m.text === 'for bea')!;
+    const fromC = c.getView().messages.find(m => m.text === 'for bea')!;
+    expect(fromA.recipients).toEqual(['alex', 'bea']);
+    expect(canSeeChat(fromB.recipients, 'bea')).toBe(true);
+    expect(canSeeChat(fromC.recipients, 'cy')).toBe(false);
+    h.destroy();
+  });
+
+  it('delivers a private message to an offline recipient when they connect', async () => {
+    const h = createSessionHarness();
+    const a = h.add('a', chatSnapshot('seed'), 'alex');
+    const b = h.add('b', null, 'bea');
+    expect(a.sendMessage({ text: 'later, bea', recipients: ['bea'] })).toBe(true);
+    h.connect('a', 'b'); await h.flush();
+    const message = b.getView().messages.find(m => m.text === 'later, bea');
+    expect(message).toBeDefined();
+    expect(canSeeChat(message!.recipients, 'bea')).toBe(true);
+    h.destroy();
+  });
+
+  it('sends images live-only, keeps them across reconnect, and drops them in a new session', async () => {
+    const h = createSessionHarness();
+    const a = h.add('a', chatSnapshot('seed'), 'alex');
+    const b = h.add('b', null, 'bea');
+    h.connect('a', 'b'); await h.flush();
+    const image = { dataUrl: 'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=', name: 'pixel.png', type: 'image/png' as const, width: 1, height: 1 };
+    a.sendMessage({ text: 'with caption', recipients: null, image });
+    a.sendMessage({ text: '', recipients: null, image });
+    await h.flush();
+    expect(b.getView().liveImages).toHaveLength(2);
+    expect(JSON.stringify(a.getSnapshot())).not.toContain(image.dataUrl);
+    h.disconnect('a'); h.connect('a', 'b'); await h.flush();
+    expect(b.getView().liveImages).toHaveLength(2);
+    const later = h.add('later', b.getSnapshot()!, 'bea');
+    expect(later.getView().liveImages).toEqual([]);
+    expect(later.getView().messages.map(m => m.text)).toEqual(['with caption']);
+    h.destroy();
+  });
+
+  it('rejects unknown recipients and image-only messages without a seated player', () => {
+    const h = createSessionHarness();
+    const a = h.add('a', chatSnapshot('seed'), 'alex');
+    const b = h.add('b', null);
+    const image = { dataUrl: 'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=', name: 'pixel.png', type: 'image/png' as const, width: 1, height: 1 };
+    expect(a.sendMessage({ text: 'x', recipients: ['nobody'] })).toBe(false);
+    expect(a.getView().error).toMatch(/recipient/i);
+    expect(b.sendMessage({ text: '', recipients: null, image })).toBe(false);
+    expect(b.getView().error).toMatch(/player/i);
+    h.destroy();
+  });
+
+  it('converges on the same newest 100 after two backlogs meet', async () => {
+    const h = createSessionHarness();
+    const seed = chatSnapshot('seed');
+    const a = h.add('a', seed, 'alex');
+    const b = h.add('b', forkSnapshot(seed, 'b'), 'bea');
+    for (let i = 0; i < 95; i++) {
+      a.sendMessage({ text: `a${i}`, recipients: null });
+      h.advance(150);
+    }
+    for (let i = 0; i < 15; i++) {
+      b.sendMessage({ text: `b${i}`, recipients: null });
+      h.advance(150);
+    }
+    h.connect('a', 'b'); await h.flush();
+    const aIds = a.getView().messages.map(m => m.id);
+    const bIds = b.getView().messages.map(m => m.id);
+    expect(aIds).toEqual(bIds);
+    expect(aIds).toHaveLength(100);
     h.destroy();
   });
 });

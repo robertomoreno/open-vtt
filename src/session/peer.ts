@@ -1,4 +1,5 @@
 import * as Y from 'yjs';
+import { normalizeRecipients, validateChatImage } from '../game/chat';
 import { makeRosterAddition } from '../game/history';
 import { capturePriority, reconcileHistories } from '../game/reconcile';
 import type { ConflictNotice, GameHistory, GameOperation, LocalEdit, WorkspaceSnapshot } from '../game/sync-types';
@@ -9,18 +10,24 @@ import { ACTION_TOKEN_BURST, ACTION_TOKEN_REFILL_PER_SECOND, EXPIRY_MS, HEARTBEA
 import { createRoomLink, type RoomLink } from '../network/room-link';
 import { createRoomTransport, type RoomTransport } from '../network/room';
 import { createMembership, type Membership, type MembershipEvent } from './membership';
-import type { PeerSession, PeerSessionOptions, PeerSessionPhase, PeerSessionView } from './peer-types';
+import type { ChatDraft, PeerSession, PeerSessionOptions, PeerSessionPhase, PeerSessionView } from './peer-types';
 import {
   clearTransientStage,
   createWorkspaceBridge,
+  pruneStagedChat,
+  publishChat,
   readClaimConfirmations,
   readControlEvents,
+  readLiveImages,
   readRosterIntents,
+  readStagedChat,
   readStagedHistory,
+  removeLiveImage,
   removeRosterIntent,
   snapshotFromHistory,
   writeClaimConfirmation,
   writeControlEvent,
+  writeLiveImage,
   writeRosterIntent,
   type RosterIntent,
   type WorkspaceBridge,
@@ -156,6 +163,9 @@ export function createPeerSession(options: PeerSessionOptions): PeerSession {
       if (publishPending) publishLocal();
       admitCandidates();
     }
+    // Chat merges after the game work: game history stays the priority data and admitted
+    // records are the baseline before anything staged is mirrored back.
+    syncChat();
     processIntents();
     applyRemembered();
     if (localPlayerId !== null && connected() && claimIntentFor !== localPlayerId) publishClaimIntent();
@@ -314,6 +324,31 @@ export function createPeerSession(options: PeerSessionOptions): PeerSession {
     error = actionable(e instanceof Error ? e.message : 'The room data could not be staged.');
     teardownRequested = true;
     syncDirty = true;
+  }
+
+  // ── durable chat mirror ──────────────────────────────────────────────────────────────
+  /**
+   * Admits staged chat into the durable workspace, then mirrors the canonical window back
+   * to staging and prunes only records that were safely admitted. A failed merge leaves
+   * staging untouched; a failed publish surfaces a normal error without tearing down the
+   * room. Both writes are idempotent, so a settled stage is left byte-for-byte alone.
+   */
+  function syncChat() {
+    if (!workspace) return;
+    try {
+      workspace.mergeMessages(readStagedChat(stage));
+    } catch {
+      return; // never publish or prune records that were not safely admitted
+    }
+    if (!transport) return;
+    try {
+      const messages = workspace.getMessages();
+      publishChat(stage, messages);
+      pruneStagedChat(stage, messages);
+    } catch (e) {
+      // Chat is durable after the local add; a mirror failure must not end the session.
+      error = actionable(e instanceof Error ? e.message : 'Chat could not be synchronized.');
+    }
   }
 
   // ── roster intents (creation and claims) ─────────────────────────────────────────────
@@ -486,19 +521,25 @@ export function createPeerSession(options: PeerSessionOptions): PeerSession {
     tokens--;
     return true;
   }
-  /** Public actions report failures in `view.error`; they never throw through DOM callbacks. */
-  function action(run: () => void) {
-    if (closed) { error = 'Session is closed.'; emit(); return; }
+  /**
+   * Public actions report failures in `view.error`; they never throw through DOM callbacks.
+   * Returns whether the action was accepted, for callers that need the outcome.
+   */
+  function action(run: () => void): boolean {
+    if (closed) { error = 'Session is closed.'; emit(); return false; }
     // Rate-limit user actions, never sync fragments.
-    if (!takeToken()) { error = 'Too many actions; wait a moment and try again.'; emit(); return; }
+    if (!takeToken()) { error = 'Too many actions; wait a moment and try again.'; emit(); return false; }
+    let accepted = true;
     try {
       run();
       error = null;
     } catch (e) {
+      accepted = false;
       error = actionable(e instanceof Error ? e.message : 'The action could not be completed.');
     }
     refresh();
     emit();
+    return accepted;
   }
   function isLocalGm(): boolean {
     if (workspace === null || localPlayerId === null) return false;
@@ -526,6 +567,8 @@ export function createPeerSession(options: PeerSessionOptions): PeerSession {
       refresh();
       const tenure = membership?.getView().tenure ?? null;
       const game = workspace && !closed ? workspace.getSnapshot().game : null;
+      const seated = !closed && workspace !== null && localPlayerId !== null
+        && (game?.players.some(player => player.id === localPlayerId) ?? false);
       return {
         game,
         phase: currentPhase(),
@@ -533,7 +576,10 @@ export function createPeerSession(options: PeerSessionOptions): PeerSession {
         onlinePlayerIds: [...onlinePlayerIds],
         priorityParticipantId: tenure?.leaderId ?? null,
         canCreatePlayer: canCreatePlayerNow(),
-        canRoll: !closed && workspace !== null && localPlayerId !== null && (game?.players.some(player => player.id === localPlayerId) ?? false),
+        canRoll: seated,
+        canChat: seated,
+        messages: workspace && !closed ? workspace.getMessages() : [],
+        liveImages: closed ? [] : readLiveImages(stage),
         hasRecovery: recovery !== null,
         hasRoomLink: !closed && link !== null,
         unseatedParticipantCount: unseatedCount(),
@@ -619,6 +665,36 @@ export function createPeerSession(options: PeerSessionOptions): PeerSession {
           && intent.name.trim().toLowerCase() === playerName.toLowerCase() && intent.role === playerRole);
         if (pending) return;
         writeRosterIntent(stage, { id: runtime.id(), type: 'add-player', participantId, name: playerName, role: playerRole, at: now() });
+      });
+    },
+    sendMessage(draft: ChatDraft): boolean {
+      return action(() => {
+        // The seat is checked first: with no game there is still no player to post as.
+        check(localPlayerId !== null, 'Choose your player first.');
+        check(workspace !== null, 'No game is loaded.');
+        const playerId = localPlayerId;
+        const players = workspace.getSnapshot().game.players;
+        check(players.some(player => player.id === playerId), 'Unknown player reference.');
+        const body = typeof draft.text === 'string' ? draft.text.trim() : '';
+        const image = draft.image;
+        check(body.length > 0 || image !== undefined, 'Enter a message or attach an image.');
+        const recipients = normalizeRecipients(draft.recipients, playerId);
+        check(recipients === null || recipients.every(recipient => players.some(player => player.id === recipient)), 'Unknown chat recipient.');
+        // One id and time for the draft: the live image and its durable caption share them.
+        const messageId = id(runtime.id());
+        const at = runtime.now();
+        if (image !== undefined) {
+          writeLiveImage(stage, validateChatImage({ ...image, id: messageId, playerId, at, recipients }));
+          try {
+            if (body.length > 0) workspace.addMessage({ id: messageId, playerId, at, text: body, recipients });
+          } catch (e) {
+            // Never leave an image whose caption was not saved; the draft stays retryable.
+            removeLiveImage(stage, messageId);
+            throw e;
+          }
+        } else {
+          workspace.addMessage({ id: messageId, playerId, at, text: body, recipients });
+        }
       });
     },
     roll(sides: DieSides) {

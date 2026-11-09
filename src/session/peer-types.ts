@@ -1,3 +1,4 @@
+import type { ChatImage, ChatImageInput, ChatMessage, ChatRecipients } from '../game/chat';
 import type { ConflictNotice, LocalEdit, WorkspaceSnapshot } from '../game/sync-types';
 import type { DieSides, Game, Role, Runtime } from '../game/types';
 import type { RoomLink } from '../network/room-link';
@@ -37,6 +38,12 @@ export type PeerSessionView = {
   priorityParticipantId: string | null;
   canCreatePlayer: boolean;
   canRoll: boolean;
+  /** True when the seated local player may post chat, local or connected. */
+  canChat: boolean;
+  /** Durable chat text, oldest first, detached from the workspace. */
+  messages: ChatMessage[];
+  /** Live-only images currently staged for this session, oldest first. */
+  liveImages: ChatImage[];
   hasRecovery: boolean;
   /** True when this controller holds a room link, connected or not. */
   hasRoomLink: boolean;
@@ -52,6 +59,16 @@ export type PeerSessionView = {
    * It is never the game revision and never a global counter.
    */
   saveGeneration: number;
+};
+
+/**
+ * One outgoing chat draft. Text is durable; an attached image is live-only and never saved.
+ * `recipients: null` is public; a list is normalized with the sender included.
+ */
+export type ChatDraft = {
+  text: string;
+  recipients: ChatRecipients;
+  image?: ChatImageInput;
 };
 
 export type PeerSessionOptions = {
@@ -73,6 +90,8 @@ export type PeerSession = {
   joinRoom(link: RoomLink): void;
   selectPlayer(id: string): void;
   createPlayer(name: string, role: Role): void;
+  /** Posts one chat draft; returns whether the action was accepted (see `view.error`). */
+  sendMessage(draft: ChatDraft): boolean;
   roll(sides: DieSides): void;
   edit(edit: LocalEdit): void;
   disconnect(): void;
