@@ -7,11 +7,12 @@ import { browserWorkspaceRepository, type WorkspaceRepository } from '../storage
 import { parseBackupFile, downloadBackup } from '../storage/backups';
 import { validateGame } from '../game/validation';
 import { createPeerSession } from '../session/peer';
-import type { PeerSession } from '../session/peer-types';
+import type { ChatDraft, PeerSession } from '../session/peer-types';
 import { decodeRoomLink, roomLink, type RoomLink } from '../network/room-link';
 import { createStartView } from './start';
 import { createRestoreGameView } from './restore-game';
 import { createTableView, type TableView } from './table';
+import { prepareChatImage } from './image';
 import { createPlayerView, type PlayerView } from './player';
 import { createShareView, type ShareView } from './share';
 import { browserTabLocks, type TabLocks } from './tab-locks';
@@ -482,6 +483,8 @@ export function mountApp(root: HTMLElement, deps: AppDependencies = {}) {
         renderSession();
       },
       createPlayer: (name: string, role: any) => { session?.createPlayer(name, role); },
+      sendMessage: (draft: ChatDraft) => session?.sendMessage(draft) ?? false,
+      prepareImage: (file: File) => prepareChatImage(file),
     };
   }
 
