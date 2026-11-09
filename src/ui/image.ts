@@ -98,7 +98,7 @@ function encodeImage(decoded: DecodedImage, file: File): ChatImageInput {
       const type = encodedType(dataUrl);
       if (type !== requested) continue;
       encoded = true;
-      if (dataUrl.length > CHAT_IMAGE_DATA_URL_BYTES) break;
+      if (dataUrl.length > CHAT_IMAGE_DATA_URL_BYTES) continue;
       return { dataUrl, name: (file.name || 'image').slice(0, 100), type, width, height };
     }
   }
