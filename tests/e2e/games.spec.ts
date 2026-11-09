@@ -1,97 +1,103 @@
-import { test, expect } from '@playwright/test';
-import { createGame, countRolls, waitForSavedGame } from './helpers';
+import { test, expect } from './support/fixtures';
+import { APP_URL } from './config';
+import { GatherApp } from './pages/gather-app';
+import { waitForSavedGame } from './support/storage';
 
-test('create refresh restore and portable file roundtrip', async ({ page, browser }) => {
-  await createGame(page);
-  await page.locator('#roll').click();
-  await countRolls(page, 1);
-  await page.waitForTimeout(1000);
-  await page.reload();
-  await page.getByRole('button', { name: /Continue/ }).first().click();
-  await expect(page.getByLabel('Host as player')).toHaveValue(/.+/);
-  await page.getByRole('button', { name: 'Open game', exact: true }).click();
-  await countRolls(page, 1);
+test('create refresh restore and portable file roundtrip', async ({ app, browser }) => {
+  await app.createGame('The Lantern Road', 'Alex');
+  await app.table.roll();
+  await expect(app.table.rolls).toHaveCount(1);
+  await waitForSavedGame(app.page, { rolls: 1 });
 
-  const downloadPromise = page.waitForEvent('download');
-  await page.locator('#download').click();
-  const file = await downloadPromise;
+  await app.page.reload();
+  await app.start.continueGame('The Lantern Road');
+  await expect(app.restore.hostAsSelect).toHaveValue(/.+/);
+  await app.restore.open();
+  await expect(app.table.rolls).toHaveCount(1);
+
+  const file = await app.table.downloadGame();
   const path = (await file.path())!;
 
-  const context = await browser.newContext();
-  const fresh = await context.newPage();
-  await fresh.goto('/');
-  await fresh.getByLabel('Load state file').setInputFiles(path);
-  await fresh.getByRole('button', { name: 'Open game', exact: true }).click();
-  await expect(fresh.getByRole('heading', { name: 'The Lantern Road' })).toBeVisible();
-  await countRolls(fresh, 1);
+  const context = await browser.newContext({ baseURL: APP_URL });
+  const fresh = new GatherApp(await context.newPage());
+  await fresh.start.goto();
+  await fresh.start.importFile(path);
+  await fresh.restore.open();
+  await expect(fresh.table.title).toHaveText('The Lantern Road');
+  await expect(fresh.table.rolls).toHaveCount(1);
   await context.close();
 });
 
-test('invalid and canceled replacement imports preserve existing saves', async ({ page }) => {
-  await createGame(page);
-  await page.locator('#roll').click();
-  await countRolls(page, 1);
-  const promise = page.waitForEvent('download');
-  await page.locator('#download').click();
-  const path = (await (await promise).path())!;
-  await page.locator('#leave').click();
-  await page.getByLabel('Load state file').setInputFiles(path);
-  await expect(page.getByRole('button', { name: 'Replace saved game and open' })).toBeVisible();
-  await page.getByRole('button', { name: 'Cancel', exact: true }).click();
+test('invalid and canceled replacement imports preserve existing saves', async ({ app }) => {
+  await app.createGame();
+  await app.table.roll();
+  await expect(app.table.rolls).toHaveCount(1);
+  const path = await app.table.downloadGamePath();
+  await waitForSavedGame(app.page, { rolls: 1 });
+  await app.table.leave();
 
-  await page.getByLabel('Load state file').setInputFiles({ name: 'invalid.json', mimeType: 'application/json', buffer: Buffer.from('{"schemaVersion":2}') });
-  await expect(page.getByText('Unsupported backup format.')).toBeVisible();
-  await expect(page.getByRole('button', { name: 'Continue' })).toHaveCount(1);
+  await app.start.importFile(path);
+  await expect(app.restore.replaceOpenButton).toBeVisible();
+  await app.restore.cancel();
+
+  await app.start.importFile({
+    name: 'invalid.json',
+    mimeType: 'application/json',
+    buffer: Buffer.from('{"schemaVersion":2}'),
+  });
+  await expect(app.page.getByText('Unsupported backup format.')).toBeVisible();
+  await expect(app.start.continueButtons).toHaveCount(1);
 });
 
-test('saved-game deletion is blocked while another tab holds the game open', async ({ page, context }) => {
-  await createGame(page);
-  await page.locator('#roll').click();
-  await countRolls(page, 1);
-  await waitForSavedGame(page);
-  await page.locator('#leave').click();
-  await expect(page.getByRole('button', { name: /Continue/ }).first()).toBeVisible();
+test('saved-game deletion is blocked while another tab holds the game open', async ({ app, context }) => {
+  await app.createGame();
+  await app.table.roll();
+  await expect(app.table.rolls).toHaveCount(1);
+  await waitForSavedGame(app.page, { rolls: 1 });
+  await app.table.leave();
+  await expect(app.start.continueButtons.first()).toBeVisible();
 
-  const other = await context.newPage();
-  await other.goto('/');
-  const deleteButton = other.getByRole('button', { name: 'Delete The Lantern Road' });
+  const other = new GatherApp(await context.newPage());
+  await other.start.goto();
+  const deleteButton = other.start.deleteButton('The Lantern Road');
   await expect(deleteButton).toBeVisible();
 
-  await page.getByRole('button', { name: /Continue/ }).first().click();
-  await page.getByRole('button', { name: 'Open game', exact: true }).click();
-  await expect(page.locator('#roll')).toBeEnabled();
+  await app.start.continueGame('The Lantern Road');
+  await app.restore.open();
+  await expect(app.table.rollButton).toBeEnabled();
 
-  const blockedDialog = other.waitForEvent('dialog');
+  const blockedDialog = other.page.waitForEvent('dialog');
   await deleteButton.click();
   const blocked = await blockedDialog;
   expect(blocked.message()).toContain('open in another tab');
   await blocked.dismiss();
   await expect(deleteButton).toBeVisible();
 
-  await page.locator('#leave').click();
-  await expect(page.locator('#new-game')).toBeVisible();
+  await app.table.leave();
+  await expect(app.start.createGameButton).toBeVisible();
 
-  const confirmDialog = other.waitForEvent('dialog');
+  const confirmationDialog = other.page.waitForEvent('dialog');
   await deleteButton.click();
-  const confirmation = await confirmDialog;
+  const confirmation = await confirmationDialog;
   expect(confirmation.message()).toContain('Delete');
   await confirmation.accept();
-  await expect(other.getByText('No games saved here yet.')).toBeVisible();
-  await other.reload();
-  await expect(other.getByText('No games saved here yet.')).toBeVisible();
-  await other.close();
+  await expect(other.start.emptyState).toBeVisible();
+  await other.page.reload();
+  await expect(other.start.emptyState).toBeVisible();
+  await other.page.close();
 });
 
-test('responsive keyboard forms preserve die selection and safe text', async ({ page }) => {
-  await page.setViewportSize({ width: 390, height: 844 });
-  await createGame(page, '<img onerror=alert(1)>');
-  await expect(page.locator('img')).toHaveCount(0);
-  await page.getByRole('combobox', { name: 'Die', exact: true }).selectOption('6');
-  await page.locator('#roll').focus();
-  await page.keyboard.press('Enter');
-  await countRolls(page, 1);
-  await expect(page.getByRole('combobox', { name: 'Die', exact: true })).toHaveValue('6');
-  await expect(page.locator('#roll')).toBeFocused();
-  expect(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth)).toBe(true);
-  await page.screenshot({ path: `test-results/table-${test.info().project.name}.png`, fullPage: true });
+test('responsive keyboard forms preserve die selection and safe text', async ({ app }) => {
+  await app.page.setViewportSize({ width: 390, height: 844 });
+  await app.createGame('<img onerror=alert(1)>', 'Alex');
+  await expect(app.page.locator('img')).toHaveCount(0);
+
+  await app.table.chooseDie(6);
+  await app.table.focusRoll();
+  await app.page.keyboard.press('Enter');
+  await expect(app.table.rolls).toHaveCount(1);
+  await expect(app.table.dieSelect).toHaveValue('6');
+  await expect(app.table.rollButton).toBeFocused();
+  expect(await app.page.evaluate(() => document.documentElement.scrollWidth <= innerWidth)).toBe(true);
+  await app.page.screenshot({ path: `test-results/table-${test.info().project.name}.png`, fullPage: true });
 });

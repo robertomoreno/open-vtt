@@ -1,6 +1,6 @@
-import { test, expect, chromium, firefox, webkit, type BrowserType } from '@playwright/test';
-import { createGame, openSharedRoom, joinSharedRoom, addPlayerAsGm, claimPlayer, countRolls } from './helpers';
-import { APP_URL } from './config';
+import { chromium, firefox, webkit, type BrowserType } from '@playwright/test';
+import { test, expect } from './support/fixtures';
+import { Participant } from './support/participant';
 
 const engines: Record<string, BrowserType> = { chromium, firefox, webkit };
 
@@ -18,65 +18,59 @@ const directions: Array<[string, string]> = [
 
 for (const [hostEngine, guestEngine] of directions) {
   test(`${hostEngine} host ↔ ${guestEngine} guests: shared room, claims, rolls, departure, rejoin, download`, async () => {
-    test.setTimeout(300000);
+    test.setTimeout(300_000);
     const hostBrowser = await engines[hostEngine].launch();
     const guestBrowser = await engines[guestEngine].launch();
     try {
-      const hostContext = await hostBrowser.newContext({ baseURL: APP_URL });
-      const guestContext1 = await guestBrowser.newContext({ baseURL: APP_URL });
-      const guestContext2 = await guestBrowser.newContext({ baseURL: APP_URL });
-      const host = await hostContext.newPage();
-      const guest1 = await guestContext1.newPage();
-      const guest2 = await guestContext2.newPage();
+      const host = await Participant.create(hostBrowser);
+      const guest1 = await Participant.create(guestBrowser);
+      const guest2 = await Participant.create(guestBrowser);
 
-      await createGame(host, 'The Lantern Road');
-      const link = await openSharedRoom(host);
+      await host.app.createGame('The Lantern Road');
+      const link = await host.app.openSharedRoom();
 
-      await joinSharedRoom(guest1, link);
-      await addPlayerAsGm(host, 'Bea');
-      await claimPlayer(guest1, 'Bea');
+      await guest1.app.joinSharedRoom(link);
+      await host.app.table.addPlayer('Bea');
+      await guest1.app.claimPlayer('Bea');
 
-      await host.locator('#roll').click();
-      await countRolls(host, 1);
+      await host.app.table.roll();
+      await expect(host.app.table.rolls).toHaveCount(1);
 
-      await guest1.getByRole('combobox', { name: 'Die', exact: true }).selectOption('6');
-      await guest1.locator('#roll').click();
-      await countRolls(host, 2);
-      await countRolls(guest1, 2);
+      await guest1.app.table.chooseDie(6);
+      await guest1.app.table.roll();
+      await expect(host.app.table.rolls).toHaveCount(2);
+      await expect(guest1.app.table.rolls).toHaveCount(2);
 
-      await joinSharedRoom(guest2, link);
-      await addPlayerAsGm(host, 'Cy');
-      await claimPlayer(guest2, 'Cy');
-      await countRolls(guest2, 2);
+      await guest2.app.joinSharedRoom(link);
+      await host.app.table.addPlayer('Cy');
+      await guest2.app.claimPlayer('Cy');
+      await expect(guest2.app.table.rolls).toHaveCount(2);
 
-      await guest2.locator('#roll').click();
-      await countRolls(host, 3);
-      await countRolls(guest1, 3);
-      await countRolls(guest2, 3);
+      await guest2.app.table.roll();
+      await expect(host.app.table.rolls).toHaveCount(3);
+      await expect(guest1.app.table.rolls).toHaveCount(3);
+      await expect(guest2.app.table.rolls).toHaveCount(3);
 
-      await guest2.getByRole('button', { name: 'Choose player' }).click();
-      await expect(guest2.locator('#create-player-form')).toBeHidden();
-      await guest2.getByRole('button', { name: 'Cancel' }).click();
+      await guest2.app.table.choosePlayer();
+      await expect(guest2.app.playerChooser.createForm).toBeHidden();
+      await guest2.app.playerChooser.cancel();
 
-      await guest1.locator('#leave').click();
-      await joinSharedRoom(guest1, link);
-      await expect(guest1.locator('#roll')).toBeEnabled({ timeout: 60000 });
-      await countRolls(guest1, 3);
+      await guest1.app.table.leave();
+      await guest1.app.joinSharedRoom(link);
+      await expect(guest1.app.table.rollButton).toBeEnabled({ timeout: 60_000 });
+      await expect(guest1.app.table.rolls).toHaveCount(3);
 
       await host.close();
-      await guest1.getByRole('button', { name: 'Choose player' }).click();
-      await expect(guest1.locator('#create-player-form')).toBeHidden();
-      await guest1.getByRole('button', { name: 'Cancel' }).click();
+      await guest1.app.table.choosePlayer();
+      await expect(guest1.app.playerChooser.createForm).toBeHidden();
+      await guest1.app.playerChooser.cancel();
 
-      await countRolls(guest1, 3);
+      await expect(guest1.app.table.rolls).toHaveCount(3);
+      await guest1.app.table.roll();
+      await expect(guest1.app.table.rolls).toHaveCount(4);
+      await expect(guest2.app.table.rolls).toHaveCount(4);
 
-      await guest1.locator('#roll').click();
-      await countRolls(guest1, 4);
-      await countRolls(guest2, 4);
-
-      const downloadPromise = guest1.waitForEvent('download');
-      await guest1.locator('#download').click();
-      const download = await downloadPromise;
+      const download = await guest1.app.table.downloadGame();
       expect(download.suggestedFilename()).toMatch(/\.json$/);
     } finally {
       await hostBrowser.close().catch(() => {});
