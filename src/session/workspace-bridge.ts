@@ -1,15 +1,19 @@
 import * as Y from 'yjs';
+import {
+  chatImageBytes, chatMessageBytes, sortChatRecords, trimChatImages, trimChatMessages,
+  validateChatImage, validateChatMessage, type ChatImage, type ChatMessage,
+} from '../game/chat';
 import { projectHistory, validateHistory, validateOperation } from '../game/history';
 import type { GameHistory, GameOperation, WorkspaceSnapshot } from '../game/sync-types';
 import type { Game, Role } from '../game/types';
 import { check, id, validateGame } from '../game/validation';
 import type { Workspace } from '../game/workspace';
-import { CONTROL_BYTES, CONTROL_ENTRIES, ENCODED_OPERATION_BYTES, GAME_OPERATIONS, PENDING_ADMISSIONS } from '../network/limits';
+import { CHAT_RECORDS, CONTROL_BYTES, CONTROL_ENTRIES, ENCODED_OPERATION_BYTES, GAME_OPERATIONS, PENDING_ADMISSIONS } from '../network/limits';
 import { validateMembershipEvent, type MembershipEvent } from './membership';
 
 /**
  * The transient staging document is the untrusted boundary between the room and the
- * durable workspace. It carries four kinds of data, all transient and none of it saved:
+ * durable workspace. It carries transient records only, none of them saved:
  *
  * - `gather.entries`: candidate game records, one canonical JSON key per seed/operation
  *   (individual records, never one replaceable game blob), mirroring the workspace doc's
@@ -18,6 +22,8 @@ import { validateMembershipEvent, type MembershipEvent } from './membership';
  *   (re)joining participant naturally, because joining syncs the whole document.
  * - `gather.intents`: bounded, deduplicated roster-addition and claim intents.
  * - `gather.claims`: claim confirmations written only by the priority participant.
+ * - `gather.chat`: durable chat text mirrored to peers, one canonical JSON key per message.
+ * - `gather.chat-live`: live-only image payloads; they never reach the workspace or a save.
  *
  * Everything read back from staging is treated as malicious until validated: canonical
  * keys, normalized payloads, immutable IDs, allowed roots and size bounds are checked
@@ -27,10 +33,17 @@ export const STAGE_ENTRIES = 'gather.entries';
 export const STAGE_CONTROL = 'gather.control';
 export const STAGE_INTENTS = 'gather.intents';
 export const STAGE_CLAIMS = 'gather.claims';
+export const STAGE_CHAT = 'gather.chat';
+export const STAGE_CHAT_LIVE = 'gather.chat-live';
 
 const encoder = new TextEncoder();
-/** Aggregate encoded bound for the transient staging document (entries plus control log). */
-const STAGE_BYTES = ENCODED_OPERATION_BYTES + CONTROL_BYTES;
+const MiB = 1024 * 1024;
+/**
+ * Aggregate encoded bound for the transient staging document. Game history is admitted
+ * first; staged chat and live images are the lowest-priority data and are pruned to make
+ * room for it. The durable workspace keeps its own 1 MiB encoded cap.
+ */
+export const STAGE_BYTES = 1.75 * MiB;
 const LIMIT_MESSAGE = 'Room data limit reached; the accepted game is unchanged — download a backup before continuing.';
 
 export type WorkspaceBridge = {
@@ -212,6 +225,164 @@ export function snapshotFromHistory(value: GameHistory): WorkspaceSnapshot {
   }
 }
 
+/** Parses one staged chat record; malformed, noncanonical, or ID-mismatched records drop out. */
+function stagedChatRecord(key: string, value: unknown): ChatMessage | null {
+  if (typeof value !== 'string') return null;
+  let parsed: unknown;
+  try { parsed = JSON.parse(value); } catch { return null; }
+  let message: ChatMessage;
+  try { message = validateChatMessage(parsed); } catch { return null; }
+  return message.id === key && JSON.stringify(message) === value ? message : null;
+}
+
+function stagedChatRecords(stage: Y.Doc): ChatMessage[] {
+  const messages: ChatMessage[] = [];
+  for (const [key, value] of stage.getMap(STAGE_CHAT)) {
+    const message = stagedChatRecord(key, value);
+    if (message) messages.push(message);
+  }
+  return sortChatRecords(messages);
+}
+
+/** Valid staged chat records, oldest first, bounded by the canonical retention. */
+export function readStagedChat(stage: Y.Doc): ChatMessage[] {
+  return trimChatMessages(stagedChatRecords(stage));
+}
+
+/** Parses one staged live image; malformed, noncanonical, or ID-mismatched records drop out. */
+function stagedImageRecord(key: string, value: unknown): ChatImage | null {
+  if (typeof value !== 'string') return null;
+  let parsed: unknown;
+  try { parsed = JSON.parse(value); } catch { return null; }
+  let image: ChatImage;
+  try { image = validateChatImage(parsed); } catch { return null; }
+  return image.id === key && JSON.stringify(image) === value ? image : null;
+}
+
+function stagedImages(stage: Y.Doc): ChatImage[] {
+  const images: ChatImage[] = [];
+  for (const [key, value] of stage.getMap(STAGE_CHAT_LIVE)) {
+    const image = stagedImageRecord(key, value);
+    if (image) images.push(image);
+  }
+  return sortChatRecords(images);
+}
+
+/** Valid staged live images, oldest first, bounded by the live retention. */
+export function readLiveImages(stage: Y.Doc): ChatImage[] {
+  return trimChatImages(stagedImages(stage));
+}
+
+type StageVictim = { map: Y.Map<unknown>; key: string; bytes: number };
+
+/**
+ * Frees space in the transient staging document by dropping the lowest-priority data:
+ * invalid records first, then the oldest live images, then the oldest staged chat
+ * records. Chat outside the newest `CHAT_RECORDS` window goes before the window itself,
+ * so the canonical backlog survives while chat still yields to game history. Durable
+ * game entries and the control log are never touched. Returns true once the encoded
+ * stage is within `STAGE_BYTES`, and false when nothing else can be removed.
+ */
+export function shrinkTransientStage(stage: Y.Doc): boolean {
+  let size = Y.encodeStateAsUpdate(stage).byteLength;
+  if (size <= STAGE_BYTES) return true;
+  const chat = stage.getMap(STAGE_CHAT);
+  const live = stage.getMap(STAGE_CHAT_LIVE);
+  const invalidChat: string[] = [], invalidImages: string[] = [];
+  for (const [key, value] of chat) if (!stagedChatRecord(key, value)) invalidChat.push(key);
+  for (const [key, value] of live) if (!stagedImageRecord(key, value)) invalidImages.push(key);
+  if (invalidChat.length > 0 || invalidImages.length > 0) {
+    stage.transact(() => {
+      for (const key of invalidChat) chat.delete(key);
+      for (const key of invalidImages) live.delete(key);
+    });
+    size = Y.encodeStateAsUpdate(stage).byteLength;
+  }
+  while (size > STAGE_BYTES) {
+    const messages = stagedChatRecords(stage);
+    const window = new Set(messages.slice(-CHAT_RECORDS).map(message => message.id));
+    const victims: StageVictim[] = [
+      ...stagedImages(stage).map(image => ({ map: live, key: image.id, bytes: chatImageBytes(image) })),
+      ...messages.filter(message => !window.has(message.id)).map(message => ({ map: chat, key: message.id, bytes: chatMessageBytes(message) })),
+      ...messages.filter(message => window.has(message.id)).map(message => ({ map: chat, key: message.id, bytes: chatMessageBytes(message) })),
+    ];
+    const excess = size - STAGE_BYTES;
+    const chosen: StageVictim[] = [];
+    let freed = 0;
+    for (const victim of victims) {
+      if (freed >= excess) break;
+      chosen.push(victim);
+      freed += victim.bytes;
+    }
+    if (chosen.length === 0) return false;
+    stage.transact(() => { for (const victim of chosen) victim.map.delete(victim.key); });
+    const next = Y.encodeStateAsUpdate(stage).byteLength;
+    // Deletion must shrink the encoded document; otherwise a tombstone-only loop would spin.
+    if (next >= size) return false;
+    size = next;
+  }
+  return true;
+}
+
+/**
+ * Mirrors canonical chat into staging, writing only records that are missing or differ.
+ * This runs on every session refresh, so a matching stage is left byte-for-byte untouched.
+ * On failure only our own writes are rolled back; anything `shrinkTransientStage` already
+ * dropped as lowest-priority data stays dropped.
+ */
+export function publishChat(stage: Y.Doc, messages: readonly ChatMessage[]): void {
+  const map = stage.getMap(STAGE_CHAT);
+  const changes: Array<{ key: string; encoded: string; previous: string | undefined }> = [];
+  for (const message of trimChatMessages(messages.map(value => validateChatMessage(value)))) {
+    const encoded = JSON.stringify(message);
+    const previous = map.get(message.id);
+    if (previous === encoded) continue;
+    changes.push({ key: message.id, encoded, previous: typeof previous === 'string' ? previous : undefined });
+  }
+  if (changes.length === 0) return;
+  stage.transact(() => { for (const change of changes) map.set(change.key, change.encoded); });
+  if (shrinkTransientStage(stage)) return;
+  stage.transact(() => {
+    for (const change of changes) {
+      if (!map.has(change.key)) continue;
+      if (change.previous === undefined) map.delete(change.key);
+      else map.set(change.key, change.previous);
+    }
+  });
+  check(false, LIMIT_MESSAGE);
+}
+
+/** Removes staged chat records outside the canonical keep set; a matching stage is untouched. */
+export function pruneStagedChat(stage: Y.Doc, keep: readonly ChatMessage[]): void {
+  const ids = new Set(keep.map(message => validateChatMessage(message).id));
+  const map = stage.getMap(STAGE_CHAT);
+  const stale = [...map.keys()].filter(key => !ids.has(key));
+  if (stale.length === 0) return;
+  stage.transact(() => { for (const key of stale) map.delete(key); });
+}
+
+/** Stages one live-only image, trimming older images; the bytes never reach the workspace. */
+export function writeLiveImage(stage: Y.Doc, image: ChatImage): void {
+  const validated = validateChatImage(image);
+  const encoded = JSON.stringify(validated);
+  const map = stage.getMap(STAGE_CHAT_LIVE);
+  stage.transact(() => {
+    if (map.get(validated.id) !== encoded) map.set(validated.id, encoded);
+    const kept = new Set(trimChatImages(stagedImages(stage)).map(item => item.id));
+    for (const key of [...map.keys()]) if (!kept.has(key)) map.delete(key);
+  });
+  if (shrinkTransientStage(stage)) return;
+  if (map.has(validated.id)) stage.transact(() => map.delete(validated.id));
+  check(false, LIMIT_MESSAGE);
+}
+
+/** Drops one live image; used to roll back an image whose durable caption was not saved. */
+export function removeLiveImage(stage: Y.Doc, imageId: string): void {
+  const map = stage.getMap(STAGE_CHAT_LIVE);
+  if (!map.has(imageId)) return;
+  stage.transact(() => map.delete(imageId));
+}
+
 export function createWorkspaceBridge(stage: Y.Doc, workspace: Workspace): WorkspaceBridge {
   let destroyed = false;
   const ensureOpen = () => check(!destroyed, 'Bridge is closed.');
@@ -237,11 +408,11 @@ export function createWorkspaceBridge(stage: Y.Doc, workspace: Workspace): Works
       const added: string[] = [];
       stage.transact(() => { for (const key of keys) if (!map.has(key)) { map.set(key, true); added.push(key); } });
       if (added.length === 0) return;
-      if (Y.encodeStateAsUpdate(stage).byteLength > STAGE_BYTES) {
-        // Roll the offending records back; the accepted workspace is never touched.
-        stage.transact(() => { for (const key of added) map.delete(key); });
-        check(false, LIMIT_MESSAGE);
-      }
+      // Chat and live images are lowest priority: prune them before giving up on history.
+      if (shrinkTransientStage(stage)) return;
+      // Roll the offending records back; the accepted workspace is never touched.
+      stage.transact(() => { for (const key of added) map.delete(key); });
+      check(false, LIMIT_MESSAGE);
     },
     admit(history) {
       ensureOpen();
@@ -360,7 +531,10 @@ export function writeClaimConfirmation(stage: Y.Doc, confirmation: ClaimConfirma
   stage.transact(() => stage.getMap(STAGE_CLAIMS).set(confirmation.playerId, JSON.stringify(confirmation)));
 }
 
-/** Clears intents and claim confirmations; they are per-connection and must never replay. */
+/**
+ * Clears intents and claim confirmations; they are per-connection and must never replay.
+ * Staged chat and live images survive a reconnect within the same session.
+ */
 export function clearTransientStage(stage: Y.Doc): void {
   stage.transact(() => {
     const intents = stage.getMap(STAGE_INTENTS);

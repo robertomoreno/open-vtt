@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import * as Y from 'yjs';
+import type { ChatImage, ChatMessage } from '../../src/game/chat';
 import type { GameHistory, GameOperation } from '../../src/game/sync-types';
 import type { Game, Runtime } from '../../src/game/types';
 import { validateOperation } from '../../src/game/history';
@@ -7,13 +8,20 @@ import { ValidationError } from '../../src/game/validation';
 import { createWorkspace, type Workspace } from '../../src/game/workspace';
 import { CONTROL_ENTRIES, GAME_OPERATIONS, MISSING_DEPENDENCY_OPERATIONS } from '../../src/network/limits';
 import {
+  STAGE_CHAT,
   STAGE_CONTROL,
   STAGE_ENTRIES,
+  clearTransientStage,
   createWorkspaceBridge,
+  pruneStagedChat,
+  publishChat,
   readControlEvents,
+  readLiveImages,
+  readStagedChat,
   readStagedHistory,
   snapshotFromHistory,
   writeControlEvent,
+  writeLiveImage,
 } from '../../src/session/workspace-bridge';
 import type { MembershipEvent } from '../../src/session/membership';
 import { createTestWorkspace, fixtureRoster, namedRuntime } from '../helpers/workspace';
@@ -225,5 +233,76 @@ describe('workspace bridge', () => {
     loaded.destroy();
     // A wrong game id finds nothing to bootstrap from.
     expect(readStagedHistory(stage, 'other-game')).toBeNull();
+  });
+});
+
+describe('staged chat', () => {
+  const AT = '2026-11-09T10:00:00.000Z';
+  const PNG = 'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=';
+  const msg = (id: string, over: Partial<ChatMessage> = {}): ChatMessage => ({ id, playerId: 'alex', at: AT, text: `Hello ${id}`, recipients: null, ...over });
+  const img = (id: string, over: Partial<ChatImage> = {}): ChatImage => ({ id, playerId: 'alex', at: AT, recipients: null, name: 'map.png', type: 'image/png', width: 1, height: 1, dataUrl: PNG, ...over });
+
+  it('round-trips staged chat and skips malformed or noncanonical records', () => {
+    const { stage } = setup();
+    publishChat(stage, [msg('m1'), msg('m2')]);
+    stage.transact(() => {
+      stage.getMap(STAGE_CHAT).set('bad', '{"id":"bad"}');
+      stage.getMap(STAGE_CHAT).set('rewrite', JSON.stringify(msg('other')));
+    });
+    expect(readStagedChat(stage).map(m => m.id)).toEqual(['m1', 'm2']);
+    stage.transact(() => stage.getMap(STAGE_CHAT).set('m1', JSON.stringify(msg('m1', { text: 'tampered' }))));
+    publishChat(stage, [msg('m1')]);
+    expect(stage.getMap(STAGE_CHAT).get('m1')).toBe(JSON.stringify(msg('m1')));
+    pruneStagedChat(stage, [msg('m2')]);
+    expect([...stage.getMap(STAGE_CHAT).keys()]).toEqual(['m2']);
+  });
+
+  it('round-trips live images and trims the oldest beyond the bounds', () => {
+    const { stage } = setup();
+    for (let i = 0; i < 5; i++) writeLiveImage(stage, img(`i${i}`, { at: new Date(Date.UTC(2026, 0, 1, 0, 0, i)).toISOString() }));
+    expect(readLiveImages(stage).map(i => i.id)).toEqual(['i1', 'i2', 'i3', 'i4']);
+    expect(readLiveImages(stage)[0].dataUrl).toBe(PNG);
+  });
+
+  it('prunes staged chat instead of rolling back a history publish', () => {
+    const { stage, ws, bridge } = setup();
+    const big = '🧙'.repeat(2000);
+    stage.transact(() => {
+      for (let i = 0; i < 400; i++) {
+        const m = msg(`m${String(i).padStart(3, '0')}`, { text: big, at: new Date(Date.UTC(2026, 0, 1, 0, 0, i)).toISOString() });
+        stage.getMap(STAGE_CHAT).set(m.id, JSON.stringify(m));
+      }
+    });
+    expect(() => bridge.publish(ws.getHistory())).not.toThrow();
+    expect(stage.getMap(STAGE_ENTRIES).size).toBeGreaterThan(0);
+    expect(stage.getMap(STAGE_CHAT).size).toBeLessThan(400);
+  });
+
+  // Additional boundary checks beyond the plan's block: both stage writers must be true
+  // no-ops when staging already matches, and a reconnect must not drop chat or images.
+  it('writes only changed records and survives a transient-stage clear', () => {
+    const { stage } = setup();
+    publishChat(stage, [msg('m1')]);
+    const staged = Y.encodeStateAsUpdate(stage);
+    publishChat(stage, [msg('m1')]);
+    pruneStagedChat(stage, [msg('m1')]);
+    expect(Y.encodeStateAsUpdate(stage)).toEqual(staged);
+    writeLiveImage(stage, img('i0'));
+    const withImage = Y.encodeStateAsUpdate(stage);
+    clearTransientStage(stage);
+    expect(Y.encodeStateAsUpdate(stage)).toEqual(withImage);
+    expect(readStagedChat(stage).map(m => m.id)).toEqual(['m1']);
+    expect(readLiveImages(stage).map(i => i.id)).toEqual(['i0']);
+  });
+
+  it('still rolls back a history publish when game entries alone overflow the stage', () => {
+    const { stage, ws, bridge } = setup();
+    const seed = seedIdOf(ws);
+    // An oversized candidate entry is game data: chat cannot make room for it, so the
+    // publish must fail closed without leaving the new seed behind.
+    stage.transact(() => stage.getMap(STAGE_ENTRIES).set(JSON.stringify([`junk-${'x'.repeat(2 * 1024 * 1024)}`, soloGame()]), true));
+    const seedKey = JSON.stringify([seed, ws.getHistory().seeds[seed]]);
+    expect(() => bridge.publish(ws.getHistory())).toThrow(/Room data limit/);
+    expect(stage.getMap(STAGE_ENTRIES).has(seedKey)).toBe(false);
   });
 });
