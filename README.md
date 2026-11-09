@@ -1,6 +1,6 @@
 # Gather
 
-A small, local-first virtual tabletop for your stories. Create or restore a game, open a shared room, choose approved player identities, and share dice rolls. No accounts, application backend, gameplay relay, analytics, or cloud saves.
+A small, local-first virtual tabletop for your stories. Create or restore a game, open a shared room, choose approved player identities, and share dice rolls and table chat. No accounts, application backend, gameplay relay, analytics, or cloud saves.
 
 ## Run
 
@@ -83,6 +83,16 @@ Stop the relay with `npm run signal:stop`.
 - When a conflict is resolved, a detailed warning lists the competing changes, the retained value, and why it won. Pre-merge recovery downloads retain the losing offline history.
 - The successor’s current validated version becomes the starting fallback for their priority tenure; a fresh room starts from its opener’s saved version.
 
+### Chat
+
+Text is saved with the game and appears in the shared ledger beside rolls, with its author and time. Chat is public by default. Ticking **Private message** shows the roster and limits that entry to the named players; the sender is always included. Participants who are not named receive no entry at all, not even a placeholder. An offline recipient sees the message the next time they open the game and synchronize with the room.
+
+`Private` is a UI convention among trusted participants, not access control or encryption. Every participant’s browser copy of the game contains the records, including messages they cannot see in the UI, and a decoded game backup contains them too. Use private chat only at a table where everyone is trusted; do not rely on it to keep secrets from someone who can open the save or the app.
+
+Images can be attached to a message from the composer. Supported sources are PNG, JPEG, and WebP up to 10 MB; the browser resizes them to at most 1280 px and re-encodes until the shared image fits in 192 KiB. Images are live-only: they reach currently connected participants and disappear after a reload or when the room closes. A text caption sent with an image is saved and remains after the image is gone; an image sent without text leaves no saved record.
+
+One message carries at most 2,000 characters and one image. Chat retains the newest **100 messages** (256 KiB total) and up to **4 live images** (192 KiB each, 512 KiB total).
+
 ## Network privacy and limits
 
 `src/network/config.ts` uses public Google STUN:
@@ -94,7 +104,7 @@ STUN discovers network addresses; it does **not** relay game data. The service s
 
 No TURN relay is configured. Corporate firewalls, restrictive NAT, or incompatible network policies can make direct connections impossible. Same-machine tests do not prove connectivity between homes.
 
-Games support **32 players**, **100 recent rolls**, and one die per request (d4/d6/d8/d10/d12/d20/d100; default d20). The host supports at most 31 remote peers / 8 unapproved peers. Incoming requests have a 20-message burst and 10/second refill per peer. Accepted roll IDs remain deduplicated for that connection; after 4,096 accepted requests, reconnect to roll more. A flooding peer is closed independently. Frames are bounded to 16 KiB, reassembled messages to 256 KiB / 128 chunks, 4 incomplete transfers / 10 seconds, and outgoing buffering to 1 MiB. JSON imports are capped at 1 MiB. History and causal operations have finite bounds; oversized backups are rejected.
+Games support **32 players**, **100 recent rolls**, and one die per request (d4/d6/d8/d10/d12/d20/d100; default d20). The host supports at most 31 remote peers / 8 unapproved peers. Incoming requests have a 20-message burst and 10/second refill per peer. Accepted roll IDs remain deduplicated for that connection; after 4,096 accepted requests, reconnect to roll more. A flooding peer is closed independently. Frames are bounded to 16 KiB, reassembled messages to 2 MiB / 256 fragments, 4 incomplete transfers per peer within 10 seconds, and 16 MiB of pending inbound data per connection; outgoing buffering is limited to 1 MiB. Game files are capped at 1 MiB and portable backups at 4 MiB. History, causal operations, and chat retention (see **Shared rooms**) have finite bounds; the transient synchronization stage holds at most 1.75 MiB, and oversized backups are rejected.
 
 ## Compatibility
 
@@ -120,10 +130,10 @@ WebKit automation is **not proof of shipping Safari behavior**, and Chromium aut
 
 ## Structure
 
-- `src/game/`: durable schema, validation, immutable operations, causal reconciliation, unbiased Web Crypto dice.
+- `src/game/`: durable schema, validation, immutable operations, chat records and audiences (`chat.ts`), causal reconciliation, unbiased Web Crypto dice.
 - `src/storage/`: IndexedDB-backed browser records, identity hints, validated JSON files, recovery copies.
-- `src/network/`: room links, bounded framing, native WebRTC lifecycle, public signaling/STUN configuration; no game rules/DOM.
-- `src/session/`: causal peer session, membership, tenure, claims, request validation, presence, snapshots; no storage/DOM.
-- `src/ui/`: replaceable views and application wiring. The game-room layout is intentionally provisional.
+- `src/network/`: room links, bounded framing, native WebRTC lifecycle, public signaling/STUN configuration, shared size limits; no game rules/DOM.
+- `src/session/`: causal peer session, membership, tenure, claims, request validation, chat and live-image staging, presence, snapshots; no storage/DOM.
+- `src/ui/`: replaceable views and application wiring, including in-browser chat image preparation (`image.ts`). The game-room layout is intentionally provisional.
 
-No maps, tokens, sheets, chat, voice/video, cloud saves, automatic host migration, seamless reconnection, or PWA are included in this foundation.
+No maps, tokens, sheets, voice/video, cloud saves, automatic host migration, seamless reconnection, or PWA are included in this foundation.
