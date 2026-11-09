@@ -82,8 +82,14 @@ describe('public WSS topic relay client', () => {
     expect(socket.sent).toEqual([]);
   });
 
-  it('rejects non-wss relay URLs', () => {
-    expect(() => createRelayClient('ws://insecure.example', FakeSocket as unknown as typeof WebSocket)).toThrow();
+  it('rejects non-WebSocket relay URLs', () => {
+    expect(() => createRelayClient('https://insecure.example', FakeSocket as unknown as typeof WebSocket)).toThrow();
+  });
+
+  it('accepts a loopback ws:// relay in development', () => {
+    const relay = createRelayClient('ws://127.0.0.1:4444', FakeSocket as unknown as typeof WebSocket);
+    expect(relay).toBeDefined();
+    relay.close();
   });
 
   it('rejects every pending publish when the relay closes or the socket fails before opening', async () => {

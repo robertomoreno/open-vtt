@@ -17,6 +17,7 @@ function makeView(overrides: Partial<PeerSessionView> = {}): PeerSessionView {
     hasRecovery: false,
     conflicts: [],
     error: null,
+    connectionError: null,
     saveGeneration: 1,
     ...overrides,
   };
@@ -40,6 +41,15 @@ it('enables Roll when offline canRoll is true', () => {
   const actions = { roll: () => {}, download: () => {}, downloadRecovery: () => {}, connect: () => {}, disconnect: () => {}, leave: () => {}, choosePlayer: () => {} };
   const t = createTableView(document.querySelector('main')!, view, actions);
   expect(document.querySelector<HTMLButtonElement>('#roll')!.disabled).toBe(false);
+  t.destroy();
+});
+
+it('surfaces a transport connection error instead of the waiting text', () => {
+  document.body.innerHTML = '<main></main>';
+  const view = makeView({ phase: 'waiting', connectionError: 'Room discovery failed.' });
+  const actions = { roll: () => {}, download: () => {}, downloadRecovery: () => {}, connect: () => {}, disconnect: () => {}, leave: () => {}, choosePlayer: () => {} };
+  const t = createTableView(document.querySelector('main')!, view, actions);
+  expect(document.querySelector('[role="status"]')?.textContent).toBe('Room discovery failed.');
   t.destroy();
 });
 

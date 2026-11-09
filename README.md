@@ -56,6 +56,12 @@ VITE_GATHER_SIGNALING_URLS=ws://127.0.0.1:4444 npm run dev   # terminal 2
 
 Open a second tab or browser and join the room link. The `ws://` override is honored **only in dev builds**; production builds require `wss://`.
 
+When every configured signaling URL is loopback, the app also rewrites browsers' mDNS-obfuscated `.local` host candidates to `127.0.0.1` for that room. Some macOS/browser configurations cannot resolve those candidates across processes, which otherwise leaves ICE stuck at `checking`/`failed` even though signaling works. This fallback is dev-only and only valid because loopback signaling means every peer is on the same machine; it is **not** TURN and does not make remote peers or NAT traversal work.
+
+If ICE still fails, check the browser's macOS Local Network and incoming-connections permissions; a firewall-blocked browser cannot receive WebRTC traffic. Firefox in particular may be blocked by the application firewall even when Chromium works.
+
+If a connection fails, the table status now shows the transport error (for example, failed ICE or a room-password mismatch) instead of only “Waiting for connection.”
+
 Alternatively, set it once in the browser so it persists across reloads:
 
 ```js

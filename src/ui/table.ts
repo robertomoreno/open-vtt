@@ -89,6 +89,7 @@ export function createTableView(root: HTMLElement, view: PeerSessionView, action
     // status
     let statusText = '';
     if (v.error) statusText = v.error;
+    else if (v.connectionError) statusText = v.connectionError;
     else if (v.phase === 'offline') statusText = 'Offline. Local play continues; reconnect to sync.';
     else if (v.phase === 'waiting') statusText = 'Waiting for connection.';
     else if (v.phase === 'syncing') statusText = 'Syncing game state…';

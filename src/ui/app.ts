@@ -340,7 +340,10 @@ export function mountApp(root: HTMLElement, deps: AppDependencies = {}) {
     const recoverySnap = session.getRecoverySnapshot();
     if (recoverySnap) inMemoryRecovery = recoverySnap;
 
-    if (state.error) error.textContent = state.error;
+    // The player chooser renders its own status; do not duplicate the same live
+    // error in both places (screen readers would announce it twice).
+    const playerChooserOpen = Boolean(game) && (choosingPlayer || state.phase === 'choosing');
+    if (state.error && !playerChooserOpen) error.textContent = state.error;
     else error.textContent = '';
 
     if (choosingPlayer || state.phase === 'choosing' || !game) {
@@ -352,7 +355,7 @@ export function mountApp(root: HTMLElement, deps: AppDependencies = {}) {
             selectedId: state.localPlayerId,
             occupiedIds: state.onlinePlayerIds,
             canCreate: state.canCreatePlayer,
-            message: state.error,
+            message: state.error ?? state.connectionError,
           }, {
             select(id: string) { session?.selectPlayer(id); },
             create(name: string, role: any) { session?.createPlayer(name, role); },
@@ -370,7 +373,7 @@ export function mountApp(root: HTMLElement, deps: AppDependencies = {}) {
             selectedId: state.localPlayerId,
             occupiedIds: state.onlinePlayerIds,
             canCreate: state.canCreatePlayer,
-            message: state.error,
+            message: state.error ?? state.connectionError,
           });
         }
       } else {

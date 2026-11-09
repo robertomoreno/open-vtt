@@ -148,6 +148,28 @@ describe('peer session', () => {
     s.close();
   });
 
+  it('reclaims a remembered player after the leaving owner becomes unreachable', async () => {
+    const h = createSessionHarness();
+    const a = h.add('a', soloSnapshot('seed'));
+    const b = h.add('b', null);
+    h.connect('a', 'b'); await h.flush();
+    a.createPlayer('Bea', 'pj');
+    await h.flush();
+    const bea = a.getView().game!.players.find(player => player.name === 'Bea')!;
+
+    b.selectPlayer(bea.id);
+    await h.flush();
+    expect(b.getView().localPlayerId).toBe(bea.id);
+    expect(b.getView().onlinePlayerIds).toEqual([bea.id]);
+
+    b.close();
+    const c = h.add('c', null, bea.id);
+    h.connect('a', 'c'); await h.flush();
+    expect(c.getView().localPlayerId).toBe(bea.id);
+    expect(c.getView().error).toBeNull();
+    h.destroy();
+  });
+
   it('confirms one owner per reconciled view for two concurrent claims', async () => {
     const h = createSessionHarness();
     const a = h.add('a', soloSnapshot('seed'));

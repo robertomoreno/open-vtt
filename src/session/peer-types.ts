@@ -39,7 +39,10 @@ export type PeerSessionView = {
   canRoll: boolean;
   hasRecovery: boolean;
   conflicts: ConflictNotice[];
+  /** Last action/join error surfaced by the session. */
   error: string | null;
+  /** Live transport error (for example failed ICE or wrong room password), if any. */
+  connectionError: string | null;
   /**
    * Monotonic per-controller counter that changes only for accepted workspace changes.
    * It is never the game revision and never a global counter.

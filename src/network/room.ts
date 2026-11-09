@@ -1,6 +1,6 @@
 import * as Y from 'yjs';
 import type { JoinRoom, JoinRoomConfig, MessageAction, Room } from '@trystero-p2p/core';
-import { roomNetworkConfig } from './config';
+import { roomNetworkConfig, signalingIsLoopback } from './config';
 import { ACTION_TOKEN_BURST, ACTION_TOKEN_REFILL_PER_SECOND, ADMITTED_PARTICIPANTS, AWARENESS_BYTES, CONTROL_BYTES, CONTROL_ENTRIES, EXPIRY_MS, HEARTBEAT_MS, INCOMPLETE_TRANSFERS, MESSAGE_BYTES, NATIVE_REMOTE_CONNECTIONS, PENDING_ADMISSIONS, PENDING_INBOUND_BYTES, TRANSFER_TIMEOUT_MS } from './limits';
 import type { RoomLink } from './room-link';
 import { createBoundedRtcRuntime, type RtcConstructors } from './rtc-runtime';
@@ -57,6 +57,7 @@ export function createRoomTransport(doc: Y.Doc, link: RoomLink, participantId: s
   // A fault from one peer closes only that peer; it must not fail the room while other channels are open.
   const peerError = (message: string) => {
     if (closed) return;
+    if (import.meta.env.DEV) console.warn('[Gather room] transport error:', message);
     error = message;
     notify();
   };
@@ -95,7 +96,16 @@ export function createRoomTransport(doc: Y.Doc, link: RoomLink, participantId: s
         relayConfig: { urls: roomNetworkConfig.signaling },
         rtcConfig: roomNetworkConfig.rtc,
         rtcPolyfill: runtime.rtcPolyfill,
-      }, link.roomId, { onPeerHandshake: handshake, onJoinError: () => peerError('Room discovery failed.') });
+        // When signaling is loopback every peer is on this machine, so the
+        // browser's mDNS-obfuscated host candidates can safely become 127.0.0.1.
+        ...(signalingIsLoopback ? { _test_only_mdnsHostFallbackToLoopback: true } : {}),
+      }, link.roomId, {
+        onPeerHandshake: handshake,
+        onJoinError: (details) => {
+          if (import.meta.env.DEV) console.warn('[Gather room] join error:', details.error, 'peer=', details.peerId);
+          peerError('Room discovery failed.');
+        },
+      });
       wire(room);
     } catch {
       fail('The room transport could not start.');

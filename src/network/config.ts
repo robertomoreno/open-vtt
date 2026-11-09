@@ -53,6 +53,26 @@ if (import.meta.env.DEV) {
   }
 }
 
+// Browsers obfuscate local addresses in ICE candidates as mDNS hostnames
+// (e.g. "4f3a....local"). Some macOS/browser configurations cannot resolve
+// those cross-process, so same-machine peers exchange only unusable mDNS and
+// public STUN candidates and ICE fails. When every signaling URL is loopback,
+// all participants must be on this machine, so rewriting host candidates to
+// 127.0.0.1 is exact. This is dev-only; a production build never enables it.
+function isLoopbackUrl(value: string): boolean {
+  try {
+    const hostname = new URL(value).hostname.replace(/^\[|\]$/g, '');
+    return hostname === '127.0.0.1' || hostname === 'localhost' || hostname === '::1';
+  } catch {
+    return false;
+  }
+}
+export const signalingIsLoopback = import.meta.env.DEV && signalingUrls.every(isLoopbackUrl);
+if (signalingIsLoopback) {
+  // eslint-disable-next-line no-console
+  console.info('[Gather dev] Loopback signaling: rewriting mDNS host candidates to 127.0.0.1 for same-machine peers.');
+}
+
 export const roomNetworkConfig: { signaling: string[]; rtc: RTCConfiguration } = {
   signaling: signalingUrls,
   rtc: rtcConfiguration,

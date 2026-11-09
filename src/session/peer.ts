@@ -399,9 +399,9 @@ export function createPeerSession(options: PeerSessionOptions): PeerSession {
   function applyRemembered() {
     if (!workspace || localPlayerId !== null || remembered === null) return;
     const owner = readClaimConfirmations(stage).find(entry => entry.playerId === remembered);
-    if (owner && owner.participantId !== participantId) {
-      // An occupied remembered id never silently selects someone else.
-      remembered = null;
+    if (owner && owner.participantId !== participantId && reachable(owner.participantId)) {
+      // Another live participant owns it. Keep the preference (unlike a manual
+      // selection) so a reconnecting owner can reclaim it after the old claim expires.
       return;
     }
     if (!workspace.getSnapshot().game.players.some(player => player.id === remembered)) return;
@@ -418,7 +418,7 @@ export function createPeerSession(options: PeerSessionOptions): PeerSession {
     }
     if (localPlayerId !== null && transport) {
       const owner = confirmations.find(entry => entry.playerId === localPlayerId);
-      if (owner && owner.participantId !== participantId) {
+      if (owner && owner.participantId !== participantId && reachable(owner.participantId)) {
         localPlayerId = null;
         claimIntentFor = null;
         remembered = null;
@@ -505,6 +505,7 @@ export function createPeerSession(options: PeerSessionOptions): PeerSession {
         hasRecovery: recovery !== null,
         conflicts: conflicts.map(notice => ({ ...notice })),
         error,
+        connectionError: closed ? null : (transport?.getView().error ?? null),
         saveGeneration,
       };
     },

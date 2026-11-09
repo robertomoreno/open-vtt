@@ -20,8 +20,21 @@ describe('network configuration', () => {
   });
 
   it('rejects an invalid VITE_GATHER_SIGNALING_URLS override at load time', async () => {
-    vi.stubEnv('VITE_GATHER_SIGNALING_URLS', 'ws://insecure.example.test');
+    vi.stubEnv('VITE_GATHER_SIGNALING_URLS', 'https://insecure.example.test');
     await expect(import('../../src/network/config')).rejects.toThrow();
+  });
+
+  it('accepts a loopback ws:// override in development and enables the loopback candidate fallback', async () => {
+    vi.stubEnv('VITE_GATHER_SIGNALING_URLS', 'ws://127.0.0.1:4444');
+    const config = await import('../../src/network/config');
+    expect(config.roomNetworkConfig.signaling).toEqual(['ws://127.0.0.1:4444']);
+    expect(config.signalingIsLoopback).toBe(true);
+  });
+
+  it('does not treat a remote signaling override as loopback', async () => {
+    vi.stubEnv('VITE_GATHER_SIGNALING_URLS', 'wss://relay.example.test');
+    const config = await import('../../src/network/config');
+    expect(config.signalingIsLoopback).toBe(false);
   });
 
   it('uses explicit STUN-only ICE', () => {
