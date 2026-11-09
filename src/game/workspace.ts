@@ -1,12 +1,16 @@
 import * as Y from 'yjs';
-import { ENCODED_OPERATION_BYTES, GAME_OPERATIONS } from '../network/limits';
+import { CHAT_HARD_RECORDS, ENCODED_OPERATION_BYTES, GAME_OPERATIONS } from '../network/limits';
 import type { Game, Runtime } from './types';
 import type { GameHistory, GameOperation, LocalEdit, WorkspaceSnapshot } from './sync-types';
+import { trimChatMessages, validateChatMessage, type ChatMessage } from './chat';
 import { frontier, mergeHistory, projectHistory, validateHistory, validateOperation } from './history';
-import { check, id, object, role, sides, text, validateGame } from './validation';
+import { ValidationError, check, id, object, role, sides, text, validateGame } from './validation';
 
 export type Workspace = {
   readonly replicaId: string;
+  getMessages(): ChatMessage[];
+  addMessage(message: ChatMessage): void;
+  mergeMessages(messages: readonly ChatMessage[]): void;
   getHistory(): GameHistory;
   getSnapshot(): WorkspaceSnapshot;
   applyLocal(edit: LocalEdit): void;
@@ -16,7 +20,7 @@ export type Workspace = {
 };
 
 function readDoc(doc: Y.Doc): GameHistory {
-  check([...doc.share.keys()].every(key => ['meta', 'seeds', 'operations'].includes(key)), 'Unexpected workspace data.');
+  check([...doc.share.keys()].every(key => ['meta', 'seeds', 'operations', 'chat'].includes(key)), 'Unexpected workspace data.');
   const meta = doc.getMap('meta');
   check([...meta.keys()].every(key => key === 'modelVersion' || key === 'gameId') && meta.size === 2, 'Invalid workspace metadata.');
   // The canonical content is the map key: different payloads with the same
@@ -41,17 +45,35 @@ function readDoc(doc: Y.Doc): GameHistory {
   }
   return validateHistory({ modelVersion: meta.get('modelVersion'), gameId: meta.get('gameId'), seeds: Object.fromEntries(seeds), operations: Object.fromEntries(operations) });
 }
-function loadSnapshot(value: WorkspaceSnapshot): { doc: Y.Doc; history: GameHistory; game: Game } {
+function readChat(doc: Y.Doc): ChatMessage[] {
+  const chat = doc.getMap('chat');
+  check(chat.size <= CHAT_HARD_RECORDS, 'Too many chat records.');
+  const records: ChatMessage[] = [];
+  for (const [key, value] of chat) {
+    let message: ChatMessage;
+    try {
+      check(typeof value === 'string', 'Invalid chat record.');
+      message = validateChatMessage(JSON.parse(value));
+    } catch { throw new ValidationError('Invalid chat record.'); }
+    check(key === message.id && JSON.stringify(message) === value, 'Noncanonical chat record.');
+    records.push(message);
+  }
+  return trimChatMessages(records);
+}
+function loadSnapshot(value: WorkspaceSnapshot): { doc: Y.Doc; history: GameHistory; game: Game; messages: ChatMessage[] } {
   const snapshot = object(value, ['game', 'history']);
   const game = validateGame(snapshot.game);
   check(snapshot.history instanceof Uint8Array && snapshot.history.byteLength > 0 && snapshot.history.byteLength <= ENCODED_OPERATION_BYTES, 'Invalid or oversized history.');
   const doc = new Y.Doc();
   try {
     Y.applyUpdate(doc, snapshot.history);
-    const history = readDoc(doc), projected = projectHistory(history);
+    const history = readDoc(doc), projected = projectHistory(history), messages = readChat(doc);
+    const keep = new Set(messages.map(message => message.id));
+    const chat = doc.getMap('chat');
+    if ([...chat.keys()].some(key => !keep.has(key))) doc.transact(() => { for (const key of [...chat.keys()]) if (!keep.has(key)) chat.delete(key); });
     check(JSON.stringify(game) === JSON.stringify(projected), 'Snapshot does not match history.');
     check(Y.encodeStateAsUpdate(doc).byteLength <= ENCODED_OPERATION_BYTES, 'History limit reached; download a backup.');
-    return { doc, history, game: projected };
+    return { doc, history, game: projected, messages };
   } catch (error) { doc.destroy(); throw error; }
 }
 export function validateWorkspaceSnapshot(snapshot: WorkspaceSnapshot): WorkspaceSnapshot {
@@ -62,9 +84,9 @@ export function validateWorkspaceSnapshot(snapshot: WorkspaceSnapshot): Workspac
 
 export function createWorkspace(input: Game | WorkspaceSnapshot, runtime: Runtime, replicaId?: string): Workspace {
   const author = id(replicaId ?? runtime.id());
-  let doc: Y.Doc, history: GameHistory, game: Game;
+  let doc: Y.Doc, history: GameHistory, game: Game, messages: ChatMessage[];
   if ('history' in input) {
-    ({ doc, history, game } = loadSnapshot(input));
+    ({ doc, history, game, messages } = loadSnapshot(input));
   } else {
     game = validateGame(input);
     const seedId = id(runtime.id());
@@ -72,6 +94,7 @@ export function createWorkspace(input: Game | WorkspaceSnapshot, runtime: Runtim
     doc = new Y.Doc();
     doc.transact(() => { doc.getMap('meta').set('modelVersion', 1); doc.getMap('meta').set('gameId', game.id); doc.getMap('seeds').set(JSON.stringify([seedId, game]), true); });
     check(Y.encodeStateAsUpdate(doc).byteLength <= ENCODED_OPERATION_BYTES, 'History limit reached; download a backup.');
+    messages = [];
   }
   let destroyed = false;
   const listeners = new Set<() => void>();
@@ -96,8 +119,48 @@ export function createWorkspace(input: Game | WorkspaceSnapshot, runtime: Runtim
     }
     history = next; game = projected; notify();
   }
+  function commitMessages(next: ChatMessage[]) {
+    ensureOpen();
+    const previous = Y.encodeStateAsUpdate(doc), previousMessages = messages;
+    try {
+      const keep = new Set(next.map(message => message.id));
+      doc.transact(() => {
+        const chat = doc.getMap('chat');
+        for (const key of [...chat.keys()]) if (!keep.has(key)) chat.delete(key);
+        for (const message of next) chat.set(message.id, JSON.stringify(message));
+      });
+      const kept = [...next];
+      while (Y.encodeStateAsUpdate(doc).byteLength > ENCODED_OPERATION_BYTES && kept.length > 0) {
+        const oldest = kept.shift()!;
+        doc.transact(() => doc.getMap('chat').delete(oldest.id));
+      }
+      check(Y.encodeStateAsUpdate(doc).byteLength <= ENCODED_OPERATION_BYTES, 'History limit reached; download a backup.');
+      messages = kept;
+    } catch (error) {
+      doc.destroy(); doc = new Y.Doc(); Y.applyUpdate(doc, previous); messages = previousMessages; throw error;
+    }
+    notify();
+  }
   return {
     replicaId: author,
+    getMessages() { ensureOpen(); return structuredClone(messages); },
+    addMessage(value) {
+      ensureOpen();
+      const message = validateChatMessage(value);
+      check(!messages.some(existing => existing.id === message.id), 'Duplicate chat message.');
+      const next = trimChatMessages([...messages, message]);
+      if (JSON.stringify(next) !== JSON.stringify(messages)) commitMessages(next);
+    },
+    mergeMessages(incoming) {
+      ensureOpen();
+      const merged = new Map(messages.map(message => [message.id, message]));
+      for (const value of incoming) {
+        const message = validateChatMessage(value);
+        if (!merged.has(message.id)) merged.set(message.id, message);
+      }
+      const next = trimChatMessages([...merged.values()]);
+      if (JSON.stringify(next) !== JSON.stringify(messages)) commitMessages(next);
+    },
     getHistory() { ensureOpen(); return structuredClone(history); },
     getSnapshot() { ensureOpen(); return { game: structuredClone(game), history: Y.encodeStateAsUpdate(doc) }; },
     applyLocal(edit) {
