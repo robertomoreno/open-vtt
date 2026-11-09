@@ -10,9 +10,10 @@ import { createRoomLink } from '../../src/network/room-link';
 import type { RoomTransport, RoomTransportView } from '../../src/network/room';
 import { createPeerSession } from '../../src/session/peer';
 import type { PeerSession } from '../../src/session/peer-types';
-import { STAGE_ENTRIES } from '../../src/session/workspace-bridge';
+import { STAGE_CHAT, STAGE_ENTRIES } from '../../src/session/workspace-bridge';
+import { serializeBackup } from '../../src/storage/backups';
 import { createSessionHarness } from '../helpers/rooms';
-import { namedRuntime } from '../helpers/workspace';
+import { namedRuntime, nearCapSnapshot } from '../helpers/workspace';
 
 const AT = '2026-01-01T00:00:00.000Z';
 
@@ -596,7 +597,21 @@ describe('peer chat', () => {
     a.sendMessage({ text: '', recipients: null, image });
     await h.flush();
     expect(b.getView().liveImages).toHaveLength(2);
-    expect(JSON.stringify(a.getSnapshot())).not.toContain(image.dataUrl);
+    const snapshot = a.getSnapshot()!;
+    const durableBytes = new TextDecoder().decode(snapshot.history);
+    expect(durableBytes).not.toContain(image.dataUrl);
+    const durableDoc = new Y.Doc();
+    Y.applyUpdate(durableDoc, snapshot.history);
+    expect(durableDoc.getMap('gather.chat-live').size).toBe(0);
+    expect([...durableDoc.getMap('chat').values()].join('')).not.toContain('data:image');
+    durableDoc.destroy();
+    const durable = createWorkspace(snapshot, namedRuntime('durable'));
+    try { expect(durable.getMessages().map(m => m.text)).toEqual(['with caption']); }
+    finally { durable.destroy(); }
+    const backup = serializeBackup(snapshot);
+    expect(backup).not.toContain(image.dataUrl);
+    const backupUpdate = Uint8Array.from(atob((JSON.parse(backup) as { history: { update: string } }).history.update), char => char.charCodeAt(0));
+    expect(new TextDecoder().decode(backupUpdate)).not.toContain(image.dataUrl);
     h.disconnect('a'); h.connect('a', 'b'); await h.flush();
     expect(b.getView().liveImages).toHaveLength(2);
     const later = h.add('later', b.getSnapshot()!, 'bea');
@@ -637,4 +652,29 @@ describe('peer chat', () => {
     expect(aIds).toHaveLength(100);
     h.destroy();
   });
+
+  it('prunes staging to the shared chat window rather than a near-cap workspace subset', () => {
+    const h = createSessionHarness();
+    const a = h.add('a', nearCapSnapshot(10_000), 'alex');
+    a.openRoom();
+    const stage = h.stageOf('a');
+    stage.transact(() => {
+      const chat = stage.getMap(STAGE_CHAT);
+      for (let i = 0; i < 100; i++) {
+        const value: ChatMessage = {
+          id: `staged-${String(i).padStart(3, '0')}`,
+          playerId: 'alex',
+          at: new Date(Date.UTC(2026, 0, 1, 0, 0, i)).toISOString(),
+          text: `staged ${i} ${'x'.repeat(500)}`,
+          recipients: null,
+        };
+        chat.set(value.id, JSON.stringify(value));
+      }
+    });
+    // The near-cap workspace can only retain a suffix of the shared window; staging must
+    // still keep the deterministic shared window instead of pruning to that suffix.
+    expect(a.getView().messages.length).toBeLessThan(100);
+    expect(stage.getMap(STAGE_CHAT).size).toBe(100);
+    h.destroy();
+  }, 120_000);
 });

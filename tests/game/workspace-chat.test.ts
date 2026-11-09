@@ -1,11 +1,10 @@
 import { describe, expect, it } from 'vitest';
 import * as Y from 'yjs';
-import type { GameHistory, GameOperation, WorkspaceSnapshot } from '../../src/game/sync-types';
-import type { ChatMessage } from '../../src/game/chat';
+import { chatMessageBytes, type ChatMessage } from '../../src/game/chat';
+import type { WorkspaceSnapshot } from '../../src/game/sync-types';
 import { CHAT_RECORDS, ENCODED_OPERATION_BYTES } from '../../src/network/limits';
 import { createWorkspace, validateWorkspaceSnapshot } from '../../src/game/workspace';
-import { projectHistory, validateHistory, validateOperation } from '../../src/game/history';
-import { createTestWorkspace, fixtureRoster, namedRuntime } from '../helpers/workspace';
+import { createTestWorkspace, namedRuntime, nearCapSnapshot } from '../helpers/workspace';
 
 const AT = '2026-11-09T10:00:00.000Z';
 const message = (id: string, over: Partial<ChatMessage> = {}): ChatMessage => ({ id, playerId: 'alex', at: AT, text: `Hello ${id}`, recipients: null, ...over });
@@ -16,44 +15,6 @@ function docOf(snapshot: WorkspaceSnapshot): Y.Doc {
   return doc;
 }
 
-// Builds a valid accepted snapshot whose encoded workspace is within a few bytes
-// of the 1 MiB bound. The operation name length is measured in UTF-8 bytes so the
-// final build lands on the cap instead of one whole operation short; every build
-// is a single Y.Doc transaction, so the fixture costs a handful of encodes.
-const sizedName = (bytes: number): string => '🧙'.repeat(Math.floor(bytes / 4)) + 'a'.repeat(bytes % 4);
-
-function nearCapSnapshot(): WorkspaceSnapshot {
-  const game = fixtureRoster(), seedId = 'cap-seed';
-  let count = 1900, tail = 400;
-  for (let attempt = 0; attempt < 12; attempt++) {
-    const operations: Record<string, GameOperation> = {};
-    let parents: string[] = [seedId];
-    for (let i = 0; i < count; i++) {
-      const id = `cap-${i}`;
-      operations[id] = validateOperation({
-        type: 'set-game-name', name: sizedName(i === count - 1 ? tail : 400), id, authorId: 'cap', parents, at: '2026-01-01T00:00:00.000Z',
-      });
-      parents = [id];
-    }
-    const history: GameHistory = validateHistory({ modelVersion: 1, gameId: game.id, seeds: { [seedId]: game }, operations });
-    const doc = new Y.Doc();
-    doc.transact(() => {
-      doc.getMap('meta').set('modelVersion', 1);
-      doc.getMap('meta').set('gameId', game.id);
-      doc.getMap('seeds').set(JSON.stringify([seedId, game]), true);
-      for (const operation of Object.values(operations)) doc.getMap('operations').set(JSON.stringify(operation), true);
-    });
-    const encoded = Y.encodeStateAsUpdate(doc), snapshot = { game: projectHistory(history), history: encoded };
-    doc.destroy();
-    const room = ENCODED_OPERATION_BYTES - encoded.byteLength;
-    if (room >= 0 && room <= 10) return snapshot;
-    const adjusted = tail + room - (room > 10 ? 8 : 0);
-    if (adjusted > 400) { count += Math.ceil((adjusted - 400) / 520); tail = 400; }
-    else if (adjusted < 1) { count -= Math.ceil((1 - adjusted) / 520); tail = 1; }
-    else tail = adjusted;
-  }
-  throw new Error('Unable to build a near-cap workspace snapshot.');
-}
 
 describe('workspace chat', () => {
   it('saves and restores messages with the workspace snapshot', () => {
@@ -136,14 +97,35 @@ describe('workspace chat', () => {
     expect(growth).toBeLessThan(1000);
   });
 
-  it('rolls back a message when the encoded workspace would exceed its limit', () => {
-    const w = createWorkspace(nearCapSnapshot(), namedRuntime('cap'), 'cap');
-    let rejected = false;
-    try { w.applyLocal({ type: 'set-game-name', name: '🏰'.repeat(100) }); } catch { rejected = true; }
-    expect(rejected).toBe(true);
+  it('rejects a message that cannot fit the encoded workspace and leaves it unchanged', () => {
+    // ~1000 bytes of real headroom: enough for small messages, not a 2000-character one.
+    const w = createWorkspace(nearCapSnapshot(1000), namedRuntime('cap'), 'cap');
     const before = w.getSnapshot();
-    expect(() => w.addMessage(message('m1'))).toThrow(/limit|backup/i);
+    expect(w.getMessages()).toEqual([]);
+    expect(() => w.addMessage(message('m1', { text: 'x'.repeat(2000) }))).toThrow(/could not be retained/i);
     expect(w.getSnapshot()).toEqual(before);
     expect(w.getMessages()).toEqual([]);
   }, 120_000);
+
+  it('prunes the oldest other message before the new one when the workspace is tight', () => {
+    const w = createWorkspace(nearCapSnapshot(2000), namedRuntime('cap'), 'cap');
+    const headroom = ENCODED_OPERATION_BYTES - w.getSnapshot().history.byteLength;
+    const old = message('old', { text: 'o'.repeat(Math.max(1, Math.floor(headroom / 2))) });
+    const fresh = message('new', { text: 'n'.repeat(Math.max(1, Math.floor(headroom / 2))) });
+    expect(chatMessageBytes(fresh)).toBeLessThan(headroom);
+    expect(chatMessageBytes(old) + chatMessageBytes(fresh)).toBeGreaterThan(headroom);
+    w.addMessage(old);
+    w.addMessage(fresh);
+    expect(w.getMessages().map(m => m.id)).toEqual(['new']);
+  }, 120_000);
+
+  it('rejects a message outside the newest-100 retention window', () => {
+    const w = createTestWorkspace('a');
+    for (let i = 0; i < CHAT_RECORDS; i++) w.addMessage(message(`m${String(i).padStart(3, '0')}`, {
+      at: new Date(Date.UTC(2026, 0, 1, 0, 0, i)).toISOString(),
+    }));
+    const before = w.getMessages();
+    expect(() => w.addMessage(message('older', { at: '2025-01-01T00:00:00.000Z' }))).toThrow(/could not be retained/i);
+    expect(w.getMessages()).toEqual(before);
+  });
 });

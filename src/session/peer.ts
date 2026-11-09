@@ -1,5 +1,5 @@
 import * as Y from 'yjs';
-import { normalizeRecipients, validateChatImage } from '../game/chat';
+import { normalizeRecipients, trimChatMessages, validateChatImage } from '../game/chat';
 import { makeRosterAddition } from '../game/history';
 import { capturePriority, reconcileHistories } from '../game/reconcile';
 import type { ConflictNotice, GameHistory, GameOperation, LocalEdit, WorkspaceSnapshot } from '../game/sync-types';
@@ -344,7 +344,11 @@ export function createPeerSession(options: PeerSessionOptions): PeerSession {
     try {
       const messages = workspace.getMessages();
       publishChat(stage, messages);
-      pruneStagedChat(stage, messages);
+      // Prune to the deterministic shared window, never to this peer's post-cap subset:
+      // a near-cap workspace may retain only a suffix, and pruning the rest from staging
+      // would race a roomier peer that republishes them.
+      const staged = readStagedChat(stage);
+      pruneStagedChat(stage, trimChatMessages([...messages, ...staged]));
     } catch (e) {
       // Chat is durable after the local add; a mirror failure must not end the session.
       error = actionable(e instanceof Error ? e.message : 'Chat could not be synchronized.');

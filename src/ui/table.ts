@@ -253,7 +253,7 @@ export function createTableView(root: HTMLElement, view: PeerSessionView, action
     const img = el('img', '', 'chat-preview-image');
     img.src = image.dataUrl;
     img.alt = `Attached image ${image.name}`;
-    previewBody.append(img, el('span', image.name, 'muted'));
+    previewBody.append(img, el('span', image.name, 'muted'), el('span', `${image.width} × ${image.height} px`, 'muted chat-preview-dimensions'));
     preview.hidden = false;
   }
 

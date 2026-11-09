@@ -119,7 +119,7 @@ export function createWorkspace(input: Game | WorkspaceSnapshot, runtime: Runtim
     }
     history = next; game = projected; notify();
   }
-  function commitMessages(next: ChatMessage[]) {
+  function commitMessages(next: ChatMessage[], protectedId?: string) {
     ensureOpen();
     const previous = Y.encodeStateAsUpdate(doc), previousMessages = messages;
     try {
@@ -134,10 +134,15 @@ export function createWorkspace(input: Game | WorkspaceSnapshot, runtime: Runtim
       });
       const kept = [...next];
       while (Y.encodeStateAsUpdate(doc).byteLength > ENCODED_OPERATION_BYTES && kept.length > 0) {
-        const oldest = kept.shift()!;
+        // The caller's new record is never a prune victim: drop the oldest *other* message
+        // first, and fail rather than silently discard it when nothing else can go.
+        const victim = kept.findIndex(message => message.id !== protectedId);
+        check(victim !== -1, 'Chat message could not be retained.');
+        const [oldest] = kept.splice(victim, 1);
         doc.transact(() => doc.getMap('chat').delete(oldest.id));
       }
       check(Y.encodeStateAsUpdate(doc).byteLength <= ENCODED_OPERATION_BYTES, 'History limit reached; download a backup.');
+      check(protectedId === undefined || kept.some(message => message.id === protectedId), 'Chat message could not be retained.');
       messages = kept;
     } catch (error) {
       doc.destroy(); doc = new Y.Doc(); Y.applyUpdate(doc, previous); messages = previousMessages; throw error;
@@ -152,7 +157,8 @@ export function createWorkspace(input: Game | WorkspaceSnapshot, runtime: Runtim
       const message = validateChatMessage(value);
       check(!messages.some(existing => existing.id === message.id), 'Duplicate chat message.');
       const next = trimChatMessages([...messages, message]);
-      if (JSON.stringify(next) !== JSON.stringify(messages)) commitMessages(next);
+      check(next.some(existing => existing.id === message.id), 'Chat message could not be retained.');
+      commitMessages(next, message.id);
     },
     mergeMessages(incoming) {
       ensureOpen();

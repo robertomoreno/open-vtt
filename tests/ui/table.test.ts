@@ -235,6 +235,8 @@ it('previews and removes an attached image without sending it yet', async () => 
   Object.defineProperty(fileInput, 'files', { value: [new File(['x'], 'map.png', { type: 'image/png' })] });
   fileInput.dispatchEvent(new Event('change', { bubbles: true }));
   await vi.waitFor(() => expect(document.querySelector('.chat-preview img')).not.toBeNull());
+  expect(document.querySelector('.chat-preview')!.textContent).toContain('map.png');
+  expect(document.querySelector('.chat-preview')!.textContent).toContain('10 × 10 px');
   document.querySelector<HTMLButtonElement>('[aria-label="Remove image"]')!.click();
   expect(document.querySelector('.chat-preview')!.hasAttribute('hidden')).toBe(true);
   t.destroy();
