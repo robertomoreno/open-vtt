@@ -12,7 +12,8 @@ export default defineConfig({
    {command:`VITE_GATHER_SIGNALING_URLS=${LOCAL_RELAY_URL} npm run dev:e2e`,url:APP_URL,reuseExistingServer:false,timeout:30000},
  ],
  projects:[
-  ...(['chromium','firefox','webkit'] as const).map(browserName=>({name:browserName,testIgnore:['**/connections.spec.ts','**/provider-gate.spec.ts'],use:{browserName}})),
-  {name:'interoperability',testMatch:['**/connections.spec.ts','**/provider-gate.spec.ts']}
+  ...(['chromium','firefox','webkit'] as const).map(browserName=>({name:browserName,testIgnore:['**/connections.spec.ts','**/provider-gate.spec.ts','**/chat.spec.ts'],use:{browserName}})),
+  {name:'interoperability',testMatch:['**/connections.spec.ts','**/provider-gate.spec.ts']},
+  {name:'chat',testMatch:['**/chat.spec.ts'],use:{browserName:'chromium'}}
  ]
 });

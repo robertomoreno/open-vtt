@@ -17,6 +17,12 @@ export class TablePage {
   readonly addPlayerNameInput: Locator;
   readonly addPlayerRoleSelect: Locator;
   readonly addPlayerButton: Locator;
+  readonly chatEntries: Locator;
+  readonly chatImages: Locator;
+  readonly chatInput: Locator;
+  readonly sendChatButton: Locator;
+  readonly privateToggle: Locator;
+  readonly imageInput: Locator;
 
   constructor(page: Page) {
     this.page = page;
@@ -34,6 +40,12 @@ export class TablePage {
     this.addPlayerNameInput = page.getByLabel('New player name');
     this.addPlayerRoleSelect = page.getByLabel('New player role');
     this.addPlayerButton = page.getByRole('button', { name: 'Add player' });
+    this.chatEntries = page.locator('[data-chat]');
+    this.chatImages = page.locator('[data-chat] img.chat-image');
+    this.chatInput = page.getByLabel('Message', { exact: true });
+    this.sendChatButton = page.getByRole('button', { name: 'Send', exact: true });
+    this.privateToggle = page.getByLabel('Private message', { exact: true });
+    this.imageInput = page.locator('#chat-image-input');
   }
 
   async roll(): Promise<void> {
@@ -63,6 +75,28 @@ export class TablePage {
 
   rosterEntry(name: string): Locator {
     return this.roster.locator('li', { hasText: name }).first();
+  }
+
+  async sendChat(text: string): Promise<void> {
+    await this.chatInput.fill(text);
+    await this.sendChatButton.click();
+    await expect(this.chatInput).toHaveValue('');
+  }
+
+  async sendPrivateChat(text: string, recipients: string[]): Promise<void> {
+    await this.privateToggle.check();
+    for (const name of recipients) await this.page.getByRole('checkbox', { name, exact: true }).check();
+    await this.sendChat(text);
+  }
+
+  async attachImage(file: { name: string; mimeType: string; buffer: Buffer }): Promise<void> {
+    await this.imageInput.setInputFiles(file);
+    await expect(this.page.locator('.chat-preview img')).toBeVisible();
+  }
+
+  async sendAttachedImage(): Promise<void> {
+    await this.sendChatButton.click();
+    await expect(this.page.locator('.chat-preview')).toBeHidden();
   }
 
   async openRoom(): Promise<void> {
