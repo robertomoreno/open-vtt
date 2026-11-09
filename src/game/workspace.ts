@@ -127,7 +127,10 @@ export function createWorkspace(input: Game | WorkspaceSnapshot, runtime: Runtim
       doc.transact(() => {
         const chat = doc.getMap('chat');
         for (const key of [...chat.keys()]) if (!keep.has(key)) chat.delete(key);
-        for (const message of next) chat.set(message.id, JSON.stringify(message));
+        for (const message of next) {
+          const serialized = JSON.stringify(message);
+          if (chat.get(message.id) !== serialized) chat.set(message.id, serialized);
+        }
       });
       const kept = [...next];
       while (Y.encodeStateAsUpdate(doc).byteLength > ENCODED_OPERATION_BYTES && kept.length > 0) {
