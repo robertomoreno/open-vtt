@@ -109,7 +109,8 @@ export function createRoomTransport(doc: Y.Doc, link: RoomLink, participantId: s
 
   // The handshake exchanges the protocol version and an opaque label; it does not authenticate a person.
   async function handshake(peerId: string, send: (data: any) => Promise<void>, receive: () => Promise<{ data: any }>) {
-    if (pendingHandshakes >= PENDING_ADMISSIONS || peers.size + pendingHandshakes >= ADMITTED_PARTICIPANTS - 1) throw new Error('busy');
+    if (import.meta.env.DEV) console.info('[Gather room] handshake start', peerId);
+    if (pendingHandshakes >= PENDING_ADMISSIONS || peers.size + pendingHandshakes >= ADMITTED_PARTICIPANTS - 1) { if (import.meta.env.DEV) console.warn('[Gather room] handshake busy', peerId); throw new Error('busy'); }
     pendingHandshakes++;
     try {
       await send({ v: 2, id: participantId });
