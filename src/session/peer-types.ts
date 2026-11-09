@@ -38,6 +38,10 @@ export type PeerSessionView = {
   canCreatePlayer: boolean;
   canRoll: boolean;
   hasRecovery: boolean;
+  /** True when this controller holds a room link, connected or not. */
+  hasRoomLink: boolean;
+  /** Admitted, reachable remote participants without a confirmed player claim. */
+  unseatedParticipantCount: number;
   conflicts: ConflictNotice[];
   /** Last action/join error surfaced by the session. */
   error: string | null;

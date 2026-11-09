@@ -1,0 +1,13 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+
+  // Project-local restriction: only OpenCode Go is usable in this repository.
+  // Broad deny first, exception last (last matching statement wins).
+  "policies": [
+    { "action": "provider.use", "resource": "*", "effect": "deny" },
+    { "action": "provider.use", "resource": "opencode-go", "effect": "allow" },
+
+    // oneos is loaded from the global config; block it only for this project.
+    { "action": "plugin.use", "resource": "@oneo-innersource/oneos", "effect": "deny" }
+  ]
+}

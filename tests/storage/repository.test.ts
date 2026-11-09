@@ -14,3 +14,10 @@ it('returns save warning on denied storage or quota',()=>{
  const storage=new Proxy({} as Storage,{get(){throw new Error('denied');}}); const repo=createRepository(storage);
  expect(repo.save(fixtureGame()).ok).toBe(false); expect(repo.rememberPlayer('g','p').ok).toBe(false); expect(repo.list().warnings).toHaveLength(1); expect(repo.get('g')).toBeNull();
 });
+it('removes a saved game and its identity hint without touching other games',()=>{
+ const storage=memoryStorage(); const repo=createRepository(storage); const game=fixtureGame();
+ repo.save(game); repo.save({...game,id:'second'}); repo.rememberPlayer(game.id,'alex'); repo.rememberPlayer('second','bea');
+ expect(repo.remove(game.id)).toEqual({ok:true});
+ expect(storage.getItem('gather:game:'+game.id)).toBeNull(); expect(storage.getItem('gather:identity:'+game.id)).toBeNull();
+ expect(repo.list().games.map(g=>g.id)).toEqual(['second']); expect(repo.rememberedPlayer('second')).toBe('bea');
+});

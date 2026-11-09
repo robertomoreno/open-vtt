@@ -1,6 +1,6 @@
 import { readFile } from 'node:fs/promises';
 import { test, expect, chromium } from '@playwright/test';
-import { createGame, openSharedRoom, joinSharedRoom, countRolls, forkBackupFile } from './helpers';
+import { createGame, openSharedRoom, joinSharedRoom, addPlayerAsGm, claimPlayer, forkBackupFile, waitForSavedGame } from './helpers';
 import { APP_URL } from './config';
 
 test('offline forks merge with first-participant priority and recovery download', async () => {
@@ -28,32 +28,31 @@ test('offline forks merge with first-participant priority and recovery download'
     await bob.goto('/');
     await bob.getByLabel('Load state file').setInputFiles(bobFile);
     await bob.getByRole('button', { name: 'Open game', exact: true }).click();
+    await expect(bob.getByRole('heading', { name: 'Red Castle' })).toBeVisible();
+    await bob.locator('#roll').click();
+    await waitForSavedGame(bob);
     await bob.locator('#leave').click();
     await joinSharedRoom(bob, link);
-    const bobChoose = bob.getByRole('button', { name: 'Choose player' });
-    if (await bobChoose.isVisible().catch(() => false)) await bobChoose.click();
-    await bob.getByLabel('Available saved player').waitFor({ state: 'visible', timeout: 60000 });
-    const bobOption = bob.locator('#player-existing option', { hasText: 'Alex' }).first();
-    const bobValue = await bobOption.getAttribute('value');
-    await bob.getByLabel('Available saved player').selectOption(bobValue!);
-    await expect(bob.locator('#roll')).toBeEnabled({ timeout: 60000 });
+    await addPlayerAsGm(alice, 'Bea');
+    await claimPlayer(bob, 'Bea');
+
+    // Bob's offline rename is accepted while Alice's copy is unchanged.
+    await expect(alice.getByRole('heading', { name: 'Red Castle' })).toBeVisible({ timeout: 60000 });
 
     // Carol imports her offline fork, then joins.
     await carol.goto('/');
     await carol.getByLabel('Load state file').setInputFiles(carolFile);
     await carol.getByRole('button', { name: 'Open game', exact: true }).click();
+    await carol.locator('#roll').click();
+    await waitForSavedGame(carol);
     await carol.locator('#leave').click();
     await joinSharedRoom(carol, link);
-    const carolChoose = carol.getByRole('button', { name: 'Choose player' });
-    if (await carolChoose.isVisible().catch(() => false)) await carolChoose.click();
-    await carol.getByLabel('Available saved player').waitFor({ state: 'visible', timeout: 60000 });
-    const carolOption = carol.locator('#player-existing option', { hasText: 'Alex' }).first();
-    const carolValue = await carolOption.getAttribute('value');
-    await carol.getByLabel('Available saved player').selectOption(carolValue!);
+    await addPlayerAsGm(alice, 'Cy');
+    await claimPlayer(carol, 'Cy');
 
-    // Alice retains the first-participant value with a detailed warning.
+    // The first participant's current version survives Carol's competing fork, with a warning.
+    await expect(alice.getByRole('heading', { name: 'Red Castle' })).toBeVisible();
     await expect(alice.getByText(/first room participant/i)).toBeVisible({ timeout: 60000 });
-    await expect(alice.getByRole('heading', { name: 'Old Castle' })).toBeVisible();
 
     // Pre-merge recovery download remains available.
     await expect(alice.locator('#download-recovery')).toBeVisible();
@@ -94,33 +93,29 @@ test('independent player-field edits survive reconciliation', async () => {
     await bob.goto('/');
     await bob.getByLabel('Load state file').setInputFiles(bobFile);
     await bob.getByRole('button', { name: 'Open game', exact: true }).click();
+    await expect(bob.getByRole('heading', { name: 'Red Castle' })).toBeVisible();
+    await bob.locator('#roll').click();
+    await waitForSavedGame(bob);
     await bob.locator('#leave').click();
     await joinSharedRoom(bob, link);
-    const bobChoose = bob.getByRole('button', { name: 'Choose player' });
-    if (await bobChoose.isVisible().catch(() => false)) await bobChoose.click();
-    await bob.getByLabel('Available saved player').waitFor({ state: 'visible', timeout: 60000 });
-    const bobOption = bob.locator('#player-existing option', { hasText: 'Alex' }).first();
-    const bobValue = await bobOption.getAttribute('value');
-    await bob.getByLabel('Available saved player').selectOption(bobValue!);
-    await expect(bob.locator('#roll')).toBeEnabled({ timeout: 60000 });
+    await addPlayerAsGm(alice, 'Bea');
+    await claimPlayer(bob, 'Bea');
 
     await carol.goto('/');
     await carol.getByLabel('Load state file').setInputFiles(carolFile);
     await carol.getByRole('button', { name: 'Open game', exact: true }).click();
+    await carol.locator('#roll').click();
+    await waitForSavedGame(carol);
     await carol.locator('#leave').click();
     await joinSharedRoom(carol, link);
-    const carolChoose = carol.getByRole('button', { name: 'Choose player' });
-    if (await carolChoose.isVisible().catch(() => false)) await carolChoose.click();
-    await carol.getByLabel('Available saved player').waitFor({ state: 'visible', timeout: 60000 });
-    const carolOption = carol.locator('#player-existing option', { hasText: 'Alex' }).first();
-    const carolValue = await carolOption.getAttribute('value');
-    await carol.getByLabel('Available saved player').selectOption(carolValue!);
+    await addPlayerAsGm(alice, 'Cy');
+    await claimPlayer(carol, 'Cy');
 
     // Both independent edits survive the merge.
     await expect(alice.getByRole('heading', { name: 'Red Castle' })).toBeVisible({ timeout: 60000 });
-    await expect(alice.getByText('Alexandra')).toBeVisible({ timeout: 60000 });
+    await expect(alice.locator('.roster li', { hasText: 'Alexandra' }).first()).toBeVisible({ timeout: 60000 });
     await expect(bob.getByRole('heading', { name: 'Red Castle' })).toBeVisible({ timeout: 60000 });
-    await expect(bob.getByText('Alexandra')).toBeVisible({ timeout: 60000 });
+    await expect(bob.locator('.roster li', { hasText: 'Alexandra' }).first()).toBeVisible({ timeout: 60000 });
   } finally {
     await browser.close().catch(() => {});
   }
@@ -138,6 +133,7 @@ test('successor Dave starts from current Red', async () => {
     const carol = await carolContext.newPage();
 
     await createGame(alice, 'Old Castle');
+    await createGame(alice, 'Old Castle');
     const link = await openSharedRoom(alice);
 
     const downloadPromise = alice.waitForEvent('download');
@@ -152,15 +148,12 @@ test('successor Dave starts from current Red', async () => {
     await dave.goto('/');
     await dave.getByLabel('Load state file').setInputFiles(daveFile);
     await dave.getByRole('button', { name: 'Open game', exact: true }).click();
+    await dave.locator('#roll').click();
+    await waitForSavedGame(dave);
     await dave.locator('#leave').click();
     await joinSharedRoom(dave, link);
-    const daveChoose = dave.getByRole('button', { name: 'Choose player' });
-    if (await daveChoose.isVisible().catch(() => false)) await daveChoose.click();
-    await dave.getByLabel('Available saved player').waitFor({ state: 'visible', timeout: 60000 });
-    const daveOption = dave.locator('#player-existing option', { hasText: 'Alex' }).first();
-    const daveValue = await daveOption.getAttribute('value');
-    await dave.getByLabel('Available saved player').selectOption(daveValue!);
-    await expect(dave.locator('#roll')).toBeEnabled({ timeout: 60000 });
+    await addPlayerAsGm(alice, 'Dave');
+    await claimPlayer(dave, 'Dave');
 
     await expect(alice.getByRole('heading', { name: 'Red Castle' })).toBeVisible({ timeout: 60000 });
     await expect(dave.getByRole('heading', { name: 'Red Castle' })).toBeVisible({ timeout: 60000 });
@@ -172,14 +165,11 @@ test('successor Dave starts from current Red', async () => {
     await carol.goto('/');
     await carol.getByLabel('Load state file').setInputFiles(carolFile);
     await carol.getByRole('button', { name: 'Open game', exact: true }).click();
+    await carol.locator('#roll').click();
+    await waitForSavedGame(carol);
     await carol.locator('#leave').click();
     await joinSharedRoom(carol, link);
-    const carolChoose = carol.getByRole('button', { name: 'Choose player' });
-    if (await carolChoose.isVisible().catch(() => false)) await carolChoose.click();
-    await carol.getByLabel('Available saved player').waitFor({ state: 'visible', timeout: 60000 });
-    const carolOption = carol.locator('#player-existing option', { hasText: 'Alex' }).first();
-    const carolValue = await carolOption.getAttribute('value');
-    await carol.getByLabel('Available saved player').selectOption(carolValue!);
+    await expect(carol.locator('#roll')).toBeEnabled({ timeout: 60000 });
 
     await expect(dave.getByRole('heading', { name: 'Red Castle' })).toBeVisible({ timeout: 60000 });
     await expect(carol.getByRole('heading', { name: 'Red Castle' })).toBeVisible({ timeout: 60000 });

@@ -17,6 +17,7 @@ export function createRepository(storage: Storage) {
     },
     get(id:string):Game|null {try {const raw=storage.getItem(prefix+id); if(!raw)return null;const game=validateGame(JSON.parse(raw));return game.id===id?game:null;}catch{return null;}},
     save(game:Game):SaveResult {try {return write(prefix+game.id,JSON.stringify(validateGame(game)));}catch{return {ok:false,message:'Invalid game; existing browser saves were not changed.'};}},
+    remove(id:string):SaveResult {try {storage.removeItem(prefix+id);storage.removeItem('gather:identity:'+id);return {ok:true};}catch{return {ok:false,message:warning};}},
     rememberPlayer(gameId:string,playerId:string):SaveResult {return write('gather:identity:'+gameId,playerId);},
     rememberedPlayer(gameId:string):string|null {try{return storage.getItem('gather:identity:'+gameId);}catch{return null;}}
   };

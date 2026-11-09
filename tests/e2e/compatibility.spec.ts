@@ -17,6 +17,7 @@ test('missing WebRTC explains unsupported connection operations without crashing
   await expect(page.getByText(/WebRTC is unavailable/)).toBeVisible();
   await createGame(page);
   await page.getByRole('button', { name: 'Connect' }).click();
-  await expect(page.getByRole('button', { name: 'Open room' })).toBeDisabled();
+  await expect(page.getByText(/WebRTC is unavailable/).first()).toBeVisible();
+  await expect(page.locator('#room-link-output')).toHaveCount(0);
   await expect(page.locator('#roll')).toBeEnabled();
 });

@@ -1,5 +1,6 @@
 // @vitest-environment jsdom
 import { beforeEach, expect, it, vi } from 'vitest';
+import { createStartView } from '../../src/ui/start';
 import { mountApp } from '../../src/ui/app';
 import { createWorkspaceRepository } from '../../src/storage/workspace-repository';
 import { IDBFactory } from 'fake-indexeddb';
@@ -29,4 +30,10 @@ it('shows environment message when creation is unavailable', async () => {
   const app = mountApp(root(), { repository: createWorkspaceRepository({ indexedDB: new IDBFactory(), dbName: randomUUID(), runtime: runtime() }), runtime: runtime(), environment: { canCreate: false, canConnect: false, message: 'Use HTTPS or localhost with Web Crypto and WebRTC.' } });
   await vi.waitFor(() => expect(root().textContent).toContain('Use HTTPS or localhost'));
   app.destroy();
+});
+
+it('does not ask for an invitation link on the start screen', () => {
+  createStartView(root(), { games: [], warnings: [], canCreate: true, canConnect: true }, { create: () => {}, restore: () => {}, remove: () => {}, import: () => {} });
+  expect(document.querySelector('#join-code')).toBeNull();
+  expect(root().textContent).not.toContain('Have an invitation?');
 });

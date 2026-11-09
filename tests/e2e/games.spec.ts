@@ -1,5 +1,5 @@
 import { test, expect } from '@playwright/test';
-import { createGame, countRolls } from './helpers';
+import { createGame, countRolls, waitForSavedGame } from './helpers';
 
 test('create refresh restore and portable file roundtrip', async ({ page, browser }) => {
   await createGame(page);
@@ -42,6 +42,44 @@ test('invalid and canceled replacement imports preserve existing saves', async (
   await page.getByLabel('Load state file').setInputFiles({ name: 'invalid.json', mimeType: 'application/json', buffer: Buffer.from('{"schemaVersion":2}') });
   await expect(page.getByText('Unsupported backup format.')).toBeVisible();
   await expect(page.getByRole('button', { name: 'Continue' })).toHaveCount(1);
+});
+
+test('saved-game deletion is blocked while another tab holds the game open', async ({ page, context }) => {
+  await createGame(page);
+  await page.locator('#roll').click();
+  await countRolls(page, 1);
+  await waitForSavedGame(page);
+  await page.locator('#leave').click();
+  await expect(page.getByRole('button', { name: /Continue/ }).first()).toBeVisible();
+
+  const other = await context.newPage();
+  await other.goto('/');
+  const deleteButton = other.getByRole('button', { name: 'Delete The Lantern Road' });
+  await expect(deleteButton).toBeVisible();
+
+  await page.getByRole('button', { name: /Continue/ }).first().click();
+  await page.getByRole('button', { name: 'Open game', exact: true }).click();
+  await expect(page.locator('#roll')).toBeEnabled();
+
+  const blockedDialog = other.waitForEvent('dialog');
+  await deleteButton.click();
+  const blocked = await blockedDialog;
+  expect(blocked.message()).toContain('open in another tab');
+  await blocked.dismiss();
+  await expect(deleteButton).toBeVisible();
+
+  await page.locator('#leave').click();
+  await expect(page.locator('#new-game')).toBeVisible();
+
+  const confirmDialog = other.waitForEvent('dialog');
+  await deleteButton.click();
+  const confirmation = await confirmDialog;
+  expect(confirmation.message()).toContain('Delete');
+  await confirmation.accept();
+  await expect(other.getByText('No games saved here yet.')).toBeVisible();
+  await other.reload();
+  await expect(other.getByText('No games saved here yet.')).toBeVisible();
+  await other.close();
 });
 
 test('responsive keyboard forms preserve die selection and safe text', async ({ page }) => {

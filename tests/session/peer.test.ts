@@ -22,6 +22,16 @@ function soloSnapshot(label: string): WorkspaceSnapshot {
   const ws = createWorkspace(soloGame(), namedRuntime(label), label);
   try { return ws.getSnapshot(); } finally { ws.destroy(); }
 }
+function twoGmGame(): Game {
+  return { ...soloGame(), players: [
+    { id: 'alex', name: 'Alex', role: 'gm' },
+    { id: 'bea', name: 'Bea', role: 'gm' },
+  ] };
+}
+function twoGmSnapshot(label: string): WorkspaceSnapshot {
+  const ws = createWorkspace(twoGmGame(), namedRuntime(label), label);
+  try { return ws.getSnapshot(); } finally { ws.destroy(); }
+}
 function forkSnapshot(source: WorkspaceSnapshot, label: string, name?: string): WorkspaceSnapshot {
   const ws = createWorkspace(source, namedRuntime(label), label);
   try { if (name) ws.applyLocal({ type: 'set-game-name', name }); return ws.getSnapshot(); } finally { ws.destroy(); }
@@ -46,11 +56,11 @@ describe('peer session', () => {
     const a = h.add('a', soloSnapshot('seed'), 'alex');
     const b = h.add('b', null);
     h.connect('a', 'b'); await h.flush();
-    expect(b.getView().canCreatePlayer).toBe(true);
-    h.disconnect('b');
-    b.createPlayer('Bea', 'pj');
-    expect(b.getView().game!.players).toHaveLength(1);
-    expect(b.getView().error).toMatch(/connection/i);
+    expect(a.getView().canCreatePlayer).toBe(true);
+    h.disconnect('a');
+    a.createPlayer('Bea', 'pj');
+    expect(a.getView().game!.players).toHaveLength(1);
+    expect(a.getView().error).toMatch(/connection/i);
     h.connect('a', 'b'); await h.flush();
     expect(a.getView().game!.players).toHaveLength(1);
     expect(b.getView().game!.players).toHaveLength(1);
@@ -73,8 +83,8 @@ describe('peer session', () => {
 
   it('pins not-yet-reconciled creation to canCreatePlayer false', async () => {
     const h = createSessionHarness();
-    h.add('a', soloSnapshot('seed'), 'alex');
-    const b = h.add('b', null);
+    h.add('a', twoGmSnapshot('seed'), 'alex');
+    const b = h.add('b', null, 'bea');
     h.connect('a', 'b');
     expect(b.getView().canCreatePlayer).toBe(false);
     expect(b.getView().phase).toBe('syncing');
@@ -83,25 +93,74 @@ describe('peer session', () => {
     h.destroy();
   });
 
+  it('allows only the seated GM to add players', async () => {
+    const h = createSessionHarness();
+    const a = h.add('a', soloSnapshot('seed'), 'alex');
+    const b = h.add('b', null);
+    h.connect('a', 'b'); await h.flush();
+    expect(b.getView().canCreatePlayer).toBe(false);
+    b.createPlayer('Bea', 'pj');
+    expect(b.getView().error).toMatch(/Only the GM/i);
+    await h.flush();
+    expect(a.getView().game!.players).toHaveLength(1);
+    a.createPlayer('Bea', 'pj');
+    await h.flush();
+    expect(a.getView().game!.players.map(p => p.name)).toEqual(['Alex', 'Bea']);
+    h.destroy();
+  });
+
+  it('counts admitted participants waiting for a character', async () => {
+    const h = createSessionHarness();
+    const a = h.add('a', soloSnapshot('seed'), 'alex');
+    const b = h.add('b', null);
+    h.connect('a', 'b'); await h.flush();
+    expect(a.getView().unseatedParticipantCount).toBe(1);
+    a.createPlayer('Bea', 'pj');
+    await h.flush();
+    const bea = a.getView().game!.players.find(p => p.name === 'Bea')!;
+    b.selectPlayer(bea.id);
+    await h.flush();
+    expect(a.getView().unseatedParticipantCount).toBe(0);
+    h.destroy();
+  });
+
+  it('keeps the last conflict notice until a new conflict replaces it', async () => {
+    const h = createSessionHarness();
+    const seed = soloSnapshot('seed');
+    const a = h.add('a', seed, 'alex');
+    const b = h.add('b', forkSnapshot(seed, 'b', 'Red Castle'));
+    const c = h.add('c', forkSnapshot(seed, 'c', 'Blue Castle'));
+    h.connect('a', 'b'); await h.flush();
+    a.createPlayer('Bea', 'pj'); await h.flush();
+    const bea = a.getView().game!.players.find(p => p.name === 'Bea')!;
+    b.selectPlayer(bea.id); await h.flush();
+    h.connect('a', 'c'); await h.flush();
+    expect(a.getView().conflicts.length).toBeGreaterThan(0);
+    a.createPlayer('Cy', 'pj'); await h.flush();
+    const cy = a.getView().game!.players.find(p => p.name === 'Cy')!;
+    c.selectPlayer(cy.id); await h.flush();
+    expect(a.getView().conflicts.length).toBeGreaterThan(0);
+    h.destroy();
+  });
+
   it('yields exactly one player for a connected creation and a duplicate request', async () => {
     const h = createSessionHarness();
     const a = h.add('a', soloSnapshot('seed'), 'alex');
     const b = h.add('b', null);
     h.connect('a', 'b'); await h.flush();
-    b.createPlayer('Bea', 'pj');
-    b.createPlayer('Bea', 'pj');
+    a.createPlayer('Bea', 'pj');
+    a.createPlayer('Bea', 'pj');
     await h.flush();
     expect(a.getView().game!.players).toHaveLength(2);
     expect(b.getView().game!.players).toHaveLength(2);
     expect(b.getView().game!.players.map(p => p.name)).toEqual(['Alex', 'Bea']);
     // The addition is durably accepted, so a third request is a plain duplicate-name failure.
-    b.createPlayer('Bea', 'pj');
-    expect(b.getView().error).toMatch(/Duplicate/i);
-    expect(b.getView().game!.players).toHaveLength(2);
-    // The addition was authored by the producer, not the leader.
+    a.createPlayer('Bea', 'pj');
+    expect(a.getView().error).toMatch(/Duplicate/i);
+    expect(a.getView().game!.players).toHaveLength(2);
     const history = decodeHistory(a.getSnapshot()!);
     const addition = Object.values(history.operations).find(op => op.type === 'add-player');
-    expect(addition?.authorId).toBe('b-1');
+    expect(addition?.authorId).toBe('a-1');
     h.destroy();
   });
 
@@ -150,7 +209,7 @@ describe('peer session', () => {
 
   it('reclaims a remembered player after the leaving owner becomes unreachable', async () => {
     const h = createSessionHarness();
-    const a = h.add('a', soloSnapshot('seed'));
+    const a = h.add('a', soloSnapshot('seed'), 'alex');
     const b = h.add('b', null);
     h.connect('a', 'b'); await h.flush();
     a.createPlayer('Bea', 'pj');
@@ -160,7 +219,7 @@ describe('peer session', () => {
     b.selectPlayer(bea.id);
     await h.flush();
     expect(b.getView().localPlayerId).toBe(bea.id);
-    expect(b.getView().onlinePlayerIds).toEqual([bea.id]);
+    expect(b.getView().onlinePlayerIds).toContain(bea.id);
 
     b.close();
     const c = h.add('c', null, bea.id);
@@ -316,7 +375,7 @@ describe('peer session', () => {
     const a = h.add('a', soloSnapshot('seed'), 'alex');
     const b = h.add('b', null);
     h.connect('a', 'b'); await h.flush();
-    b.createPlayer('Bea', 'pj');
+    a.createPlayer('Bea', 'pj');
     await h.flush();
     const bea = b.getView().game!.players.find(p => p.name === 'Bea');
     expect(bea).toBeDefined();

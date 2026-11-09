@@ -1,15 +1,16 @@
 import { el, button, field, option, status } from './dom';
-import type { DieSides } from '../game/types';
+import type { DieSides, Role } from '../game/types';
 import type { PeerSessionView } from '../session/peer-types';
 
 export type TableActions = {
   roll(sides: DieSides): void;
   download(): void;
   downloadRecovery(): void;
-  connect(): void;
+  share(): void;
   disconnect(): void;
   leave(): void;
   choosePlayer(): void;
+  createPlayer(name: string, role: Role): void;
 };
 export type TableView = { update(view: PeerSessionView): void; destroy(): void };
 
@@ -40,15 +41,32 @@ export function createTableView(root: HTMLElement, view: PeerSessionView, action
   roll.className = 'primary';
 
   const choosePlayer = button('Choose player', () => actions.choosePlayer(), 'choose-player');
-  const connect = button('Connect', () => actions.connect(), 'open-room');
+  const room = button('Connect', () => actions.share(), 'open-room');
   const disconnect = button('Disconnect', () => actions.disconnect(), 'disconnect-room');
   const leave = button('Leave table', () => actions.leave(), 'leave');
   const download = button('Download game JSON', () => actions.download(), 'download');
   const downloadRecovery = button('Download recovery copy', () => actions.downloadRecovery(), 'download-recovery');
+  const waiting = status();
+  waiting.id = 'waiting-players';
+  const addName = field('New player name', 'new-player-name');
+  const addRole = field('New player role', 'new-player-role', 'select');
+  addRole.input.append(option('pj', 'PJ · Player'), option('gm', 'GM · Game master'));
+  addRole.input.value = 'pj';
+  const add = button('Add player', () => {}, 'add-player');
+  add.type = 'submit';
+  const addForm = el('form');
+  addForm.id = 'add-player-form';
+  addForm.append(el('h3', 'Add a player'), addName.wrapper, addRole.wrapper, add);
+  addForm.onsubmit = (e) => {
+    e.preventDefault();
+    if (add.disabled) return;
+    actions.createPlayer(addName.input.value, addRole.input.value as Role);
+    addName.input.value = '';
+  };
 
   const left = el('aside', '', 'panel');
   const right = el('section', '', 'panel');
-  left.append(el('h2', 'Around the table'), roster, choosePlayer, connect, disconnect, leave, el('p', 'Players connect directly. Keep the host tab open.', 'muted'));
+  left.append(el('h2', 'Around the table'), waiting, roster, addForm, choosePlayer, room, disconnect, leave, el('p', 'Players connect directly. Keep the host tab open.', 'muted'));
   right.append(el('h2', 'The dice have a story.'), el('p', 'One roll. Seen by everyone at the table.', 'muted'), rolls, die.wrapper, roll, download, downloadRecovery);
 
   const grid = el('div', '', 'room');
@@ -102,9 +120,22 @@ export function createTableView(root: HTMLElement, view: PeerSessionView, action
     download.disabled = !game;
     downloadRecovery.hidden = !v.hasRecovery;
     downloadRecovery.disabled = !v.hasRecovery;
-    connect.hidden = v.phase === 'ready' || v.phase === 'choosing' || v.phase === 'closed';
+    const reconnect = v.phase === 'local' || v.phase === 'offline';
+    room.textContent = !v.hasRoomLink ? 'Connect' : reconnect ? 'Reconnect' : 'Share link';
+    room.hidden = !game || v.phase === 'closed';
     disconnect.hidden = v.phase === 'local' || v.phase === 'closed';
     leave.disabled = false;
+
+    const isGm = game?.players.some((p) => p.id === v.localPlayerId && p.role === 'gm') ?? false;
+    addForm.hidden = !isGm;
+    add.disabled = !v.canCreatePlayer;
+    addName.input.disabled = !v.canCreatePlayer;
+    addRole.input.disabled = !v.canCreatePlayer;
+    const freePlayers = game ? game.players.filter((p) => !v.onlinePlayerIds.includes(p.id)).length : 0;
+    const waitingCount = v.unseatedParticipantCount;
+    const showWaiting = isGm && waitingCount > 0 && freePlayers === 0;
+    waiting.hidden = !showWaiting;
+    waiting.textContent = showWaiting ? `${waitingCount} participant${waitingCount === 1 ? '' : 's'} waiting for a character. Add one below.` : '';
 
     renderRoster(v);
     renderRolls(v);

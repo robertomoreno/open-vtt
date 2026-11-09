@@ -18,6 +18,7 @@ export function createPlayerView(root: HTMLElement, data: PlayerData, actions: P
   const gameName = el('p', data.game.name, 'eyebrow');
   const message = status();
   const roster = el('ul', '', 'roster');
+  let current: PlayerData = data;
 
   const existingField = field('Available saved player', 'player-existing', 'select');
   const existingSelect = existingField.input as HTMLSelectElement;
@@ -32,7 +33,8 @@ export function createPlayerView(root: HTMLElement, data: PlayerData, actions: P
   const createButton = button('Create player', () => {}, 'create-player');
   createButton.type = 'submit';
   const form = el('form', '', 'panel');
-  form.append(el('h2', 'A new face'), nameField.wrapper, roleField.wrapper, createButton, el('p', 'Roles label players; they do not grant host authority.', 'muted'));
+  form.id = 'create-player-form';
+  form.append(el('h2', 'A new face'), nameField.wrapper, roleField.wrapper, createButton, el('p', 'Only the seated GM can add players.', 'muted'));
   form.onsubmit = (e) => {
     e.preventDefault();
     if (!current.canCreate || createButton.disabled) return;
@@ -40,13 +42,16 @@ export function createPlayerView(root: HTMLElement, data: PlayerData, actions: P
   };
   const cancel = button('Cancel', () => actions.cancel(), 'cancel-player');
 
+  const joinSelected = button('Join as selected player', () => {
+    if (!existingSelect.value) return;
+    if (existingSelect.value === current.selectedId) actions.cancel();
+    else actions.select(existingSelect.value);
+  }, 'join-selected-player');
   const saved = el('article', '', 'panel');
-  saved.append(el('h2', 'A familiar face'), existingField.wrapper, el('p', 'A remembered choice is a convenience, not proof of identity.', 'muted'));
+  saved.append(el('h2', 'A familiar face'), existingField.wrapper, joinSelected, el('p', 'A remembered choice is a convenience, not proof of identity.', 'muted'));
 
   panel.append(gameName, title, message, saved, form, roster, cancel);
   root.replaceChildren(panel);
-
-  let current: PlayerData = data;
 
   function renderRoster(next: PlayerData) {
     roster.replaceChildren(...next.game.players.map((p) => {
@@ -57,8 +62,12 @@ export function createPlayerView(root: HTMLElement, data: PlayerData, actions: P
 
   function apply(next: PlayerData) {
     current = next;
-    message.textContent = next.message ?? '';
+    const isGm = next.selectedId !== null && next.game.players.some((p) => p.id === next.selectedId && p.role === 'gm');
     const available = next.game.players;
+    const free = available.filter((p) => !next.occupiedIds.includes(p.id));
+    message.textContent = next.message ?? (free.length === 0
+      ? (isGm ? 'All characters are taken. Add another below.' : 'All characters are taken. Waiting for the GM to add one.')
+      : '');
     existingSelect.replaceChildren(...available.map((p) => {
       const o = el('option', `${p.name} · ${p.role.toUpperCase()} · ${next.occupiedIds.includes(p.id) ? 'Occupied' : 'Available'}`);
       o.value = p.id;
@@ -71,9 +80,14 @@ export function createPlayerView(root: HTMLElement, data: PlayerData, actions: P
       const firstAvailable = available.find((p) => !next.occupiedIds.includes(p.id));
       if (firstAvailable) existingSelect.value = firstAvailable.id;
     }
-    existingSelect.onchange = () => {
-      if (existingSelect.value) actions.select(existingSelect.value);
+    const syncJoin = () => {
+      const selected = available.find((p) => p.id === existingSelect.value);
+      joinSelected.textContent = selected ? `Join as ${selected.name}` : 'Join as selected player';
+      joinSelected.disabled = selected === undefined || next.occupiedIds.includes(selected.id);
     };
+    existingSelect.onchange = syncJoin;
+    syncJoin();
+    form.hidden = !isGm;
     createButton.disabled = !next.canCreate;
     renderRoster(next);
   }

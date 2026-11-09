@@ -13,40 +13,53 @@ export async function createGame(page: Page, name = 'The Lantern Road') {
   await expect(page.locator('#roll')).toBeEnabled();
 }
 
+export async function waitForSavedGame(page: Page): Promise<void> {
+  await page.waitForFunction(() => new Promise<boolean>(resolve => {
+    const request = indexedDB.open('gather-workspaces');
+    request.onerror = () => resolve(false);
+    request.onsuccess = () => {
+      const db = request.result;
+      if (!db.objectStoreNames.contains('games')) { db.close(); resolve(false); return; }
+      const all = db.transaction('games', 'readonly').objectStore('games').getAll();
+      all.onsuccess = () => { const saved = all.result.length > 0; db.close(); resolve(saved); };
+      all.onerror = () => { db.close(); resolve(false); };
+    };
+  }));
+}
+
 export async function openSharedRoom(page: Page): Promise<string> {
   await page.getByRole('button', { name: 'Connect' }).click();
-  await page.getByRole('button', { name: 'Open room' }).click();
   const output = page.locator('#room-link-output');
   await expect(output).toHaveValue(/\S/, { timeout: 40000 });
   return output.inputValue();
 }
 
 export async function joinSharedRoom(page: Page, link: string): Promise<void> {
-  await page.goto('/');
-  await page.getByLabel('Room link').fill(link);
-  await page.getByRole('button', { name: 'Join room' }).click();
+  await page.goto(link);
   await page.waitForFunction(
-    () => !!document.querySelector('#roll') || !!document.querySelector('#player-name') || !!document.querySelector('#choose-player'),
+    () => !!document.querySelector('#roll') || !!document.querySelector('#player-existing') || !!document.querySelector('#join-selected-player'),
     undefined,
     { timeout: 60000 },
   );
 }
 
-export async function createConnectedPlayer(page: Page, name: string): Promise<void> {
-  const playerName = page.getByLabel('Player name');
-  // Synchronization completion swaps the table for the player-creation form on
-  // its own. If the form is not there yet, click the table affordance; a detach
-  // during that click means the automatic transition won the race.
-  if (!(await playerName.isVisible().catch(() => false))) {
-    await page.getByRole('button', { name: 'Choose player' }).click({ timeout: 5_000 }).catch(() => {});
-  }
-  await playerName.waitFor({ state: 'visible', timeout: 60_000 });
-  await playerName.fill(name);
-  await page.getByRole('button', { name: 'Create player' }).click();
+export async function addPlayerAsGm(page: Page, name: string): Promise<void> {
+  const input = page.getByLabel('New player name');
+  await input.waitFor({ state: 'visible', timeout: 60000 });
+  await expect(input).toBeEnabled({ timeout: 60000 });
+  await input.fill(name);
+  const add = page.getByRole('button', { name: 'Add player' });
+  await expect(add).toBeEnabled({ timeout: 60000 });
+  await add.click();
+  await expect(input).toHaveValue('', { timeout: 60000 });
+}
+
+export async function claimPlayer(page: Page, name: string): Promise<void> {
   const option = page.locator('#player-existing option', { hasText: name }).first();
   await expect(option).toBeAttached({ timeout: 60000 });
   const value = await option.getAttribute('value');
   await page.getByLabel('Available saved player').selectOption(value!);
+  await page.locator('#join-selected-player').click();
   await expect(page.locator('#roll')).toBeEnabled({ timeout: 60000 });
 }
 

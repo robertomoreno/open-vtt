@@ -265,7 +265,9 @@ export function createPeerSession(options: PeerSessionOptions): PeerSession {
         const reconciled = reconcileHistories([local, ...candidates], priority, runtime);
         recovery = preMerge;
         bridge.admit(reconciled.history);
-        conflicts = reconciled.notices;
+        // Keep the last warning visible until a new conflict replaces it; a routine merge
+        // must not erase the explanation before the participant has seen it.
+        if (reconciled.notices.length) conflicts = reconciled.notices;
         // pendingIds carry no payloads; their records remain staged until dependencies arrive.
         bridge.publish(reconciled.history);
         publishPending = false;
@@ -298,7 +300,8 @@ export function createPeerSession(options: PeerSessionOptions): PeerSession {
   function noteConflicts(local: GameHistory, candidates: GameHistory[], leaderId: string | null, tenureId: string | null) {
     try {
       const priority = capturePriority(local, leaderId ?? participantId, tenureId ?? 'offline');
-      conflicts = reconcileHistories([local, ...candidates], priority, runtime).notices;
+      const notices = reconcileHistories([local, ...candidates], priority, runtime).notices;
+      if (notices.length) conflicts = notices;
     } catch {
       // Notices are best effort; they never block or fail an admission.
     }
@@ -334,9 +337,47 @@ export function createPeerSession(options: PeerSessionOptions): PeerSession {
       fresh.push(intent);
     }
     const game = workspace.getSnapshot().game;
+    // Claims are confirmed first so GM authority is visible before additions are judged.
+    const groups = new Map<string, typeof fresh>();
+    for (const intent of fresh) {
+      if (intent.type !== 'claim') continue;
+      groups.set(intent.playerId, [...(groups.get(intent.playerId) ?? []), intent]);
+    }
+    const confirmations = new Map(readClaimConfirmations(stage).map(entry => [entry.playerId, entry]));
+    for (const [playerId, group] of groups) {
+      if (!game.players.some(player => player.id === playerId)) {
+        for (const intent of group) removeRosterIntent(stage, intent.id);
+        continue;
+      }
+      const existing = confirmations.get(playerId);
+      if (existing && admitted(existing.participantId) && reachable(existing.participantId)) {
+        for (const intent of group) removeRosterIntent(stage, intent.id);
+        continue;
+      }
+      const winner = [...group].sort((a, b) => orderOf(a.participantId) - orderOf(b.participantId)
+        || (a.participantId < b.participantId ? -1 : a.participantId > b.participantId ? 1 : 0))[0];
+      writeClaimConfirmation(stage, { playerId, participantId: winner.participantId, at: now() });
+      for (const intent of group) removeRosterIntent(stage, intent.id);
+      dirty = true;
+    }
+    // Additions are authorized only for the participant currently seated as the GM.
+    const gmPlayerIds = new Set(game.players.filter(player => player.role === 'gm').map(player => player.id));
+    const gmParticipants = new Set(
+      readClaimConfirmations(stage)
+        .filter(entry => gmPlayerIds.has(entry.playerId) && admitted(entry.participantId) && reachable(entry.participantId))
+        .map(entry => entry.participantId),
+    );
     const produced = new Set<string>();
     for (const intent of fresh) {
       if (intent.type !== 'add-player') continue;
+      if (!gmParticipants.has(intent.participantId)) {
+        // A claim confirmed in this pass is enough; a still-pending GM claim keeps the
+        // addition waiting instead of dropping it before the claim resolves.
+        const pendingGmClaim = fresh.some(other => other.type === 'claim'
+          && other.participantId === intent.participantId && gmPlayerIds.has(other.playerId));
+        if (!pendingGmClaim) removeRosterIntent(stage, intent.id);
+        continue;
+      }
       const dedupe = `${intent.participantId}\u0000${intent.name.trim().toLowerCase()}\u0000${intent.role}`;
       if (produced.has(dedupe)) { removeRosterIntent(stage, intent.id); continue; }
       produced.add(dedupe);
@@ -359,29 +400,6 @@ export function createPeerSession(options: PeerSessionOptions): PeerSession {
         // replayable, but a rejected intent is never retried.
         removeRosterIntent(stage, intent.id);
       }
-    }
-    const groups = new Map<string, typeof fresh>();
-    for (const intent of fresh) {
-      if (intent.type !== 'claim') continue;
-      groups.set(intent.playerId, [...(groups.get(intent.playerId) ?? []), intent]);
-    }
-    if (groups.size === 0) return;
-    const confirmations = new Map(readClaimConfirmations(stage).map(entry => [entry.playerId, entry]));
-    for (const [playerId, group] of groups) {
-      if (!game.players.some(player => player.id === playerId)) {
-        for (const intent of group) removeRosterIntent(stage, intent.id);
-        continue;
-      }
-      const existing = confirmations.get(playerId);
-      if (existing && admitted(existing.participantId) && reachable(existing.participantId)) {
-        for (const intent of group) removeRosterIntent(stage, intent.id);
-        continue;
-      }
-      const winner = [...group].sort((a, b) => orderOf(a.participantId) - orderOf(b.participantId)
-        || (a.participantId < b.participantId ? -1 : a.participantId > b.participantId ? 1 : 0))[0];
-      writeClaimConfirmation(stage, { playerId, participantId: winner.participantId, at: now() });
-      for (const intent of group) removeRosterIntent(stage, intent.id);
-      dirty = true;
     }
   }
   function publishClaimIntent() {
@@ -482,11 +500,25 @@ export function createPeerSession(options: PeerSessionOptions): PeerSession {
     refresh();
     emit();
   }
+  function isLocalGm(): boolean {
+    if (workspace === null || localPlayerId === null) return false;
+    return workspace.getSnapshot().game.players.some(player => player.id === localPlayerId && player.role === 'gm');
+  }
   function canCreatePlayerNow(): boolean {
     if (closed || workspace === null || !connected() || !synced) return false;
+    if (!isLocalGm()) return false;
     const tenure = membership?.getView().tenure ?? null;
     if (!isAdmitted() || tenure === null) return false;
     return tenure.leaderId === participantId || reachable(tenure.leaderId);
+  }
+  function unseatedCount(): number {
+    if (closed || workspace === null || transport === null || membership === null) return 0;
+    const seated = new Set(readClaimConfirmations(stage)
+      .filter(entry => reachable(entry.participantId))
+      .map(entry => entry.participantId));
+    return membership.getView().members
+      .filter(member => member.id !== participantId && reachable(member.id) && !seated.has(member.id))
+      .length;
   }
 
   const session: PeerSession = {
@@ -503,6 +535,8 @@ export function createPeerSession(options: PeerSessionOptions): PeerSession {
         canCreatePlayer: canCreatePlayerNow(),
         canRoll: !closed && workspace !== null && localPlayerId !== null && (game?.players.some(player => player.id === localPlayerId) ?? false),
         hasRecovery: recovery !== null,
+        hasRoomLink: !closed && link !== null,
+        unseatedParticipantCount: unseatedCount(),
         conflicts: conflicts.map(notice => ({ ...notice })),
         error,
         connectionError: closed ? null : (transport?.getView().error ?? null),
@@ -573,6 +607,7 @@ export function createPeerSession(options: PeerSessionOptions): PeerSession {
     },
     createPlayer(name, role) {
       action(() => {
+        check(isLocalGm(), 'Only the GM can add players.');
         check(canCreatePlayerNow(), 'Player creation requires an active, synchronized room connection.');
         const playerName = text(name);
         const playerRole = roleValue(role);

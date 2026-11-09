@@ -137,6 +137,44 @@ it('migrates a legacy game on load and leaves the legacy record untouched', asyn
   expect(storage.getItem('gather:game:legacy')).toBe(JSON.stringify(legacyGame()));
 });
 
+it('removes a game with its history, recovery copy, legacy save, and identity hint only', async () => {
+  const indexedDB = new IDBFactory();
+  const storage = memoryStorage();
+  const repo = createWorkspaceRepository({ indexedDB, dbName: randomUUID(), storage, runtime: namedRuntime('d') });
+  const deleted = createTestWorkspace('deleted').getSnapshot();
+  const kept = createTestWorkspace('kept', { ...fixtureRoster(), id: 'kept' }).getSnapshot();
+  expect(await repo.save(deleted, 0)).toEqual({ ok: true, version: 1 });
+  expect(await repo.save(kept, 0)).toEqual({ ok: true, version: 1 });
+  expect(await repo.saveRecovery(deleted)).toEqual({ ok: true });
+  expect(await repo.saveRecovery(kept)).toEqual({ ok: true });
+  storage.setItem('gather:game:' + deleted.game.id, JSON.stringify(deleted.game));
+  storage.setItem('gather:identity:' + deleted.game.id, 'alex');
+  storage.setItem('gather:game:' + kept.game.id, JSON.stringify(kept.game));
+  storage.setItem('gather:identity:' + kept.game.id, 'bea');
+
+  expect(await repo.remove(deleted.game.id)).toEqual({ ok: true });
+
+  expect((await repo.list()).games.map(game => game.id)).toEqual([kept.game.id]);
+  expect((await repo.load(deleted.game.id)).snapshot).toBeNull();
+  expect(await repo.loadRecovery(deleted.game.id)).toBeNull();
+  expect(storage.getItem('gather:game:' + deleted.game.id)).toBeNull();
+  expect(storage.getItem('gather:identity:' + deleted.game.id)).toBeNull();
+  expect((await repo.load(kept.game.id)).snapshot).toEqual(kept);
+  expect(await repo.loadRecovery(kept.game.id)).toEqual(kept);
+  expect(storage.getItem('gather:game:' + kept.game.id)).toBe(JSON.stringify(kept.game));
+  expect(repo.rememberedPlayer(kept.game.id)).toBe('bea');
+});
+
+it('removes a legacy-only save when IndexedDB is unavailable', async () => {
+  const storage = memoryStorage();
+  storage.setItem('gather:game:legacy', JSON.stringify(legacyGame()));
+  storage.setItem('gather:identity:legacy', 'alex');
+  const repo = createWorkspaceRepository({ indexedDB: deniedFactory(), dbName: randomUUID(), storage, runtime: namedRuntime('d') });
+  expect(await repo.remove('legacy')).toEqual({ ok: true });
+  expect(storage.getItem('gather:game:legacy')).toBeNull();
+  expect(storage.getItem('gather:identity:legacy')).toBeNull();
+});
+
 it('returns an in-memory snapshot with a warning when migration cannot persist', async () => {
   const storage = memoryStorage();
   storage.setItem('gather:game:legacy', JSON.stringify(legacyGame()));

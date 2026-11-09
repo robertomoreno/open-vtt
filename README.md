@@ -27,7 +27,8 @@ npm run test:e2e
 ## Save and restore
 
 - **New game:** enter a game name and your name. You become the first GM and the host. You can roll while alone.
-- **Continue:** choose a saved game, then choose an existing player for this hosting browser or create a new GM. The browser may suggest a remembered choice.
+- **Continue:** choose a saved game, then choose the existing player who will host this browser. The browser may suggest a remembered choice.
+- **Delete saved game:** each saved game has a **Delete** button next to Continue. Confirmation is required, and deletion removes that game’s history, recovery copy, legacy save, and remembered player from this browser. Deletion is refused while another tab has that game open.
 - **Load state file:** select a JSON file and review its game/player information. If its game ID already exists, **Replace saved game and open** explicitly replaces that browser save; **Cancel** preserves it. Invalid, oversized, or unsupported files never partially import.
 - **Download game JSON:** every participant can export their latest state. Guest files are the **last received state**, not a guarantee of current host state after connection loss. No connection credentials or browser identity hints are exported.
 
@@ -39,10 +40,11 @@ Opening any saved snapshot starts an **independent new live session**. It preser
 
 ## Shared rooms
 
-1. Host: **Connect**, then **Open room**. Wait for the room link, then share it through a trusted channel. The link is a transient room credential, not a permanent room URL.
-2. Guest: open the link, or open your own running app and paste the full link into **Room link** → **Join room**. Different local app origins and paths are fine.
-3. The first participant to open the room becomes the priority participant. Additional players can only be created after a connection is established and the game is synchronized; offline edits to existing players remain supported.
-4. Players choose or create an identity in the synchronized room. Roles (`gm` / `pj`) are labels, **not administrative permissions**. Remembered identities are convenience hints, not proof of identity.
+1. Host: **Connect**. The room opens, the invitation link is generated and copied to the clipboard, and the share panel tells you to send it through a trusted channel. Use **Share link** later to copy it again. The link is a transient room credential, not a permanent room URL.
+2. Guest: open the link. It joins the room directly — no paste box or Join button. Different local app origins and paths are fine.
+3. The first participant to open the room becomes the priority participant. Additional players can only be added after a connection is established and the game is synchronized; offline edits to existing players remain supported.
+4. If the browser remembers a player for that game and it is free, it is claimed automatically. Otherwise the guest chooses from the available players. If every player is taken, the guest waits while the GM adds one.
+5. Only the player currently seated in the **GM** role can add players. The GM's table shows an **Add player** form and a prompt when participants are waiting. Roles remain labels for everything else and are not authentication.
 
 A room closes when its participants leave. The host tab no longer owns all live state; if the first participant leaves, the next-earliest connected participant takes over conflict decisions and play continues.
 
@@ -88,7 +90,7 @@ Stop the relay with `npm run signal:stop`.
 - `stun:stun.l.google.com:19302`
 - `stun:stun1.l.google.com:19302`
 
-STUN discovers network addresses; it does **not** relay game data. The service sees discovery traffic, including your public address. Production signaling uses the configured WSS endpoint (`wss://y-webrtc-eu.fly.dev` by default); development and browser tests use the bundled loopback relay and do not contact it. Signaling exchanges room metadata only; it does not store gameplay state. WebRTC offer/reply links contain network details and temporary connection credentials. Use trusted sharing channels. Long links can be truncated by messengers; selectable raw text/full-link paste is the fallback. Consumed incoming fragments are removed from the current address bar, but Gather cannot erase a messenger’s storage or promise control of browser history. SDP/ICE is never saved with a game or logged by the application.
+STUN discovers network addresses; it does **not** relay game data. The service sees discovery traffic, including your public address. Production signaling uses the configured WSS endpoint (`wss://y-webrtc-eu.fly.dev` by default); development and browser tests use the bundled loopback relay and do not contact it. Signaling exchanges room metadata only; it does not store gameplay state. WebRTC offer/reply links contain network details and temporary connection credentials. Use trusted sharing channels. Long links can be truncated by messengers; the share panel keeps the full link as selectable text, and an incomplete link can be pasted into the address bar. Consumed incoming fragments are removed from the current address bar, but Gather cannot erase a messenger’s storage or promise control of browser history. SDP/ICE is never saved with a game or logged by the application.
 
 No TURN relay is configured. Corporate firewalls, restrictive NAT, or incompatible network policies can make direct connections impossible. Same-machine tests do not prove connectivity between homes.
 

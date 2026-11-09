@@ -22,3 +22,11 @@ it('shows replacement notice when replace is true', () => {
   expect(document.body.textContent).toContain('Replace saved game');
   view.destroy();
 });
+
+it('does not offer an offline new-GM identity', () => {
+  document.body.innerHTML = '<main></main>';
+  const snapshot = createTestWorkspace('a').getSnapshot();
+  const view = createRestoreGameView(document.querySelector('main')!, { snapshot, replace: false, selectedId: 'alex' }, { open: () => {}, cancel: () => {} });
+  expect(document.querySelector('#restore-player option[value=""]')).toBeNull();
+  view.destroy();
+});

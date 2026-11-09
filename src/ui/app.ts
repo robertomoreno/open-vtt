@@ -8,12 +8,13 @@ import { parseBackupFile, downloadBackup } from '../storage/backups';
 import { validateGame } from '../game/validation';
 import { createPeerSession } from '../session/peer';
 import type { PeerSession } from '../session/peer-types';
-import { createRoomLink, decodeRoomLink, roomLink } from '../network/room-link';
+import { decodeRoomLink, roomLink, type RoomLink } from '../network/room-link';
 import { createStartView } from './start';
 import { createRestoreGameView } from './restore-game';
 import { createTableView, type TableView } from './table';
 import { createPlayerView, type PlayerView } from './player';
 import { createShareView, type ShareView } from './share';
+import { browserTabLocks, type TabLocks } from './tab-locks';
 import { el, status } from './dom';
 
 export type Environment = { canCreate: boolean; canConnect: boolean; message: string };
@@ -43,6 +44,8 @@ export type AppDependencies = {
   parseFile?: (file: File) => Promise<WorkspaceSnapshot>;
   download?: (snapshot: WorkspaceSnapshot) => void;
   confirm?: (message: string) => boolean;
+  alert?: (message: string) => void;
+  tabLocks?: TabLocks | null;
   environment?: Environment;
   createSession?: typeof createPeerSession;
   network?: any;
@@ -69,6 +72,8 @@ export function mountApp(root: HTMLElement, deps: AppDependencies = {}) {
   const repository = deps.repository ?? browserWorkspaceRepository(runtime);
   const environment = deps.environment ?? detectEnvironment();
   const confirm = (message: string) => (deps.confirm ?? window.confirm)(message);
+  const alert = (message: string) => (deps.alert ?? window.alert)(message);
+  const tabLocks = deps.tabLocks === undefined ? browserTabLocks() : deps.tabLocks;
 
   const header = el('header');
   header.append(el('div', 'Gather', 'brand'), el('span', 'A small place for big adventures', 'eyebrow'));
@@ -77,10 +82,11 @@ export function mountApp(root: HTMLElement, deps: AppDependencies = {}) {
   const screen = el('div', '', 'screen');
   const flow = el('section');
   flow.id = 'connection-flow';
-  root.replaceChildren(header, warning, error, screen, flow);
+  root.replaceChildren(header, warning, error, flow, screen);
 
   let destroyed = false;
   let session: PeerSession | null = null;
+  let releaseTabLock: (() => void) | null = null;
   let unsubscribe = () => {};
   let view: { destroy(): void } | null = null;
   let tableView: TableView | null = null;
@@ -91,10 +97,13 @@ export function mountApp(root: HTMLElement, deps: AppDependencies = {}) {
   let sessionToken = 0;
   let currentSaveGeneration = 0;
   let choosingPlayer = false;
+  // Identity that was active when the manual chooser opened. A successful
+  // selection (or an automatic one) must return the participant to the table;
+  // otherwise the shared roll history stays hidden behind the chooser.
+  let choosingFrom: string | null = null;
   let saveFailed = false;
   let inMemoryRecovery: WorkspaceSnapshot | null = null;
   let lastIdentity = '';
-  let pendingJoinCode: string | null = null;
 
   type SaveChain = { gameId: string; expectedVersion: number; init: Promise<void>; tail: Promise<void>; lastQueued: number };
   const saveChains = new Map<string, SaveChain>();
@@ -140,6 +149,8 @@ export function mountApp(root: HTMLElement, deps: AppDependencies = {}) {
   }
 
   function clearSession() {
+    releaseTabLock?.();
+    releaseTabLock = null;
     unsubscribe();
     unsubscribe = () => {};
     session?.close();
@@ -152,6 +163,8 @@ export function mountApp(root: HTMLElement, deps: AppDependencies = {}) {
     saveFailed = false;
     inMemoryRecovery = null;
     lastIdentity = '';
+    choosingPlayer = false;
+    choosingFrom = null;
   }
 
   function initSaveChain(gameId: string) {
@@ -190,12 +203,13 @@ export function mountApp(root: HTMLElement, deps: AppDependencies = {}) {
     chain.tail = chain.tail.then(task, task);
   }
 
-  function openSession(next: PeerSession) {
+  function openSession(next: PeerSession, gameId: string) {
     importGeneration++;
     sessionToken++;
     const thisToken = sessionToken;
     clearSession();
     session = next;
+    releaseTabLock = tabLocks?.hold(gameId) ?? null;
     clearViews();
     unsubscribe = next.subscribe(() => {
       if (!destroyed && sessionToken === thisToken) renderSession();
@@ -215,7 +229,7 @@ export function mountApp(root: HTMLElement, deps: AppDependencies = {}) {
     if (playerId && !next.getView().localPlayerId) {
       try { next.selectPlayer(playerId); } catch {}
     }
-    openSession(next);
+    openSession(next, snapshot.game.id);
     initSaveChain(snapshot.game.id);
     if (playerId) {
       try {
@@ -244,29 +258,55 @@ export function mountApp(root: HTMLElement, deps: AppDependencies = {}) {
     view = restoreView;
   }
 
-  function handleJoinStart(code: string) {
-    try {
-      const link = decodeRoomLink(code);
-      const gen = importGeneration;
-      (async () => {
-        const loaded = await repository.load(link.gameId);
-        if (destroyed || gen !== importGeneration) return;
-        const snapshot = loaded && loaded.snapshot ? loaded.snapshot : null;
-        const create = deps.createSession ?? createPeerSession;
-        const next = create({
-          initial: snapshot,
-          rememberedPlayerId: repository.rememberedPlayer ? repository.rememberedPlayer(link.gameId) : null,
-          runtime,
-          now: () => Date.now(),
-        });
-        next.joinRoom(link);
-        if (destroyed || gen !== importGeneration) { next.close(); return; }
-        openSession(next);
-        initSaveChain(link.gameId);
-      })().catch((e) => { if (!destroyed && gen === importGeneration) report(e); });
-    } catch (e) {
-      report(e);
+  function showJoining() {
+    clearViews();
+    clearFlow();
+    screen.replaceChildren(
+      el('p', 'Your party’s shared space', 'eyebrow'),
+      el('h1', 'Joining the table…'),
+      el('p', 'Connecting directly to the game. Keep this tab open.', 'lead'),
+    );
+  }
+
+  function handleJoin(link: RoomLink) {
+    if (!environment.canConnect) {
+      report(new Error(environment.message));
+      showStart();
+      return;
     }
+    if (session) {
+      const current = session.getRoomLink();
+      if (current && current.roomId === link.roomId && current.gameId === link.gameId) {
+        session.joinRoom(link);
+        renderSession();
+        return;
+      }
+    }
+    const gen = ++importGeneration;
+    warning.textContent = environment.message;
+    error.textContent = '';
+    showJoining();
+    (async () => {
+      const loaded = await repository.load(link.gameId);
+      if (destroyed || gen !== importGeneration) return;
+      const snapshot = loaded && loaded.snapshot ? loaded.snapshot : null;
+      const create = deps.createSession ?? createPeerSession;
+      const next = create({
+        initial: snapshot,
+        rememberedPlayerId: repository.rememberedPlayer ? repository.rememberedPlayer(link.gameId) : null,
+        runtime,
+        now: () => Date.now(),
+      });
+      next.joinRoom(link);
+      if (destroyed || gen !== importGeneration) { next.close(); return; }
+      openSession(next, link.gameId);
+      initSaveChain(link.gameId);
+    })().catch((e) => {
+      if (!destroyed && gen === importGeneration) {
+        report(e);
+        showStart();
+      }
+    });
   }
 
   async function handleImport(file: File) {
@@ -294,29 +334,36 @@ export function mountApp(root: HTMLElement, deps: AppDependencies = {}) {
     showStart();
   }
 
-  function showShare(mode: 'open' | 'join') {
+  function showShare() {
     clearFlow();
-    const currentLink = session?.getRoomLink() ? roomLink(session.getRoomLink()!, location.href) : null;
-    shareView = createShareView(flow, { mode, link: currentLink, message: mode === 'open' ? 'Open the room to generate a link.' : 'Join a room.', canConnect: environment.canConnect }, {
-      connect() {
-        if (!session) return;
-        if (mode === 'open') {
-          const link = session.openRoom();
-          if (link) {
-            shareView?.update({ mode, link: roomLink(link, location.href), message: 'Room open. Share the link.', canConnect: environment.canConnect });
-          }
-        }
-      },
-      cancel() {
-        clearFlow();
-      },
+    if (!session) return;
+    if (!environment.canConnect) {
+      report(new Error(environment.message));
+      return;
+    }
+    const phase = session.getView().phase;
+    const reconnect = phase === 'local' || phase === 'offline';
+    let link = session.getRoomLink();
+    if (!link || reconnect) link = session.openRoom();
+    const currentLink = link ? roomLink(link, location.href) : null;
+    const message = currentLink ? 'Room open. Preparing the link…' : (session.getView().error ?? 'The room could not be opened.');
+    shareView = createShareView(flow, { link: currentLink, message }, {
+      cancel() { clearFlow(); },
     });
+    if (currentLink) void shareView.copy();
   }
 
   function renderSession() {
     if (!session || destroyed) return;
     const state = session.getView();
     const game = state.game;
+    // A manual chooser is only a temporary detour: as soon as the local identity
+    // changes (explicit selection, remembered auto-select, or a confirmed claim),
+    // return to the shared table so its roll history is visible to this participant.
+    if (choosingPlayer && state.localPlayerId !== null && state.localPlayerId !== choosingFrom) {
+      choosingPlayer = false;
+      choosingFrom = null;
+    }
 
     if (game && state.saveGeneration !== currentSaveGeneration) {
       const snapshot = session.getSnapshot();
@@ -357,10 +404,20 @@ export function mountApp(root: HTMLElement, deps: AppDependencies = {}) {
             canCreate: state.canCreatePlayer,
             message: state.error ?? state.connectionError,
           }, {
-            select(id: string) { session?.selectPlayer(id); },
+            select(id: string) {
+              session?.selectPlayer(id);
+              // Selecting the identity that is already local also means the
+              // chooser has served its purpose; close it on any accepted pick.
+              if (session?.getView().localPlayerId === id) {
+                choosingPlayer = false;
+                choosingFrom = null;
+              }
+              renderSession();
+            },
             create(name: string, role: any) { session?.createPlayer(name, role); },
             cancel() {
               choosingPlayer = false;
+              choosingFrom = null;
               playerView?.destroy();
               playerView = null;
               renderSession();
@@ -387,6 +444,7 @@ export function mountApp(root: HTMLElement, deps: AppDependencies = {}) {
       }
     } else {
       choosingPlayer = false;
+      choosingFrom = null;
       if (playerView) {
         playerView.destroy();
         playerView = null;
@@ -415,10 +473,15 @@ export function mountApp(root: HTMLElement, deps: AppDependencies = {}) {
         const snapshot = inMemoryRecovery ?? session?.getRecoverySnapshot() ?? session?.getSnapshot();
         if (snapshot) try { (deps.download ?? downloadBackup)(snapshot); } catch (e) { report(e); }
       },
-      connect: () => { showShare('open'); },
+      share: () => { showShare(); },
       disconnect: () => { session?.disconnect(); clearFlow(); },
       leave: () => { leave(); },
-      choosePlayer: () => { choosingPlayer = true; renderSession(); },
+      choosePlayer: () => {
+        choosingPlayer = true;
+        choosingFrom = session?.getView().localPlayerId ?? null;
+        renderSession();
+      },
+      createPlayer: (name: string, role: any) => { session?.createPlayer(name, role); },
     };
   }
 
@@ -459,30 +522,50 @@ export function mountApp(root: HTMLElement, deps: AppDependencies = {}) {
           showRestore(snapshot, false, repository.rememberedPlayer ? repository.rememberedPlayer(game.id) : null);
         })().catch((e) => { if (!destroyed && gen === importGeneration) report(e); });
       },
+      async remove(game: Game) {
+        try {
+          if (tabLocks) {
+            const busy = await tabLocks.isBusy(game.id);
+            if (destroyed || gen !== importGeneration) return;
+            if (busy) {
+              alert(`“${game.name}” is open in another tab. Close it there before deleting it.`);
+              return;
+            }
+          }
+          if (!confirm(`Delete “${game.name}” and its entire history from this browser? This cannot be undone.`)) return;
+          if (destroyed || gen !== importGeneration) return;
+          await drainSaves(game.id);
+          if (destroyed || gen !== importGeneration) return;
+          const result = await repository.remove(game.id);
+          if (destroyed || gen !== importGeneration) return;
+          if (!result.ok) { report(new Error(result.message)); return; }
+          saveChains.delete(game.id);
+          await showStart();
+        } catch (e) {
+          if (!destroyed && gen === importGeneration) report(e);
+        }
+      },
       import(file: File) { handleImport(file); },
-      join(code: string) { handleJoinStart(code); },
     });
-    if (pendingJoinCode) {
-      const input = screen.querySelector<HTMLInputElement>('#join-code');
-      if (input) input.value = pendingJoinCode;
-      pendingJoinCode = null;
-    }
     warning.textContent = environment.message;
     if (listed.warnings && listed.warnings.length) {
       warning.textContent = [environment.message, ...listed.warnings].filter(Boolean).join(' ');
     }
   }
 
-  function consumeHash() {
-    if (!location.hash) return;
+  function consumeHash(): boolean {
+    if (!location.hash) return false;
     const full = location.href;
     history.replaceState(null, '', location.pathname + location.search);
+    let link: RoomLink;
     try {
-      decodeRoomLink(full);
-      pendingJoinCode = full;
-    } catch {
-      // ignore unknown fragments
+      link = decodeRoomLink(full);
+    } catch (e) {
+      report(e);
+      return false;
     }
+    handleJoin(link);
+    return true;
   }
 
   const beforeUnload = (event: BeforeUnloadEvent) => {
@@ -511,7 +594,6 @@ export function mountApp(root: HTMLElement, deps: AppDependencies = {}) {
   };
   mounts.set(root, app);
 
-  showStart();
-  consumeHash();
+  if (!consumeHash()) showStart();
   return app;
 }

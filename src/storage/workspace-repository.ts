@@ -11,6 +11,7 @@ export type WorkspaceRepository = {
   list(): Promise<{ games: Game[]; warnings: string[] }>;
   load(id: string): Promise<{ snapshot: WorkspaceSnapshot | null; version: number; warnings: string[] }>;
   save(snapshot: WorkspaceSnapshot, expectedVersion: number): Promise<WorkspaceSaveResult>;
+  remove(id: string): Promise<SaveResult>;
   saveRecovery(snapshot: WorkspaceSnapshot): Promise<SaveResult>;
   loadRecovery(id: string): Promise<WorkspaceSnapshot | null>;
   rememberedPlayer(id: string): string | null;
@@ -263,6 +264,35 @@ export function createWorkspaceRepository(options: {
     } catch { return { ok: false, reason: 'storage', message: STORAGE_WARNING }; }
   }
 
+  function deleteOne(handle: IDBDatabase, id: string): Promise<void> {
+    return new Promise((resolve, reject) => {
+      let tx: IDBTransaction;
+      try { tx = handle.transaction([GAMES_STORE, RECOVERY_STORE], 'readwrite'); } catch (error) { reject(error); return; }
+      let settled = false;
+      const fail = (error: unknown) => { if (!settled) { settled = true; reject(error instanceof Error ? error : new Error('Delete failed')); } };
+      try {
+        tx.objectStore(GAMES_STORE).delete(id);
+        tx.objectStore(RECOVERY_STORE).delete(id);
+      } catch (error) { try { tx.abort(); } catch {} fail(error); return; }
+      tx.oncomplete = () => { if (!settled) { settled = true; resolve(); } };
+      tx.onerror = () => fail(tx.error);
+      tx.onabort = () => fail(tx.error);
+    });
+  }
+
+  async function remove(id: string): Promise<SaveResult> {
+    let durableDeleted = false;
+    try {
+      const handle = await ensureDb();
+      await deleteOne(handle, id);
+      durableDeleted = true;
+    } catch {
+      if (!unavailable) return { ok: false, message: STORAGE_WARNING };
+    }
+    const legacyResult = legacy.remove(id);
+    return durableDeleted ? { ok: true } : legacyResult;
+  }
+
   async function saveRecovery(snapshot: WorkspaceSnapshot): Promise<SaveResult> {
     let valid: WorkspaceSnapshot;
     try { valid = validateWorkspaceSnapshot(snapshot); }
@@ -296,7 +326,7 @@ export function createWorkspaceRepository(options: {
     openPromise = null;
   }
 
-  return { list, load, save, saveRecovery, loadRecovery, rememberedPlayer, rememberPlayer, close };
+  return { list, load, save, remove, saveRecovery, loadRecovery, rememberedPlayer, rememberPlayer, close };
 }
 
 export function browserWorkspaceRepository(runtime: Runtime): WorkspaceRepository {

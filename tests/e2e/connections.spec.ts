@@ -1,5 +1,5 @@
 import { test, expect, chromium, firefox, webkit, type BrowserType } from '@playwright/test';
-import { createGame, openSharedRoom, joinSharedRoom, createConnectedPlayer, countRolls } from './helpers';
+import { createGame, openSharedRoom, joinSharedRoom, addPlayerAsGm, claimPlayer, countRolls } from './helpers';
 import { APP_URL } from './config';
 
 const engines: Record<string, BrowserType> = { chromium, firefox, webkit };
@@ -33,7 +33,8 @@ for (const [hostEngine, guestEngine] of directions) {
       const link = await openSharedRoom(host);
 
       await joinSharedRoom(guest1, link);
-      await createConnectedPlayer(guest1, 'Bea');
+      await addPlayerAsGm(host, 'Bea');
+      await claimPlayer(guest1, 'Bea');
 
       await host.locator('#roll').click();
       await countRolls(host, 1);
@@ -44,7 +45,8 @@ for (const [hostEngine, guestEngine] of directions) {
       await countRolls(guest1, 2);
 
       await joinSharedRoom(guest2, link);
-      await createConnectedPlayer(guest2, 'Cy');
+      await addPlayerAsGm(host, 'Cy');
+      await claimPlayer(guest2, 'Cy');
       await countRolls(guest2, 2);
 
       await guest2.locator('#roll').click();
@@ -53,9 +55,7 @@ for (const [hostEngine, guestEngine] of directions) {
       await countRolls(guest2, 3);
 
       await guest2.getByRole('button', { name: 'Choose player' }).click();
-      await guest2.getByLabel('Player name').fill('Bea');
-      await guest2.getByRole('button', { name: 'Create player' }).click();
-      await expect(guest2.getByText('Duplicate player ID or name.')).toBeVisible();
+      await expect(guest2.locator('#create-player-form')).toBeHidden();
       await guest2.getByRole('button', { name: 'Cancel' }).click();
 
       await guest1.locator('#leave').click();
@@ -65,7 +65,7 @@ for (const [hostEngine, guestEngine] of directions) {
 
       await host.close();
       await guest1.getByRole('button', { name: 'Choose player' }).click();
-      await expect(guest1.getByRole('button', { name: 'Create player' })).toBeDisabled();
+      await expect(guest1.locator('#create-player-form')).toBeHidden();
       await guest1.getByRole('button', { name: 'Cancel' }).click();
 
       await countRolls(guest1, 3);

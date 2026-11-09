@@ -24,13 +24,10 @@ export function createRestoreGameView(root: HTMLElement, data: RestoreGameData, 
   const playerField = field('Host as player', 'restore-player', 'select');
   const playerSelect = playerField.input as HTMLSelectElement;
   playerSelect.append(...game.players.map((p) => option(p.id, `${p.name} · ${p.role.toUpperCase()}`)));
-  playerSelect.append(option('', 'Create a new GM'));
   if (data.selectedId && game.players.some((p) => p.id === data.selectedId)) {
     playerSelect.value = data.selectedId;
   } else if (game.players.length) {
     playerSelect.value = game.players[0].id;
-  } else {
-    playerSelect.value = '';
   }
 
   const open = button(data.replace ? 'Replace saved game and open' : 'Open game', () => {}, 'open-restore');
