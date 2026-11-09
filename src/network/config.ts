@@ -4,7 +4,8 @@ import { SIGNALING_URL_LIMIT } from './limits';
 // Public STUN discovers network addresses; it never relays gameplay. No TURN.
 export const rtcConfiguration: RTCConfiguration = {iceServers:[{urls:['stun:stun.l.google.com:19302','stun:stun1.l.google.com:19302']}]};
 
-const defaultSignalingUrls = 'wss://y-webrtc-eu.fly.dev';
+const publicSignalingUrl = 'wss://y-webrtc-eu.fly.dev';
+const localSignalingUrl = 'ws://127.0.0.1:4444';
 
 export function parseSignalingUrls(input: string, allowWs = false): string[] {
   const urls = input.split(',').map(url => url.trim()).filter(Boolean);
@@ -22,20 +23,17 @@ export function parseSignalingUrls(input: string, allowWs = false): string[] {
   return urls;
 }
 
-// Dev-only override: allows pointing the app at a local ws:// relay (e.g. the
-// loopback signaling server started with `npm run signal:start`) without a TLS
-// endpoint. Production builds never honor this — import.meta.env.DEV is false
-// there, so Vite removes the branch entirely. Never accept an endpoint from a
-// room link; this override is read only from the developer's own browser storage
-// or the VITE_GATHER_SIGNALING_URLS env var at dev time.
+// Dev-only override: allows pointing the app at a different relay without
+// changing the default. Production builds never honor this — import.meta.env.DEV
+// is false there, so Vite removes the branch entirely. Never accept an endpoint
+// from a room link; this override is read only from the developer's own browser
+// storage or the VITE_GATHER_SIGNALING_URLS env var at dev time.
 function devSignalingOverride(): string[] | null {
   if (!import.meta.env.DEV) return null;
-  // 1. Env var at dev time (cleanest: VITE_GATHER_SIGNALING_URLS=ws://127.0.0.1:4444 npm run dev)
   const env = import.meta.env.VITE_GATHER_SIGNALING_URLS;
   if (env) {
     try { return parseSignalingUrls(env, true); } catch { return null; }
   }
-  // 2. localStorage override (set once, persists across reloads)
   let raw: string | null = null;
   try { raw = window.localStorage.getItem('gather:dev:signaling'); } catch {}
   if (!raw) return null;
@@ -43,7 +41,11 @@ function devSignalingOverride(): string[] | null {
 }
 
 const devOverride = devSignalingOverride();
-const signalingUrls = devOverride ?? parseSignalingUrls(import.meta.env.VITE_GATHER_SIGNALING_URLS || defaultSignalingUrls);
+// Development and the local test suite use the bundled loopback relay by
+// default, so they never contact the public endpoint. A production build keeps
+// the public WSS default (or an explicit VITE_GATHER_SIGNALING_URLS override).
+const fallbackSignalingUrl = import.meta.env.DEV ? localSignalingUrl : publicSignalingUrl;
+const signalingUrls = devOverride ?? parseSignalingUrls(import.meta.env.VITE_GATHER_SIGNALING_URLS || fallbackSignalingUrl, import.meta.env.DEV);
 if (import.meta.env.DEV) {
   // eslint-disable-next-line no-console
   console.info('[Gather dev] Resolved signaling URLs:', signalingUrls.join(', '));

@@ -1,5 +1,6 @@
 import { test, expect, chromium, firefox, webkit, type BrowserType } from '@playwright/test';
 import { createGame, openSharedRoom, joinSharedRoom, createConnectedPlayer, countRolls } from './helpers';
+import { APP_URL } from './config';
 
 const engines: Record<string, BrowserType> = { chromium, firefox, webkit };
 
@@ -21,9 +22,9 @@ for (const [hostEngine, guestEngine] of directions) {
     const hostBrowser = await engines[hostEngine].launch();
     const guestBrowser = await engines[guestEngine].launch();
     try {
-      const hostContext = await hostBrowser.newContext({ baseURL: 'http://localhost:5173' });
-      const guestContext1 = await guestBrowser.newContext({ baseURL: 'http://localhost:5173' });
-      const guestContext2 = await guestBrowser.newContext({ baseURL: 'http://localhost:5173' });
+      const hostContext = await hostBrowser.newContext({ baseURL: APP_URL });
+      const guestContext1 = await guestBrowser.newContext({ baseURL: APP_URL });
+      const guestContext2 = await guestBrowser.newContext({ baseURL: APP_URL });
       const host = await hostContext.newPage();
       const guest1 = await guestContext1.newPage();
       const guest2 = await guestContext2.newPage();

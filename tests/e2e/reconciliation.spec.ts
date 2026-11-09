@@ -1,14 +1,15 @@
 import { readFile } from 'node:fs/promises';
 import { test, expect, chromium } from '@playwright/test';
 import { createGame, openSharedRoom, joinSharedRoom, countRolls, forkBackupFile } from './helpers';
+import { APP_URL } from './config';
 
 test('offline forks merge with first-participant priority and recovery download', async () => {
   test.setTimeout(300000);
   const browser = await chromium.launch();
   try {
-    const aliceContext = await browser.newContext({ baseURL: 'http://localhost:5173' });
-    const bobContext = await browser.newContext({ baseURL: 'http://localhost:5173' });
-    const carolContext = await browser.newContext({ baseURL: 'http://localhost:5173' });
+    const aliceContext = await browser.newContext({ baseURL: APP_URL });
+    const bobContext = await browser.newContext({ baseURL: APP_URL });
+    const carolContext = await browser.newContext({ baseURL: APP_URL });
     const alice = await aliceContext.newPage();
     const bob = await bobContext.newPage();
     const carol = await carolContext.newPage();
@@ -69,9 +70,9 @@ test('independent player-field edits survive reconciliation', async () => {
   test.setTimeout(300000);
   const browser = await chromium.launch();
   try {
-    const aliceContext = await browser.newContext({ baseURL: 'http://localhost:5173' });
-    const bobContext = await browser.newContext({ baseURL: 'http://localhost:5173' });
-    const carolContext = await browser.newContext({ baseURL: 'http://localhost:5173' });
+    const aliceContext = await browser.newContext({ baseURL: APP_URL });
+    const bobContext = await browser.newContext({ baseURL: APP_URL });
+    const carolContext = await browser.newContext({ baseURL: APP_URL });
     const alice = await aliceContext.newPage();
     const bob = await bobContext.newPage();
     const carol = await carolContext.newPage();
@@ -129,9 +130,9 @@ test('successor Dave starts from current Red', async () => {
   test.setTimeout(300000);
   const browser = await chromium.launch();
   try {
-    const aliceContext = await browser.newContext({ baseURL: 'http://localhost:5173' });
-    const daveContext = await browser.newContext({ baseURL: 'http://localhost:5173' });
-    const carolContext = await browser.newContext({ baseURL: 'http://localhost:5173' });
+    const aliceContext = await browser.newContext({ baseURL: APP_URL });
+    const daveContext = await browser.newContext({ baseURL: APP_URL });
+    const carolContext = await browser.newContext({ baseURL: APP_URL });
     const alice = await aliceContext.newPage();
     const dave = await daveContext.newPage();
     const carol = await carolContext.newPage();

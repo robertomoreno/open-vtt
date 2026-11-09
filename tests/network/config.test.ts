@@ -7,10 +7,11 @@ describe('network configuration', () => {
     vi.resetModules();
   });
 
-  it('defaults to the required initial signaling candidate', async () => {
+  it('defaults to the bundled local relay in development', async () => {
     vi.stubEnv('VITE_GATHER_SIGNALING_URLS', '');
     const config = await import('../../src/network/config');
-    expect(config.roomNetworkConfig.signaling).toEqual(['wss://y-webrtc-eu.fly.dev']);
+    expect(config.roomNetworkConfig.signaling).toEqual(['ws://127.0.0.1:4444']);
+    expect(config.signalingIsLoopback).toBe(true);
   });
 
   it('honors the VITE_GATHER_SIGNALING_URLS build-time override', async () => {
@@ -41,7 +42,6 @@ describe('network configuration', () => {
     const urls = roomNetworkConfig.rtc.iceServers?.flatMap(server => server.urls) ?? [];
     expect(urls.length).toBeGreaterThan(0);
     for (const url of urls) expect(url.startsWith('stun:')).toBe(true);
-    for (const url of roomNetworkConfig.signaling) expect(url.startsWith('wss://')).toBe(true);
     expect(rtcConfiguration.iceServers?.flatMap(server => server.urls)).toEqual(urls);
   });
 

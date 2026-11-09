@@ -37,10 +37,13 @@ not at fault.
 
 ## Verification
 
-- Two Chromium contexts, two WebKit contexts, and Chromium↔WebKit all
-  connected through the app UI and exchanged room state, claims and rolls.
-- The shared-room e2e flow (`tests/e2e/connections.spec.ts`) passed for all
-  Chromium/WebKit directions against the loopback relay after this change.
+- The local provider gate (real Chromium/WebKit data channels, large binary
+  payloads, signaling-loss survival) passes **2/2** against the local relay.
+- The shared-room e2e flow passed for Chromium↔Chromium and both
+  Chromium/WebKit cross directions. WebKit↔WebKit passed in an earlier run but
+  later exposed a separate player-claim timing flake (the creator's own newly
+  claimed player can be marked Occupied before selection); that is a game-UI
+  race, not a signaling failure.
 - Firefox directions still failed at ICE. This is a separate environment
   limitation: the macOS Application Firewall reports the Playwright Firefox
   helper (`plugin-container.app`) as **Block incoming connections**. Firefox
@@ -74,6 +77,18 @@ also change mDNS behavior.
   wait.
 - Dev logs now include the resolved signaling mode, transport errors and
   Trystero join errors (no SDP or credentials are logged).
+
+## Test configuration
+
+- Development and the Playwright suite use the bundled loopback relay by default;
+  they do not contact the public signaling endpoint. Production builds keep the
+  public WSS default (or an explicit override).
+- `playwright.config.ts` starts the relay and a dedicated dev server on port
+  5174 with `VITE_GATHER_SIGNALING_URLS=ws://127.0.0.1:4444`, so it cannot
+  silently reuse a developer's app or fall back to public WSS.
+- The provider gate connects directly to the local relay. It still intercepts
+  the loopback WebSocket only to close it later and prove native channels
+  survive signaling loss.
 
 ## Limits
 
