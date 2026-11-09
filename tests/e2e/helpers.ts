@@ -33,10 +33,15 @@ export async function joinSharedRoom(page: Page, link: string): Promise<void> {
 }
 
 export async function createConnectedPlayer(page: Page, name: string): Promise<void> {
-  const choose = page.getByRole('button', { name: 'Choose player' });
-  if (await choose.isVisible().catch(() => false)) await choose.click();
-  await page.getByLabel('Player name').waitFor({ state: 'visible', timeout: 60000 });
-  await page.getByLabel('Player name').fill(name);
+  const playerName = page.getByLabel('Player name');
+  // Synchronization completion swaps the table for the player-creation form on
+  // its own. If the form is not there yet, click the table affordance; a detach
+  // during that click means the automatic transition won the race.
+  if (!(await playerName.isVisible().catch(() => false))) {
+    await page.getByRole('button', { name: 'Choose player' }).click({ timeout: 5_000 }).catch(() => {});
+  }
+  await playerName.waitFor({ state: 'visible', timeout: 60_000 });
+  await playerName.fill(name);
   await page.getByRole('button', { name: 'Create player' }).click();
   const option = page.locator('#player-existing option', { hasText: name }).first();
   await expect(option).toBeAttached({ timeout: 60000 });
