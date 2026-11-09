@@ -16,7 +16,7 @@ export function id(value: unknown): string { const result = text(value); check(r
 export function role(value: unknown): Role { check(value === 'gm' || value === 'pj', 'Invalid role.'); return value; }
 export function sides(value: unknown): DieSides { check(dice.includes(value as DieSides), 'Choose a supported die.'); return value as DieSides; }
 export function integer(value: unknown, min = 0): number { check(Number.isSafeInteger(value) && (value as number) >= min, 'Invalid integer.'); return value as number; }
-function timestamp(value: unknown): string {
+export function timestamp(value: unknown): string {
   check(typeof value === 'string' && /^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d\.\d{3}Z$/.test(value) && Number.isFinite(Date.parse(value)) && new Date(value).toISOString() === value, 'Invalid timestamp.'); return value;
 }
 export function validatePlayer(value: unknown): Player { const p=object(value,['id','name','role']); return {id:id(p.id),name:text(p.name),role:role(p.role)}; }
