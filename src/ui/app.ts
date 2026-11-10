@@ -7,11 +7,12 @@ import { browserWorkspaceRepository, type WorkspaceRepository } from '../storage
 import { parseBackupFile, downloadBackup } from '../storage/backups';
 import { validateGame } from '../game/validation';
 import { createPeerSession } from '../session/peer';
-import type { ChatDraft, PeerSession } from '../session/peer-types';
+import type { ChatDraft, PeerSession, PeerSessionView } from '../session/peer-types';
 import { decodeRoomLink, roomLink, type RoomLink } from '../network/room-link';
 import { createStartView } from './start';
 import { createRestoreGameView } from './restore-game';
-import { createTableView, type TableView } from './table';
+import { createTableView, type TableView, type TableViewData } from './table';
+import { createAudioController, type AudioController } from './audio';
 import { prepareChatImage } from './image';
 import { createPlayerView, type PlayerView } from './player';
 import { createShareView, type ShareView } from './share';
@@ -94,6 +95,13 @@ export function mountApp(root: HTMLElement, deps: AppDependencies = {}) {
   let playerView: PlayerView | null = null;
   let shareView: ShareView | null = null;
   let restoreView: any = null;
+  // The persistent player lives outside every replaceable screen: switching between the
+  // chooser and the table must not stop the music. It is created only once the session
+  // exposes an audio view and is destroyed with the session.
+  let audioController: AudioController | null = null;
+  let audioUnsubscribe: (() => void) | null = null;
+  let audioGameId: string | null = null;
+  let rendering = false;
   let importGeneration = 0;
   let sessionToken = 0;
   let currentSaveGeneration = 0;
@@ -149,7 +157,16 @@ export function mountApp(root: HTMLElement, deps: AppDependencies = {}) {
     screen.replaceChildren();
   }
 
+  function destroyAudio() {
+    audioUnsubscribe?.();
+    audioUnsubscribe = null;
+    audioController?.destroy();
+    audioController = null;
+    audioGameId = null;
+  }
+
   function clearSession() {
+    destroyAudio();
     releaseTabLock?.();
     releaseTabLock = null;
     unsubscribe();
@@ -354,10 +371,55 @@ export function mountApp(root: HTMLElement, deps: AppDependencies = {}) {
     if (currentLink) void shareView.copy();
   }
 
+  /**
+   * Creates the persistent player once the session exposes an audio view.
+   *
+   * A joining peer is constructed without a workspace, so the controller is never built
+   * against a session that cannot yet play audio: it appears when bootstrap adopts the
+   * workspace and is rebuilt when the game changes. `clearSession` tears it down.
+   */
+  function syncAudio(state: PeerSessionView) {
+    const game = state.game;
+    if (!state.audio || !game || !session) {
+      destroyAudio();
+      return;
+    }
+    if (audioGameId === game.id) return;
+    destroyAudio();
+    audioGameId = game.id;
+    try {
+      const controller = createAudioController({ session, repository, gameId: game.id });
+      audioController = controller;
+      // Ticks and transfer progress repaint the table, whose panel updates in place.
+      audioUnsubscribe = controller.subscribe(() => { if (!destroyed) renderSession(); });
+    } catch (e) {
+      // A browser that cannot build the player must not take the whole table down. The
+      // game key is kept so a failing construction is not retried on every render.
+      report(e);
+    }
+  }
+
+  /** Only sessions that actually expose audio get the panel; legacy fakes keep their UI. */
+  function tableViewData(state: PeerSessionView): TableViewData {
+    if (!state.audio || !audioController) return state;
+    return { ...state, audioPanel: audioController.getView() };
+  }
+
   function renderSession() {
+    if (!session || destroyed || rendering) return;
+    rendering = true;
+    try {
+      renderSessionContent();
+    } finally {
+      rendering = false;
+    }
+  }
+
+  function renderSessionContent() {
     if (!session || destroyed) return;
     const state = session.getView();
     const game = state.game;
+    syncAudio(state);
     // A manual chooser is only a temporary detour: as soon as the local identity
     // changes (explicit selection, remembered auto-select, or a confirmed claim),
     // return to the shared table so its roll history is visible to this participant.
@@ -437,10 +499,10 @@ export function mountApp(root: HTMLElement, deps: AppDependencies = {}) {
       } else {
         if (!tableView) {
           playerView = null;
-          tableView = createTableView(screen, state, tableActions());
+          tableView = createTableView(screen, tableViewData(state), tableActions());
           view = tableView;
         } else {
-          tableView.update(state);
+          tableView.update(tableViewData(state));
         }
       }
     } else {
@@ -451,10 +513,10 @@ export function mountApp(root: HTMLElement, deps: AppDependencies = {}) {
         playerView = null;
       }
       if (!tableView) {
-        tableView = createTableView(screen, state, tableActions());
+        tableView = createTableView(screen, tableViewData(state), tableActions());
         view = tableView;
       } else {
-        tableView.update(state);
+        tableView.update(tableViewData(state));
       }
     }
 
@@ -485,6 +547,9 @@ export function mountApp(root: HTMLElement, deps: AppDependencies = {}) {
       createPlayer: (name: string, role: any) => { session?.createPlayer(name, role); },
       sendMessage: (draft: ChatDraft) => session?.sendMessage(draft) ?? false,
       prepareImage: (file: File) => prepareChatImage(file),
+      // Live getter: the table is built before a joining session adopts its workspace, so
+      // the actions must reflect the controller that appears later (and disappears on leave).
+      get audio() { return audioController?.actions; },
     };
   }
 

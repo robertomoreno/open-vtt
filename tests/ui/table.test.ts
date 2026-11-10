@@ -1,8 +1,16 @@
 // @vitest-environment jsdom
 import { beforeEach, expect, it, vi } from 'vitest';
+import { IDBFactory } from 'fake-indexeddb';
+import { randomUUID } from 'node:crypto';
 import { createTableView, type TableActions } from '../../src/ui/table';
-import { fixtureGame } from '../helpers/game';
-import type { PeerSessionView } from '../../src/session/peer-types';
+import { createAudioTrack } from '../../src/game/audio';
+import type { AudioActions, AudioPanelView } from '../../src/ui/audio';
+import type { AudioSessionView } from '../../src/session/audio';
+import type { PeerSession, PeerSessionView } from '../../src/session/peer-types';
+import type { Game } from '../../src/game/types';
+import { createWorkspaceRepository } from '../../src/storage/workspace-repository';
+import { mountApp } from '../../src/ui/app';
+import { fixtureGame, runtime } from '../helpers/game';
 
 function makeView(overrides: Partial<PeerSessionView> = {}): PeerSessionView {
   const game = fixtureGame();
@@ -34,6 +42,47 @@ function actions(overrides: Partial<TableActions> = {}): TableActions {
     disconnect: () => {}, leave: () => {}, choosePlayer: () => {}, createPlayer: () => {},
     sendMessage: () => true,
     prepareImage: async () => ({ dataUrl: 'data:image/png;base64,AAAA', name: 'pixel.png', type: 'image/png' as const, width: 1, height: 1 }),
+    ...overrides,
+  };
+}
+
+const musicTrack = createAudioTrack(
+  { id: 'a'.repeat(64), name: 'Theme.wav', type: 'audio/wav', size: 4, durationMs: 60_000 },
+  'alex',
+  '2026-11-10T10:00:00.000Z',
+);
+
+function musicView(overrides: Partial<AudioPanelView> = {}): AudioPanelView {
+  return {
+    tracks: [{ ...musicTrack, available: true, downloading: false, progress: 0, current: true, ended: false }],
+    currentTrackId: musicTrack.id,
+    playing: false,
+    positionMs: 0,
+    durationMs: musicTrack.durationMs,
+    gain: 100,
+    localVolume: 100,
+    needsSound: false,
+    connected: true,
+    canAdd: true,
+    canControl: true,
+    canRemove: true,
+    usageBytes: musicTrack.size,
+    status: null,
+    ...overrides,
+  };
+}
+
+function musicActions(overrides: Partial<AudioActions> = {}): AudioActions {
+  return {
+    add: vi.fn(async () => {}),
+    remove: vi.fn(),
+    select: vi.fn(),
+    toggle: vi.fn(),
+    seek: vi.fn(),
+    setGain: vi.fn(),
+    setLocalVolume: vi.fn(),
+    enableSound: vi.fn(async () => {}),
+    retry: vi.fn(async () => {}),
     ...overrides,
   };
 }
@@ -344,4 +393,169 @@ it('reveals the recipient list with the local player fixed when private', () => 
   expect(alex.checked).toBe(true);
   expect(alex.disabled).toBe(true);
   t.destroy();
+});
+
+// ── optional music panel ─────────────────────────────────────────────────────────────
+
+it('mounts the music panel when an audio view and actions are supplied', () => {
+  const t = createTableView(main(), { ...makeView(), audioPanel: musicView() }, actions({ audio: musicActions() }));
+  expect(document.querySelector('.music')).not.toBeNull();
+  expect(document.querySelector('[data-track]')).not.toBeNull();
+  t.destroy();
+});
+
+it('updates the music panel in place and omits it when absent', () => {
+  const t = createTableView(main(), makeView(), actions());
+  expect(document.querySelector('.music')).toBeNull();
+  const first = createTableView(main(), { ...makeView(), audioPanel: musicView() }, actions({ audio: musicActions() }));
+  const row = document.querySelector('[data-track]');
+  first.update({ ...makeView(), audioPanel: musicView({ positionMs: 5000 }) });
+  expect(document.querySelector('[data-track]')).toBe(row);
+  first.destroy();
+});
+
+it('omits the music panel when the audio actions are missing', () => {
+  const t = createTableView(main(), { ...makeView(), audioPanel: musicView() }, actions());
+  expect(document.querySelector('.music')).toBeNull();
+  t.destroy();
+});
+
+it('mounts and removes the music panel as optional data arrives and disappears', () => {
+  const t = createTableView(main(), makeView(), actions({ audio: musicActions() }));
+  expect(document.querySelector('.music')).toBeNull();
+  t.update({ ...makeView(), audioPanel: musicView() });
+  const row = document.querySelector('[data-track]');
+  expect(document.querySelector('.music')).not.toBeNull();
+  t.update({ ...makeView(), audioPanel: musicView({ positionMs: 5000 }) });
+  expect(document.querySelector('[data-track]')).toBe(row);
+  t.update(makeView());
+  expect(document.querySelector('.music')).toBeNull();
+  t.destroy();
+});
+
+it('follows a replaced audio controller without leaving a stale panel', () => {
+  let current = musicActions();
+  const base = actions();
+  Object.defineProperty(base, 'audio', { get: () => current });
+  const t = createTableView(main(), { ...makeView(), audioPanel: musicView() }, base);
+  const firstRow = document.querySelector('[data-track]');
+  current = musicActions();
+  t.update({ ...makeView(), audioPanel: musicView({ positionMs: 1000 }) });
+  expect(document.querySelectorAll('.music')).toHaveLength(1);
+  expect(document.querySelector('[data-track]')).not.toBe(firstRow);
+  t.destroy();
+});
+
+it('keeps the table content when the music panel is destroyed', () => {
+  const t = createTableView(main(), { ...makeView(), audioPanel: musicView() }, actions({ audio: musicActions() }));
+  t.destroy();
+  expect(document.querySelector('#roll')).toBeNull();
+  expect(document.body.textContent).not.toContain('Theme.wav');
+});
+
+// ── app wiring: the controller is created when a joining session adopts audio ────────
+
+type LateAudioSession = PeerSession & { setAudio(next: AudioSessionView | undefined): void };
+
+/**
+ * A joining peer starts without a workspace and therefore without an audio view; its
+ * bootstrap adopts one later. The fake mirrors that: `audio` is absent until setAudio.
+ */
+function lateAudioSession(game: Game): LateAudioSession {
+  let localPlayerId: string | null = 'alex';
+  let audio: AudioSessionView | undefined;
+  const listeners = new Set<() => void>();
+  const emit = () => { for (const fn of [...listeners]) fn(); };
+  const noop = () => {};
+  return {
+    getView: () => ({
+      game,
+      phase: 'ready',
+      localPlayerId,
+      onlinePlayerIds: [],
+      priorityParticipantId: null,
+      canCreatePlayer: false,
+      canRoll: localPlayerId !== null,
+      canChat: false,
+      messages: [],
+      liveImages: [],
+      hasRecovery: false,
+      hasRoomLink: false,
+      unseatedParticipantCount: 0,
+      conflicts: [],
+      error: null,
+      connectionError: null,
+      audio,
+      saveGeneration: 0,
+    }),
+    getSnapshot: () => null,
+    getRecoverySnapshot: () => null,
+    getRoomLink: () => null,
+    subscribe(fn) { listeners.add(fn); return () => { listeners.delete(fn); }; },
+    openRoom: () => null,
+    joinRoom: noop,
+    selectPlayer(next) { localPlayerId = next; emit(); },
+    createPlayer: noop,
+    sendMessage: () => false,
+    roll: noop,
+    edit: noop,
+    addTrack: () => false,
+    removeTrack: noop,
+    setTrackGain: () => false,
+    selectTrack: noop,
+    playTrack: noop,
+    stopTrack: noop,
+    seekTrack: noop,
+    sendAudioTrack: async () => {},
+    requestAudioHolders: async () => [],
+    requestAudioTrack: async () => false,
+    requestAudioPosition: async () => null,
+    onAudioTrack: () => noop,
+    onAudioProgress: () => noop,
+    onAudioFetch: () => noop,
+    onAudioWho: () => noop,
+    onAudioPosition: () => noop,
+    disconnect: noop,
+    close() { listeners.clear(); },
+    setAudio(next) { audio = next; emit(); },
+  };
+}
+
+function audioSessionView(): AudioSessionView {
+  return {
+    tracks: [musicTrack],
+    tombstones: [],
+    currentTrackId: null,
+    playing: false,
+    positionMs: 0,
+    startedAt: null,
+    rev: 0,
+    resyncPending: false,
+    approximate: false,
+    connected: false,
+    canControl: false,
+  };
+}
+
+it('mounts the music panel when a session adopts an audio view after joining', async () => {
+  const game = fixtureGame();
+  const session = lateAudioSession(game);
+  const repo = createWorkspaceRepository({ indexedDB: new IDBFactory(), dbName: randomUUID(), runtime: runtime() });
+  const app = mountApp(main(), { repository: repo, runtime: runtime(), createSession: () => session });
+
+  await vi.waitFor(() => expect(main().querySelector('#new-game')).not.toBeNull());
+  main().querySelector<HTMLInputElement>('#game-name')!.value = 'Music Table';
+  main().querySelector<HTMLInputElement>('#creator-name')!.value = 'Alex';
+  main().querySelector<HTMLFormElement>('#new-game')!.requestSubmit();
+  await vi.waitFor(() => expect(main().querySelector('#roll')).not.toBeNull());
+  expect(main().querySelector('.music')).toBeNull();
+
+  // Adopting a workspace exposes audio, and the app must mount the panel without a reload.
+  session.setAudio(audioSessionView());  await vi.waitFor(() => expect(main().querySelector('.music')).not.toBeNull());
+  expect(main().querySelector('[data-track]')).not.toBeNull();
+
+  // Leaving the session destroys the persistent player with it.
+  app.destroy();
+  expect(main().querySelector('.music')).toBeNull();
+  expect(document.querySelector('#music-audio')).toBeNull();
 });

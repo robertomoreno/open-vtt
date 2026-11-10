@@ -3,6 +3,8 @@ import type { DieSides, Player, Role, Roll } from '../game/types';
 import type { ChatDraft, PeerSessionView } from '../session/peer-types';
 import { canSeeChat } from '../game/chat';
 import type { ChatImage, ChatImageInput, ChatMessage } from '../game/chat';
+import type { AudioActions, AudioPanelView } from './audio';
+import { createMusicView, type MusicView } from './music';
 import { CHAT_RECORDS, CHAT_TEXT_CHARS } from '../network/limits';
 
 export type TableActions = {
@@ -16,10 +18,12 @@ export type TableActions = {
   createPlayer(name: string, role: Role): void;
   sendMessage(draft: ChatDraft): boolean;
   prepareImage(file: File): Promise<ChatImageInput>;
+  /** Present only when the application has a persistent audio controller. */
+  audio?: AudioActions;
 };
-export type TableView = { update(view: PeerSessionView): void; destroy(): void };
+export type TableView = { update(view: TableViewData): void; destroy(): void };
 
-export type TableViewData = PeerSessionView;
+export type TableViewData = PeerSessionView & { audioPanel?: AudioPanelView };
 export type TableActionSet = TableActions;
 export type TableProps = PeerSessionView;
 export type TableViewModel = PeerSessionView;
@@ -39,7 +43,7 @@ function compareEntries(a: LedgerEntry, b: LedgerEntry): number {
   return a.kind < b.kind ? -1 : a.kind > b.kind ? 1 : 0;
 }
 
-export function createTableView(root: HTMLElement, view: PeerSessionView, actions: TableActions): TableView {
+export function createTableView(root: HTMLElement, view: TableViewData, actions: TableActions): TableView {
   const eyebrow = el('p', 'Your party’s shared space', 'eyebrow');
   const title = el('h1');
   const identity = el('p', '', 'lead');
@@ -125,16 +129,21 @@ export function createTableView(root: HTMLElement, view: PeerSessionView, action
 
   const left = el('aside', '', 'panel');
   const right = el('section', '', 'panel');
+  // The music view owns its own container: `createMusicView` replaces the slot's
+  // children, so mounting it never disturbs the rest of the right-hand panel.
+  const musicSlot = el('div', '', 'music-slot');
   left.append(el('h2', 'Around the table'), waiting, roster, addForm, choosePlayer, room, disconnect, leave, el('p', 'Players connect directly. Keep the host tab open.', 'muted'));
-  right.append(el('h2', 'The dice have a story.'), el('p', 'One roll. Seen by everyone at the table.', 'muted'), ledger, chatForm, die.wrapper, roll, download, downloadRecovery);
+  right.append(el('h2', 'The dice have a story.'), el('p', 'One roll. Seen by everyone at the table.', 'muted'), ledger, chatForm, die.wrapper, roll, download, downloadRecovery, musicSlot);
 
   const grid = el('div', '', 'room');
   grid.append(left, right);
   root.replaceChildren(eyebrow, title, identity, snapshotLabel, message, grid);
 
-  let current: PeerSessionView = view;
+  let current: TableViewData = view;
   let ledgerSignature: string | null = null;
   let recipientKey: string | null = null;
+  let music: MusicView | null = null;
+  let musicActions: AudioActions | null = null;
   const selected = new Set<string>();
   let pendingImage: ChatImageInput | null = null;
   let imageRequest = 0;
@@ -362,7 +371,33 @@ export function createTableView(root: HTMLElement, view: PeerSessionView, action
     }));
   }
 
-  function apply(v: PeerSessionView) {
+  /**
+   * Mounts the replaceable music panel only when both halves exist: the controller's view
+   * and its actions. It is created once, updated in place, and torn down when either half
+   * disappears so a legacy session without audio keeps its former panel.
+   */
+  function syncMusic(v: TableViewData) {
+    const audioActions = actions.audio;
+    if (v.audioPanel && audioActions) {
+      // A replaced controller brings new actions; the panel must follow them rather than
+      // keep delegating to a destroyed one.
+      if (music && musicActions === audioActions) music.update(v.audioPanel);
+      else {
+        music?.destroy();
+        music = createMusicView(musicSlot, v.audioPanel, audioActions);
+        musicActions = audioActions;
+      }
+      return;
+    }
+    if (music) {
+      music.destroy();
+      music = null;
+      musicActions = null;
+    }
+    musicSlot.replaceChildren();
+  }
+
+  function apply(v: TableViewData) {
     current = v;
     const game = v.game;
     title.textContent = game?.name ?? 'Joining the table';
@@ -405,8 +440,17 @@ export function createTableView(root: HTMLElement, view: PeerSessionView, action
     renderRoster(v);
     renderLedger(v);
     syncComposer(v);
+    syncMusic(v);
   }
 
   apply(view);
-  return { update: apply, destroy() { root.replaceChildren(); } };
+  return {
+    update: apply,
+    destroy() {
+      music?.destroy();
+      music = null;
+      musicActions = null;
+      root.replaceChildren();
+    },
+  };
 }
