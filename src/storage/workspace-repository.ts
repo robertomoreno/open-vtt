@@ -1,6 +1,7 @@
 import type { Game, Runtime } from '../game/types';
 import type { WorkspaceSnapshot } from '../game/sync-types';
 import { createWorkspace, validateWorkspaceSnapshot } from '../game/workspace';
+import { AUDIO_BYTES } from '../network/limits';
 import { createRepository, type SaveResult } from './repository';
 
 export type WorkspaceSaveResult =
@@ -16,19 +17,38 @@ export type WorkspaceRepository = {
   loadRecovery(id: string): Promise<WorkspaceSnapshot | null>;
   rememberedPlayer(id: string): string | null;
   rememberPlayer(gameId: string, playerId: string): SaveResult;
+  putAudio(gameId: string, trackId: string, bytes: ArrayBuffer): Promise<SaveResult>;
+  getAudio(gameId: string, trackId: string): Promise<ArrayBuffer | null>;
+  hasAudio(gameId: string, trackId: string): Promise<boolean>;
+  removeAudio(gameId: string, trackId: string): Promise<void>;
+  removeGameAudio(gameId: string): Promise<void>;
+  listAudio(gameId: string): Promise<string[]>;
   close(): void;
 };
 
 const DB_NAME = 'gather-workspaces';
-const DB_VERSION = 1;
+const DB_VERSION = 2;
 const GAMES_STORE = 'games';
 const RECOVERY_STORE = 'recovery';
+const AUDIO_STORE = 'audio';
+const AUDIO_INDEX = 'gameId';
 const BLOCKED_TIMEOUT_MS = 1000;
 const STORAGE_WARNING = 'Browser save unavailable. Your game is still in memory; download a JSON copy to keep it.';
 const CORRUPT_WARNING = 'A corrupt browser save was skipped. Other saves are still available.';
 const MIGRATION_WARNING = 'A saved game could not be moved to durable storage; a temporary in-memory copy is still usable.';
 
 type RecoveryRecord = { id: string; snapshot: WorkspaceSnapshot };
+type AudioRecord = { key: string; gameId: string; trackId: string; bytes: ArrayBuffer; size: number; savedAt: string };
+
+const AUDIO_ID = /^[0-9a-f]{64}$/;
+
+function isGameId(value: unknown): value is string {
+  return typeof value === 'string' && value.length > 0 && value.length <= 64 && value.trim() === value;
+}
+
+function audioKey(gameId: unknown, trackId: unknown): string | null {
+  return isGameId(gameId) && typeof trackId === 'string' && AUDIO_ID.test(trackId) ? `${gameId}:${trackId}` : null;
+}
 
 function deniedStorage(): Storage {
   return new Proxy({} as Storage, { get() { throw new Error('Storage unavailable'); } });
@@ -73,6 +93,7 @@ export function createWorkspaceRepository(options: {
         const fresh = request.result;
         if (!fresh.objectStoreNames.contains(GAMES_STORE)) fresh.createObjectStore(GAMES_STORE, { keyPath: 'id' });
         if (!fresh.objectStoreNames.contains(RECOVERY_STORE)) fresh.createObjectStore(RECOVERY_STORE, { keyPath: 'id' });
+        if (!fresh.objectStoreNames.contains(AUDIO_STORE)) fresh.createObjectStore(AUDIO_STORE, { keyPath: 'key' }).createIndex(AUDIO_INDEX, 'gameId');
       };
       request.onblocked = () => {
         blockedTimer = setTimeout(() => {
@@ -139,7 +160,39 @@ export function createWorkspaceRepository(options: {
     });
   }
 
-  function putOne(handle: IDBDatabase, storeName: string, value: { id: string } & Record<string, unknown>): Promise<void> {
+  function getIndexKeys(handle: IDBDatabase, storeName: string, indexName: string, query: IDBValidKey): Promise<IDBValidKey[]> {
+    return new Promise((resolve, reject) => {
+      let tx: IDBTransaction;
+      try { tx = handle.transaction(storeName, 'readonly'); } catch (error) { reject(error); return; }
+      let result: IDBValidKey[] = [];
+      let settled = false;
+      const fail = (error: unknown) => { if (!settled) { settled = true; reject(error instanceof Error ? error : new Error('Read failed')); } };
+      const request = tx.objectStore(storeName).index(indexName).getAllKeys(query);
+      request.onsuccess = () => { result = request.result; };
+      request.onerror = () => fail(request.error);
+      tx.oncomplete = () => { if (!settled) { settled = true; resolve(result); } };
+      tx.onerror = () => fail(tx.error);
+      tx.onabort = () => fail(tx.error);
+    });
+  }
+
+  function countOne(handle: IDBDatabase, storeName: string, query: IDBValidKey): Promise<number> {
+    return new Promise((resolve, reject) => {
+      let tx: IDBTransaction;
+      try { tx = handle.transaction(storeName, 'readonly'); } catch (error) { reject(error); return; }
+      let result = 0;
+      let settled = false;
+      const fail = (error: unknown) => { if (!settled) { settled = true; reject(error instanceof Error ? error : new Error('Read failed')); } };
+      const request = tx.objectStore(storeName).count(query);
+      request.onsuccess = () => { result = request.result; };
+      request.onerror = () => fail(request.error);
+      tx.oncomplete = () => { if (!settled) { settled = true; resolve(result); } };
+      tx.onerror = () => fail(tx.error);
+      tx.onabort = () => fail(tx.error);
+    });
+  }
+
+  function putOne(handle: IDBDatabase, storeName: string, value: Record<string, unknown>): Promise<void> {
     return new Promise((resolve, reject) => {
       let tx: IDBTransaction;
       try { tx = handle.transaction(storeName, 'readwrite'); } catch (error) { reject(error); return; }
@@ -264,19 +317,31 @@ export function createWorkspaceRepository(options: {
     } catch { return { ok: false, reason: 'storage', message: STORAGE_WARNING }; }
   }
 
-  function deleteOne(handle: IDBDatabase, id: string): Promise<void> {
+  function deleteRecords(handle: IDBDatabase, stores: string[], remove: (tx: IDBTransaction) => void): Promise<void> {
     return new Promise((resolve, reject) => {
       let tx: IDBTransaction;
-      try { tx = handle.transaction([GAMES_STORE, RECOVERY_STORE], 'readwrite'); } catch (error) { reject(error); return; }
+      try { tx = handle.transaction(stores, 'readwrite'); } catch (error) { reject(error); return; }
       let settled = false;
       const fail = (error: unknown) => { if (!settled) { settled = true; reject(error instanceof Error ? error : new Error('Delete failed')); } };
-      try {
-        tx.objectStore(GAMES_STORE).delete(id);
-        tx.objectStore(RECOVERY_STORE).delete(id);
-      } catch (error) { try { tx.abort(); } catch {} fail(error); return; }
+      try { remove(tx); } catch (error) { try { tx.abort(); } catch {} fail(error); return; }
       tx.oncomplete = () => { if (!settled) { settled = true; resolve(); } };
       tx.onerror = () => fail(tx.error);
       tx.onabort = () => fail(tx.error);
+    });
+  }
+
+  function deleteAudioKeys(tx: IDBTransaction, gameId: string): void {
+    const store = tx.objectStore(AUDIO_STORE);
+    const keys = store.index(AUDIO_INDEX).getAllKeys(gameId);
+    keys.onsuccess = () => { for (const key of keys.result) store.delete(key); };
+    keys.onerror = () => { try { tx.abort(); } catch {} };
+  }
+
+  function deleteOne(handle: IDBDatabase, id: string): Promise<void> {
+    return deleteRecords(handle, [GAMES_STORE, RECOVERY_STORE, AUDIO_STORE], tx => {
+      tx.objectStore(GAMES_STORE).delete(id);
+      tx.objectStore(RECOVERY_STORE).delete(id);
+      deleteAudioKeys(tx, id);
     });
   }
 
@@ -314,6 +379,69 @@ export function createWorkspaceRepository(options: {
     } catch { return null; }
   }
 
+  async function putAudio(gameId: string, trackId: string, bytes: ArrayBuffer): Promise<SaveResult> {
+    const key = audioKey(gameId, trackId);
+    if (!key || !(bytes instanceof ArrayBuffer) || bytes.byteLength < 1 || bytes.byteLength > AUDIO_BYTES) {
+      return { ok: false, message: STORAGE_WARNING };
+    }
+    try {
+      const handle = await ensureDb();
+      await putOne(handle, AUDIO_STORE, { key, gameId, trackId, bytes, size: bytes.byteLength, savedAt: runtime.now() });
+      return { ok: true };
+    } catch { return { ok: false, message: STORAGE_WARNING }; }
+  }
+
+  async function getAudio(gameId: string, trackId: string): Promise<ArrayBuffer | null> {
+    const key = audioKey(gameId, trackId);
+    if (!key) return null;
+    try {
+      const handle = await ensureDb();
+      const record = await getOne<AudioRecord>(handle, AUDIO_STORE, key);
+      if (!record || record.gameId !== gameId || record.trackId !== trackId) return null;
+      return record.bytes instanceof ArrayBuffer ? record.bytes : null;
+    } catch { return null; }
+  }
+
+  async function hasAudio(gameId: string, trackId: string): Promise<boolean> {
+    const key = audioKey(gameId, trackId);
+    if (!key) return false;
+    try {
+      const handle = await ensureDb();
+      return await countOne(handle, AUDIO_STORE, key) > 0;
+    } catch { return false; }
+  }
+
+  async function removeAudio(gameId: string, trackId: string): Promise<void> {
+    const key = audioKey(gameId, trackId);
+    if (!key) return;
+    try {
+      const handle = await ensureDb();
+      await deleteRecords(handle, [AUDIO_STORE], tx => { tx.objectStore(AUDIO_STORE).delete(key); });
+    } catch {}
+  }
+
+  async function removeGameAudio(gameId: string): Promise<void> {
+    if (!isGameId(gameId)) return;
+    try {
+      const handle = await ensureDb();
+      await deleteRecords(handle, [AUDIO_STORE], tx => deleteAudioKeys(tx, gameId));
+    } catch {}
+  }
+
+  async function listAudio(gameId: string): Promise<string[]> {
+    if (!isGameId(gameId)) return [];
+    try {
+      const handle = await ensureDb();
+      const keys = await getIndexKeys(handle, AUDIO_STORE, AUDIO_INDEX, gameId);
+      const prefix = `${gameId}:`;
+      return keys
+        .filter((key): key is string => typeof key === 'string' && key.startsWith(prefix))
+        .map(key => key.slice(prefix.length))
+        .filter(trackId => AUDIO_ID.test(trackId))
+        .sort();
+    } catch { return []; }
+  }
+
   function rememberedPlayer(id: string): string | null {
     return legacy.rememberedPlayer(id);
   }
@@ -326,7 +454,7 @@ export function createWorkspaceRepository(options: {
     openPromise = null;
   }
 
-  return { list, load, save, remove, saveRecovery, loadRecovery, rememberedPlayer, rememberPlayer, close };
+  return { list, load, save, remove, saveRecovery, loadRecovery, rememberedPlayer, rememberPlayer, putAudio, getAudio, hasAudio, removeAudio, removeGameAudio, listAudio, close };
 }
 
 export function browserWorkspaceRepository(runtime: Runtime): WorkspaceRepository {

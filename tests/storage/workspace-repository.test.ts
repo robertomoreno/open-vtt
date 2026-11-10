@@ -45,11 +45,12 @@ function delayedSuccessFactory(): { indexedDB: IDBFactory; close: ReturnType<typ
 }
 async function putRawRecord(indexedDB: IDBFactory, dbName: string, record: unknown): Promise<void> {
   await new Promise<void>((resolve, reject) => {
-    const request = indexedDB.open(dbName, 1);
+    const request = indexedDB.open(dbName, 2);
     request.onupgradeneeded = () => {
       const db = request.result;
       if (!db.objectStoreNames.contains('games')) db.createObjectStore('games', { keyPath: 'id' });
       if (!db.objectStoreNames.contains('recovery')) db.createObjectStore('recovery', { keyPath: 'id' });
+      if (!db.objectStoreNames.contains('audio')) db.createObjectStore('audio', { keyPath: 'key' }).createIndex('gameId', 'gameId');
     };
     request.onsuccess = () => {
       const db = request.result;
@@ -63,7 +64,7 @@ async function putRawRecord(indexedDB: IDBFactory, dbName: string, record: unkno
 }
 async function bumpVersion(indexedDB: IDBFactory, dbName: string): Promise<void> {
   await new Promise<void>((resolve) => {
-    const request = indexedDB.open(dbName, 2);
+    const request = indexedDB.open(dbName, 3);
     request.onupgradeneeded = () => {};
     request.onsuccess = () => { request.result.close(); resolve(); };
     request.onerror = () => resolve();
