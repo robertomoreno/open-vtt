@@ -288,18 +288,24 @@ export function createRoomTransport(doc: Y.Doc, link: RoomLink, participantId: s
       const id = audioTrackId({ trackId });
       const action = audioPosition;
       if (id === null || action === undefined) return null;
+      // Commands and the session carry the stable Gather participant id, while request
+      // targets are Trystero peer ids. Prefer the mapped peer; an unknown id falls back
+      // to treating the supplied value as a peer id.
+      const preferred = preferredPeer === undefined
+        ? undefined
+        : [...participants].find(([, participant]) => participant === preferredPeer)?.[0] ?? preferredPeer;
       // The preferred peer gets at most half the probe budget, so a silent peer still leaves time for the fallback.
       const deadline = Date.now() + PROBE_TIMEOUT_MS;
       const preferredBudget = Math.floor(PROBE_TIMEOUT_MS / 2);
-      if (preferredPeer !== undefined && peers.has(preferredPeer)) {
+      if (preferred !== undefined && peers.has(preferred)) {
         const started = Date.now();
         try {
-          const value: unknown = await action.request({ trackId: id }, { target: preferredPeer, timeoutMs: preferredBudget });
+          const value: unknown = await action.request({ trackId: id }, { target: preferred, timeoutMs: preferredBudget });
           const position = audioPositionBody(value, id);
-          if (position !== null) return { peerId: preferredPeer, position, rttMs: Date.now() - started };
+          if (position !== null) return { peerId: preferred, position, rttMs: Date.now() - started };
         } catch { /* timed out or rejected: the fallback below uses the remaining budget */ }
       }
-      const targets = [...peers].filter(peer => peer !== preferredPeer);
+      const targets = [...peers].filter(peer => peer !== preferred);
       if (targets.length === 0) return null;
       const answeredAt = new Map<string, number>();
       const started = Date.now();

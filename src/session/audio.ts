@@ -136,10 +136,13 @@ export function createAudioSession(options: AudioSessionOptions): AudioSession {
   let resync: { token: number; command: PlaybackCommand } | null = null;
   let resyncToken = 0;
 
-  // Late join/reconnect: the next sync that sees a command decides once whether to
-  // ask the issuer for the current position.
+  // Late join/reconnect: the first playback command observed in a connection tenure
+  // decides once whether to ask the issuer for the current position. A returning player
+  // may synchronize one or more empty stages before the room's command arrives, so the
+  // tenure flag survives an empty sync instead of being consumed by it.
   let wasConnected = false;
   let pendingJoin = false;
+  let firstCommand = true;
 
   // True while a local bound prevents at least one valid staged record from merging.
   // The warning is surfaced on the complete → blocked transition only, and cleared
@@ -288,9 +291,12 @@ export function createAudioSession(options: AudioSessionOptions): AudioSession {
     }
     const halfTrip = Math.max(0, Math.round(result.rttMs / 2));
     const body = result.position;
+    // The command, not the answer, owns playback state: a holder whose element is paused
+    // during the start lead or while autoplay is blocked still answers for a shared playing
+    // command, and adopting its local paused flag would leave this peer silent.
     positionMs = clampPosition(body.positionMs + halfTrip, durationOf(command.trackId));
-    playing = body.playing;
-    startedAt = body.playing ? now() + AUDIO_LEAD_MS : null;
+    playing = command.playing;
+    startedAt = command.playing ? now() + AUDIO_LEAD_MS : null;
     approximate = false;
   }
 
@@ -326,11 +332,15 @@ export function createAudioSession(options: AudioSessionOptions): AudioSession {
 
   function syncPlayback(): void {
     const latest = latestPlaybackCommand(readPlaybackCommands(stage));
-    // The first connected sync consumes the join marker even when no command exists yet,
-    // so a later ordinary command is not mistaken for a late join.
-    const joining = pendingJoin;
-    pendingJoin = false;
+    // An empty sync does not consume the join decision: the room's command may still be
+    // arriving through the transient stage, especially for a returning player whose first
+    // syncs precede the playback log.
     if (latest === null) return;
+    // Only a live connection can answer a probe; a command seen while offline is covered
+    // by the pendingJoin set on the next disconnected → connected transition.
+    const joining = connected() && (pendingJoin || firstCommand);
+    pendingJoin = false;
+    firstCommand = false;
     const applied = currentCommand !== null && comparePlaybackCommands(latest, currentCommand) <= 0;
     if (!applied) {
       applyCommand(latest, joining);
@@ -344,7 +354,10 @@ export function createAudioSession(options: AudioSessionOptions): AudioSession {
   function sync(): void {
     if (destroyed) return;
     const isConnected = connected();
-    if (isConnected && !wasConnected) pendingJoin = true;
+    if (isConnected && !wasConnected) {
+      pendingJoin = true;
+      firstCommand = true;
+    }
     wasConnected = isConnected;
     try {
       syncLibrary();
@@ -384,6 +397,7 @@ export function createAudioSession(options: AudioSessionOptions): AudioSession {
     resync = null;
     resyncPending = false;
     pendingJoin = false;
+    firstCommand = false;
     resyncToken++;
     reconcileTombstonedCurrent();
     onDirty();
@@ -486,6 +500,9 @@ export function createAudioSession(options: AudioSessionOptions): AudioSession {
       // in-flight probe: a response from the old connection must not re-anchor this one.
       wasConnected = false;
       pendingJoin = false;
+      // Every transport replacement starts a fresh tenure: the next command seen on this
+      // connection is a late-join candidate even if several syncs arrive without one.
+      firstCommand = true;
       resync = null;
       resyncPending = false;
       resyncToken++;

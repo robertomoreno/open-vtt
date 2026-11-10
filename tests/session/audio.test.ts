@@ -193,8 +193,8 @@ describe('session audio', () => {
     expect(audio.getView().approximate).toBe(false);
   });
 
-  it('does not treat a command after an empty first sync as a late join', () => {
-    const { audio, stage, clock } = setup();
+  it('treats the first command after an empty connected sync as a late join', async () => {
+    const { audio, stage } = setup();
     const t = track();
     audio.setLocalPlayerId('alex');
     audio.addTrack({ id: t.id, name: t.name, type: 'audio/mpeg', size: 1000, durationMs: 60_000 });
@@ -203,10 +203,56 @@ describe('session audio', () => {
     audio.sync();
     stage.transact(() => stage.getArray(STAGE_AUDIO_PLAYBACK).push([JSON.stringify({ id: 'c1', rev: 1, participantId: 'bea', trackId: t.id, playing: true, positionMs: 2000, at: AT })]));
     audio.sync();
-    expect(requestPosition).not.toHaveBeenCalled();
-    expect(audio.getView().resyncPending).toBe(false);
+    await vi.waitFor(() => expect(requestPosition).toHaveBeenCalled());
+    await vi.waitFor(() => expect(audio.getView().resyncPending).toBe(false));
     expect(audio.getView().playing).toBe(true);
     expect(audio.getView().positionMs).toBe(2000);
+    expect(audio.getView().approximate).toBe(true);
+  });
+
+  it('probes and re-anchors when a returning player with a saved workspace receives the room command', async () => {
+    const { audio, stage, clock } = setup();
+    const t = track();
+    audio.setLocalPlayerId('alex');
+    // The durable workspace is restored while the transient playback stage is still empty.
+    audio.addTrack({ id: t.id, name: t.name, type: 'audio/mpeg', size: 1000, durationMs: 60_000 });
+    const requestPosition = vi.fn(async () => ({
+      peerId: 'bea',
+      position: { trackId: t.id, playing: true, positionMs: 7000 },
+      rttMs: 200,
+    }));
+    audio.setTransport(transport({ requestPosition }));
+    audio.sync();
+    expect(requestPosition).not.toHaveBeenCalled();
+    expect(audio.getView().currentTrackId).toBeNull();
+
+    // The room's playing command arrives after the empty first sync.
+    stage.transact(() => stage.getArray(STAGE_AUDIO_PLAYBACK).push([JSON.stringify({ id: 'c1', rev: 1, participantId: 'bea', trackId: t.id, playing: true, positionMs: 1000, at: AT })]));
+    audio.sync();
+
+    await vi.waitFor(() => expect(requestPosition).toHaveBeenCalledTimes(1));
+    await vi.waitFor(() => expect(audio.getView().resyncPending).toBe(false));
+    expect(audio.getView().positionMs).toBe(7100);
+    expect(audio.getView().startedAt).toBe(clock.at + 500);
+    expect(audio.getView().approximate).toBe(false);
+  });
+
+  it('keeps the command playback state when a position answer reports a paused element', async () => {
+    const { audio, stage, clock } = setup();
+    const t = track();
+    audio.setLocalPlayerId('alex');
+    audio.addTrack({ id: t.id, name: t.name, type: 'audio/mpeg', size: 1000, durationMs: 60_000 });
+    stage.transact(() => stage.getArray(STAGE_AUDIO_PLAYBACK).push([JSON.stringify({ id: 'c1', rev: 1, participantId: 'bea', trackId: t.id, playing: true, positionMs: 1000, at: AT })]));
+    const requestPosition = vi.fn(async () => ({
+      peerId: 'bea',
+      position: { trackId: t.id, playing: false, positionMs: 5000 },
+      rttMs: 200,
+    }));
+    audio.setTransport(transport({ requestPosition }));
+    audio.sync();
+    await vi.waitFor(() => expect(audio.getView().resyncPending).toBe(false));
+    expect(audio.getView().playing).toBe(true);
+    expect(audio.getView().positionMs).toBe(5100);
     expect(audio.getView().startedAt).toBe(clock.at + 500);
   });
 

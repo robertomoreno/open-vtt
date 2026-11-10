@@ -5,7 +5,6 @@ import { el } from './dom';
 export type MusicView = { update(view: AudioPanelView): void; destroy(): void };
 
 const MIB = 1024 * 1024;
-const FORMER_PLAYER = 'Former player';
 const EMPTY_LIBRARY = 'No music in this room yet.';
 const GAIN_MAX = 200;
 const LOCAL_MAX = 100;
@@ -116,6 +115,7 @@ export function createMusicView(root: HTMLElement, initial: AudioPanelView, acti
   const emptyItem = el('li', EMPTY_LIBRARY, 'muted music-empty');
 
   const transportTitle = el('h3', 'Now playing');
+  transportTitle.id = 'music-now-playing';
 
   const playButton = el('button', 'Start');
   playButton.type = 'button';
@@ -135,6 +135,11 @@ export function createMusicView(root: HTMLElement, initial: AudioPanelView, acti
   progressField.append(progress);
 
   const time = el('span', '0:00 / 0:00', 'music-time');
+
+  const syncLabel = el('p', '', 'muted music-sync');
+  syncLabel.id = 'music-sync';
+  syncLabel.setAttribute('role', 'status');
+  syncLabel.setAttribute('aria-live', 'polite');
 
   const gainField = el('label', 'Track volume (everyone)', 'music-range');
   gainField.htmlFor = 'music-gain';
@@ -171,6 +176,7 @@ export function createMusicView(root: HTMLElement, initial: AudioPanelView, acti
     playButton,
     progressField,
     time,
+    syncLabel,
     gainField,
     gainValue,
     localField,
@@ -279,7 +285,7 @@ export function createMusicView(root: HTMLElement, initial: AudioPanelView, acti
 
   function syncRow(record: TrackRow, track: AudioTrackView, view: AudioPanelView): void {
     setText(record.name, track.name);
-    setText(record.uploader, `Added by ${track.addedBy || FORMER_PLAYER}`);
+    setText(record.uploader, `Added by ${track.addedByName}`);
     setText(record.duration, clock(track.durationMs));
     setText(record.size, fileSize(track.size));
     setText(record.gain, `Shared gain ${clamp(track.gain, 0, GAIN_MAX)}%`);
@@ -318,10 +324,19 @@ export function createMusicView(root: HTMLElement, initial: AudioPanelView, acti
     const currentTrack = view.tracks.find((track) => track.id === view.currentTrackId) ?? null;
     const ready = currentTrack !== null && currentTrack.available;
 
+    setText(transportTitle, currentTrack === null ? 'Now playing' : `Now playing: ${currentTrack.name}`);
     setText(playButton, view.playing ? 'Stop' : 'Start');
     playButton.setAttribute('aria-pressed', String(view.playing));
     playButton.disabled = !view.canControl || !ready;
     playButton.setAttribute('aria-label', view.playing ? 'Stop shared playback' : 'Start shared playback');
+
+    const syncText = view.resyncPending
+      ? 'Synchronizing position…'
+      : view.approximate
+        ? 'Position approximate.'
+        : '';
+    setText(syncLabel, syncText);
+    syncLabel.hidden = syncText === '';
 
     const duration = Math.max(0, Math.round(view.durationMs));
     const max = String(duration);
@@ -331,7 +346,9 @@ export function createMusicView(root: HTMLElement, initial: AudioPanelView, acti
     renderTime(shownPosition, duration);
 
     const shownGain = clamp(syncRange(gain, clamp(view.gain, 0, GAIN_MAX), gainGuard), 0, GAIN_MAX);
-    gain.disabled = !view.canControl || !ready;
+    // Shared gain is durable metadata, not a live transport control: a seated player may
+    // change it offline or while this track's bytes are still unavailable here.
+    gain.disabled = !view.canAdd || view.currentTrackId === null;
     setText(gainValue, `${shownGain}%`);
 
     const shownLocal = clamp(syncRange(local, clamp(view.localVolume, 0, LOCAL_MAX), localGuard), 0, LOCAL_MAX);
@@ -339,7 +356,7 @@ export function createMusicView(root: HTMLElement, initial: AudioPanelView, acti
 
     addButton.disabled = !view.canAdd;
     fileInput.disabled = !view.canAdd;
-    setText(usage, `Using ${fileSize(view.usageBytes)} of ${megabytes(AUDIO_BYTES)}`);
+    setText(usage, `${fileSize(view.usageBytes)} stored on this device`);
 
     const permissionParts: string[] = [];
     if (!view.canAdd) permissionParts.push('Choose your player before adding music.');

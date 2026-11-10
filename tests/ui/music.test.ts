@@ -4,7 +4,7 @@ import { createMusicView } from '../../src/ui/music';
 import type { AudioActions, AudioPanelView } from '../../src/ui/audio';
 
 const track = { id: 'a'.repeat(64), name: 'Theme.mp3', type: 'audio/mpeg' as const, size: 1000, durationMs: 60_000, addedBy: 'alex', addedAt: '2026-11-10T10:00:00.000Z', gain: 100, gainAt: '2026-11-10T10:00:00.000Z', gainBy: 'alex' };
-const view = (over: Partial<AudioPanelView> = {}): AudioPanelView => ({ tracks: [{ ...track, available: true, downloading: false, progress: 0, current: true, ended: false }], currentTrackId: track.id, playing: false, positionMs: 0, durationMs: 60_000, gain: 100, localVolume: 80, needsSound: false, connected: true, canAdd: true, canControl: true, canRemove: true, usageBytes: 1000, status: null, ...over });
+const view = (over: Partial<AudioPanelView> = {}): AudioPanelView => ({ tracks: [{ ...track, addedByName: 'Alex', available: true, downloading: false, progress: 0, current: true, ended: false }], currentTrackId: track.id, playing: false, positionMs: 0, durationMs: 60_000, gain: 100, localVolume: 80, needsSound: false, connected: true, canAdd: true, canControl: true, canRemove: true, approximate: false, resyncPending: false, usageBytes: 1000, status: null, ...over });
 function actions(over: Partial<AudioActions> = {}): AudioActions { return { add: vi.fn(async () => {}), remove: vi.fn(), select: vi.fn(), toggle: vi.fn(), seek: vi.fn(), setGain: vi.fn(), setLocalVolume: vi.fn(), enableSound: vi.fn(async () => {}), retry: vi.fn(), ...over }; }
 
 beforeEach(() => { document.body.innerHTML = '<main></main>'; });
@@ -13,6 +13,9 @@ it('renders the library and current transport with accessible labels', () => {
   const v = view();
   const m = createMusicView(document.querySelector('main')!, v, actions());
   expect(document.querySelector('[data-track="' + track.id + '"]')!.textContent).toContain('Theme.mp3');
+  expect(document.querySelector('[data-track="' + track.id + '"]')!.textContent).toContain('Added by Alex');
+  expect(document.querySelector('#music-now-playing')!.textContent).toBe('Now playing: Theme.mp3');
+  expect(document.querySelector('.music-usage')!.textContent).toBe('1000 B stored on this device');
   expect(document.querySelector('#music-play')!.textContent).toBe('Start');
   expect(document.querySelector('#music-gain')!.getAttribute('aria-label')).toContain('everyone');
   expect(document.querySelector('#music-local')!.getAttribute('aria-label')).toContain('device');
@@ -54,7 +57,7 @@ it('preserves focus and slider drags across updates and does not rebuild unchang
 
 it('allows selecting a peer-only track instead of disabling the control', () => {
   const a = actions();
-  const missing = { ...track, available: false, downloading: false, progress: 0, current: false, ended: false };
+  const missing = { ...track, addedByName: 'Alex', available: false, downloading: false, progress: 0, current: false, ended: false };
   const m = createMusicView(document.querySelector('main')!, view({ tracks: [missing], currentTrackId: null, durationMs: 0 }), a);
   const select = document.querySelector<HTMLButtonElement>('[data-track-select]')!;
   expect(select.disabled).toBe(false);
@@ -67,7 +70,7 @@ it('allows selecting a peer-only track instead of disabling the control', () => 
 
 it('offers retry for a current track whose file is missing here', () => {
   const a = actions();
-  const missing = { ...track, available: false, downloading: false, progress: 0, current: true, ended: false };
+  const missing = { ...track, addedByName: 'Alex', available: false, downloading: false, progress: 0, current: true, ended: false };
   const m = createMusicView(document.querySelector('main')!, view({ tracks: [missing], currentTrackId: track.id }), a);
   const retry = document.querySelector<HTMLButtonElement>('[data-track-retry]')!;
   expect(retry.hidden).toBe(false);
@@ -121,5 +124,52 @@ it('forwards a file chosen through the hidden input and clears it', () => {
   input.dispatchEvent(new Event('change', { bubbles: true }));
   expect(a.add).toHaveBeenCalledWith(file);
   expect(input.value).toBe('');
+  m.destroy();
+});
+
+it('enables shared gain offline while play and seek stay gated on control', () => {
+  const a = actions();
+  const unavailable = { ...track, addedByName: 'Alex', available: false, downloading: false, progress: 0, current: true, ended: false };
+  const m = createMusicView(
+    document.querySelector('main')!,
+    view({ tracks: [unavailable], currentTrackId: track.id, connected: false, canControl: false }),
+    a,
+  );
+  const gain = document.querySelector<HTMLInputElement>('#music-gain')!;
+  const progress = document.querySelector<HTMLInputElement>('#music-progress')!;
+  expect(gain.disabled).toBe(false);
+  expect(progress.disabled).toBe(true);
+  expect(document.querySelector<HTMLButtonElement>('#music-play')!.disabled).toBe(true);
+
+  gain.value = '150';
+  gain.dispatchEvent(new Event('change', { bubbles: true }));
+  expect(a.setGain).toHaveBeenCalledWith(150);
+  m.destroy();
+});
+
+it('labels an approximate position and a pending resync', () => {
+  const v = view();
+  const m = createMusicView(document.querySelector('main')!, v, actions());
+  const label = document.querySelector<HTMLElement>('#music-sync')!;
+  expect(label.hidden).toBe(true);
+
+  m.update({ ...v, approximate: true });
+  expect(label.hidden).toBe(false);
+  expect(label.textContent).toBe('Position approximate.');
+
+  m.update({ ...v, resyncPending: true });
+  expect(label.textContent).toBe('Synchronizing position…');
+
+  m.update({ ...v });
+  expect(label.hidden).toBe(true);
+  expect(label.textContent).toBe('');
+  m.destroy();
+});
+
+it('names the current track in the transport', () => {
+  const m = createMusicView(document.querySelector('main')!, view({ currentTrackId: null, tracks: [] }), actions());
+  expect(document.querySelector('#music-now-playing')!.textContent).toBe('Now playing');
+  m.update(view());
+  expect(document.querySelector('#music-now-playing')!.textContent).toBe('Now playing: Theme.mp3');
   m.destroy();
 });

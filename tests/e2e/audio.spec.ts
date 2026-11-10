@@ -72,6 +72,10 @@ test('the library persists across reloads and a new holder can serve a late join
     const cyRow = cy.app.music.trackRow('theme.wav');
     await expect(cyRow).toBeVisible({ timeout: 60_000 });
     await expect(cyRow).not.toContainText('Ready');
+    // No current track is playing, so the library must still be metadata-only after the
+    // first availability refresh settles rather than racing into an auto-download.
+    await cy.app.page.waitForTimeout(1_000);
+    await expect(cyRow).not.toContainText('Ready');
     await cy.app.music.select('theme.wav');
     await expect(cyRow).toContainText('Ready', { timeout: 90_000 });
     await cy.app.music.toggle();
@@ -79,6 +83,47 @@ test('the library persists across reloads and a new holder can serve a late join
     await expect.poll(async () => cy.app.music.currentTime()).toBeGreaterThan(0);
   } finally {
     await host.close().catch(() => {});
+    await bea.close();
+    await cy.close();
+  }
+});
+
+test('a late joiner joins a playing track at the current position', async ({ browser }) => {
+  test.setTimeout(300_000);
+  const host = await Participant.create(browser), bea = await Participant.create(browser), cy = await Participant.create(browser);
+  try {
+    await host.app.createGame('The Music Table');
+    const link = await host.app.openSharedRoom();
+    await bea.app.joinSharedRoom(link);
+    await host.app.table.addPlayer('Bea');
+    await bea.app.claimPlayer('Bea');
+    await host.app.music.upload({ name: 'theme.wav', mimeType: 'audio/wav', buffer: wavFixture() });
+    await expect(bea.app.music.trackRow('theme.wav')).toContainText('Ready', { timeout: 60_000 });
+
+    await host.app.music.select('theme.wav');
+    await host.app.music.toggle();
+    await host.app.music.enableSoundIfNeeded();
+    await bea.app.music.enableSoundIfNeeded();
+    await expect.poll(async () => Math.min(await host.app.music.currentTime(), await bea.app.music.currentTime())).toBeGreaterThan(2);
+
+    // Cy is seated while the host is still connected, then joins the playing room.
+    await host.app.table.addPlayer('Cy');
+    await cy.app.joinSharedRoom(link);
+    await cy.app.claimPlayer('Cy');
+
+    // A late joiner auto-fetches the current track and probes the holder's position.
+    const cyRow = cy.app.music.trackRow('theme.wav');
+    await expect(cyRow).toBeVisible({ timeout: 60_000 });
+    await expect(cyRow).toContainText('Ready', { timeout: 90_000 });
+    await cy.app.music.enableSoundIfNeeded();
+    await expect.poll(async () => cy.app.music.currentTime()).toBeGreaterThan(0);
+    await expect.poll(async () => {
+      const hostTime = await host.app.music.currentTime();
+      const cyTime = await cy.app.music.currentTime();
+      return Math.abs(hostTime - cyTime);
+    }).toBeLessThan(1.5);
+  } finally {
+    await host.close();
     await bea.close();
     await cy.close();
   }

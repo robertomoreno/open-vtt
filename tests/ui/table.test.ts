@@ -54,7 +54,7 @@ const musicTrack = createAudioTrack(
 
 function musicView(overrides: Partial<AudioPanelView> = {}): AudioPanelView {
   return {
-    tracks: [{ ...musicTrack, available: true, downloading: false, progress: 0, current: true, ended: false }],
+    tracks: [{ ...musicTrack, addedByName: 'Alex', available: true, downloading: false, progress: 0, current: true, ended: false }],
     currentTrackId: musicTrack.id,
     playing: false,
     positionMs: 0,
@@ -66,6 +66,8 @@ function musicView(overrides: Partial<AudioPanelView> = {}): AudioPanelView {
     canAdd: true,
     canControl: true,
     canRemove: true,
+    approximate: false,
+    resyncPending: false,
     usageBytes: musicTrack.size,
     status: null,
     ...overrides,

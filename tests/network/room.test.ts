@@ -428,6 +428,28 @@ describe('room transport', () => {
       t.close();
     });
 
+    it('resolves a preferred Gather participant id to its Trystero peer id', async () => {
+      const { state, join, t } = await start();
+      join('peer-a'); join('peer-b');
+      const handshake = state.callbacks.onPeerHandshake as (
+        id: string,
+        send: (data: any) => Promise<void>,
+        receive: () => Promise<{ data: any }>,
+        init: boolean,
+      ) => Promise<void>;
+      await handshake('peer-a', async () => {}, async () => ({ data: { v: 2, id: 'alice' } }), true);
+
+      const trackId = 'a'.repeat(64);
+      const position = state.actions['gather-audio-position-v1'];
+      position.request.mockResolvedValue({ trackId, playing: true, positionMs: 1000 });
+      const result = await t.audio.requestPosition(trackId, 'alice');
+
+      expect(position.request).toHaveBeenCalledWith({ trackId }, expect.objectContaining({ target: 'peer-a' }));
+      expect(position.requestMany).not.toHaveBeenCalled();
+      expect(result?.peerId).toBe('peer-a');
+      t.close();
+    });
+
     it('rate-limits who requests per peer without spending tokens on malformed payloads', async () => {
       const { state, join, t } = await start();
       vi.useFakeTimers({ toFake: ['Date'] });

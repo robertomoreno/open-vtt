@@ -291,6 +291,51 @@ it('adds a track by storing bytes before publishing metadata and sending to peer
   expect(session.sendAudioTrack).toHaveBeenCalled();
 });
 
+it('does not rebroadcast a file that is already in the library', async () => {
+  const session = fakeSession({ view: view({ currentTrackId: null }) });
+  const store = fakeStore();
+  const c = build({
+    session,
+    repository: store,
+    gameId: 'game',
+    createAudio: fakeAudio,
+    createContext: fakeContext,
+    probeDuration: async () => 6000,
+    canPlay: () => true,
+  });
+  const file = new File([new Uint8Array(4)], 'theme.wav', { type: 'audio/wav' });
+
+  await c.actions.add(file);
+  const id = vi.mocked(session.addTrack).mock.calls[0][0].id;
+  vi.mocked(session.addTrack).mockClear();
+  session.setAudio(view({ tracks: [makeTrack(id, 'theme.wav', 4)], currentTrackId: null }));
+  session.emit();
+
+  await c.actions.add(file);
+  expect(session.addTrack).not.toHaveBeenCalled();
+  expect(session.sendAudioTrack).toHaveBeenCalledTimes(1);
+  expect(c.getView().status).toBe('Already in the library.');
+});
+
+it('surfaces the removal message when re-adding tombstoned bytes', async () => {
+  const file = new File([new Uint8Array(4)], 'theme.wav', { type: 'audio/wav' });
+  const preparedId = await sha256Hex(new Uint8Array(4));
+  const session = fakeSession({ view: view({ tracks: [], tombstones: [preparedId], currentTrackId: null }) });
+  const c = build({
+    session,
+    repository: fakeStore(),
+    gameId: 'game',
+    createAudio: fakeAudio,
+    createContext: fakeContext,
+    probeDuration: async () => 6000,
+    canPlay: () => true,
+  });
+
+  await c.actions.add(file);
+  expect(session.addTrack).not.toHaveBeenCalled();
+  expect(c.getView().status).toMatch(/removed/i);
+});
+
 it('stores verified incoming bytes and rejects a hash mismatch', async () => {
   const bytes = new Uint8Array([1, 2, 3]);
   const id = await sha256Hex(bytes);
@@ -305,6 +350,23 @@ it('stores verified incoming bytes and rejects a hash mismatch', async () => {
 
   await session.receive(bytes, { trackId: ID, name: 'x', type: 'audio/mpeg', size: 3 }, 'peer-a');
   expect(c.getView().status).toMatch(/integrity|hash/i);
+});
+
+it('rotates to the next holder after corrupt bytes fail the integrity check', async () => {
+  const session = fakeSession({ view: view({ tracks: [makeTrack()], currentTrackId: null }) });
+  const holders = vi.mocked(session.requestAudioHolders);
+  const request = vi.mocked(session.requestAudioTrack);
+  holders.mockResolvedValue(['peer-a', 'peer-b']);
+  request.mockResolvedValue(true);
+  const c = build({ session, repository: fakeStore(), gameId: 'game', createAudio: fakeAudio, createContext: fakeContext });
+
+  // These bytes hash to a different id, so the metadata reference gate accepts the
+  // active track and the holder's answer is rejected as corrupt.
+  await session.receive(new Uint8Array([9, 9, 9]), { trackId: ID, name: 'Theme.wav', type: 'audio/wav', size: 3 }, 'peer-a');
+  expect(c.getView().status).toMatch(/integrity|hash/i);
+
+  await c.actions.retry(ID);
+  expect(request).toHaveBeenCalledWith(ID, 'peer-b');
 });
 
 it('deletes local bytes when a tombstone appears and stops a removed current track', async () => {
@@ -344,6 +406,21 @@ it('uses shared gain and local master independently and persists the local maste
   c.actions.setLocalVolume(20);
   expect(c.getView().localVolume).toBe(20);
   expect(storage.get('gather:audio:master')).toBe('0.2');
+});
+
+it('explains that a shared boost above 100% needs Web Audio', async () => {
+  const session = fakeSession({ view: view({ tracks: [makeTrack()], currentTrackId: ID }) });
+  const c = build({
+    session,
+    repository: fakeStore({}, { seed: [ID] }),
+    gameId: 'game',
+    createAudio: fakeAudio,
+    createContext: () => null,
+  });
+
+  c.actions.setGain(150);
+  expect(c.getView().gain).toBe(150);
+  expect(c.getView().status).toMatch(/boost|unavailable/i);
 });
 
 it('shows Enable sound when playback is blocked and never claims playing', async () => {
@@ -544,6 +621,24 @@ it('answers who and position requests from local state', async () => {
   expect(await session.position(OTHER, 'peer-a')).toBeNull();
 });
 
+it('answers for the shared playing state while the element is still paused during the lead', async () => {
+  const audio = fakeAudio();
+  audio.duration = 6;
+  const session = fakeSession({ view: view({ playing: true, positionMs: 1000, currentTrackId: ID, startedAt: 1500 }) });
+  build({
+    session,
+    repository: fakeStore({}, { seed: [ID] }),
+    gameId: 'game',
+    now: () => 1000,
+    createAudio: () => audio,
+    createContext: fakeContext,
+  });
+
+  await vi.waitFor(() => expect(audio.src).toBe('blob:audio'));
+  expect(audio.paused).toBe(true);
+  expect(await session.position(ID, 'peer-a')).toEqual({ trackId: ID, playing: true, positionMs: 1000 });
+});
+
 it('sends targeted bytes when a peer requests a track', async () => {
   const session = fakeSession({ view: view({ tracks: [makeTrack()], currentTrackId: null }) });
   const c = build({
@@ -564,6 +659,30 @@ it('sends targeted bytes when a peer requests a track', async () => {
     'peer-b',
   );
   expect(c.getView().tracks[0]?.available).toBe(true);
+});
+
+it('acknowledges a fetch before the queued send finishes', async () => {
+  let release: () => void = () => {};
+  const pending = new Promise<void>(resolve => { release = resolve; });
+  const session = fakeSession({ view: view({ tracks: [makeTrack()], currentTrackId: null }) });
+  vi.mocked(session.sendAudioTrack).mockImplementation(() => pending);
+  build({
+    session,
+    repository: fakeStore({}, { seed: [ID] }),
+    gameId: 'game',
+    createAudio: fakeAudio,
+    createContext: fakeContext,
+  });
+
+  await vi.waitFor(async () => expect(await session.who(ID, 'peer-a')).toBe(true));
+  const accepted = await Promise.race([
+    session.fetch(ID, 'peer-b'),
+    new Promise<'timeout'>(resolve => { setTimeout(() => resolve('timeout'), 250); }),
+  ]);
+  expect(accepted).toBe(true);
+  expect(session.sendAudioTrack).toHaveBeenCalled();
+  release();
+  await pending;
 });
 
 it('keeps bytes in memory and warns when durable storage fails', async () => {
@@ -638,6 +757,29 @@ it('discards an incoming track that is already tombstoned', async () => {
   await session.receive(bytes, { trackId: id, name: 'x', type: 'audio/mpeg', size: 3 }, 'peer-a');
 
   expect(store.putAudio).not.toHaveBeenCalled();
+});
+
+it('discards bytes that finish storing after a tombstone arrives', async () => {
+  const bytes = new Uint8Array([4, 4, 4, 4]);
+  const id = await sha256Hex(bytes);
+  let release: (result: { ok: true }) => void = () => {};
+  const stored = new Promise<{ ok: true }>(resolve => { release = resolve; });
+  const store = fakeStore({ putAudio: vi.fn(() => stored) });
+  const session = fakeSession({ view: view({ tracks: [makeTrack(id, 'Theme.wav', 4)], currentTrackId: id, playing: true }) });
+  const c = build({ session, repository: store, gameId: 'game', createAudio: fakeAudio, createContext: fakeContext });
+
+  const receiving = session.receive(bytes, { trackId: id, name: 'Theme.wav', type: 'audio/wav', size: 4 }, 'peer-a');
+  await vi.waitFor(() => expect(store.putAudio).toHaveBeenCalled());
+
+  // The track is removed while the write is in flight.
+  session.setAudio(view({ tracks: [], tombstones: [id], currentTrackId: null }));
+  session.emit();
+  release({ ok: true });
+  await receiving;
+
+  await vi.waitFor(() => expect(store.removeAudio).toHaveBeenCalledWith('game', id));
+  expect(c.getView().tracks.some(track => track.id === id && track.available)).toBe(false);
+  expect(c.getView().playing).toBe(false);
 });
 
 it('confirms before removing a track', () => {
