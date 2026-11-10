@@ -1,7 +1,7 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import * as Y from 'yjs';
 import { roomNetworkConfig, rtcConfiguration } from '../../src/network/config';
-import { AUDIO_BYTES } from '../../src/network/limits';
+import { AUDIO_BYTES, PROBE_TIMEOUT_MS } from '../../src/network/limits';
 import { createRoomLink } from '../../src/network/room-link';
 import { createRoomTransport, type RoomTransportOptions } from '../../src/network/room';
 
@@ -394,6 +394,47 @@ describe('room transport', () => {
       expect(state.peers['peer-a'].close).toHaveBeenCalledTimes(1);
       t.close();
       expect(vi.getTimerCount()).toBe(0);
+    });
+
+    it('bounds audio request polling and falls back when the preferred peer does not answer', async () => {
+      const { state, join, t } = await start();
+      join('peer-a'); join('peer-b');
+      const trackId = 'a'.repeat(64);
+      const who = state.actions['gather-audio-who-v1'];
+      who.requestMany.mockResolvedValue([{ status: 'fulfilled', peerId: 'peer-b', value: { has: true } }]);
+      expect(await t.audio.requestHolders(trackId)).toEqual(['peer-b']);
+      const whoOptions = who.requestMany.mock.calls.at(-1)![1];
+      expect(whoOptions.timeoutMs).toBeGreaterThan(0);
+      expect(whoOptions.timeoutMs).toBeLessThanOrEqual(PROBE_TIMEOUT_MS);
+
+      const fetch = state.actions['gather-audio-fetch-v1'];
+      fetch.request.mockResolvedValue({ accepted: true });
+      expect(await t.audio.requestFetch(trackId, 'peer-a')).toBe(true);
+      expect(fetch.request).toHaveBeenCalledWith({ trackId }, expect.objectContaining({ target: 'peer-a', timeoutMs: expect.any(Number) }));
+
+      const position = state.actions['gather-audio-position-v1'];
+      position.request.mockRejectedValue(new Error('request timed out'));
+      position.requestMany.mockResolvedValue([{ status: 'fulfilled', peerId: 'peer-b', value: { trackId, playing: false, positionMs: 500 } }]);
+      const result = await t.audio.requestPosition(trackId, 'peer-a');
+      expect(position.request).toHaveBeenCalledWith({ trackId }, expect.objectContaining({ target: 'peer-a', timeoutMs: expect.any(Number) }));
+      expect(position.requestMany).toHaveBeenCalledWith({ trackId }, expect.objectContaining({ targets: ['peer-b'], timeoutMs: expect.any(Number) }));
+      const fallbackOptions = position.requestMany.mock.calls.at(-1)![1];
+      expect(fallbackOptions.timeoutMs).toBeGreaterThan(0);
+      expect(fallbackOptions.timeoutMs).toBeLessThanOrEqual(PROBE_TIMEOUT_MS);
+      expect(result).toMatchObject({ peerId: 'peer-b', position: { trackId, playing: false, positionMs: 500 } });
+      t.close();
+    });
+
+    it('rate-limits who requests per peer without spending tokens on malformed payloads', async () => {
+      const { state, join, t } = await start();
+      vi.useFakeTimers({ toFake: ['Date'] });
+      join('peer-a');
+      t.audio.setHandlers({ onWho: async trackId => trackId === 'a'.repeat(64) });
+      const who = state.actions['gather-audio-who-v1'];
+      for (let i = 0; i < 40; i++) expect(await who.onRequest!({ trackId: 'bad' }, { peerId: 'peer-a' })).toEqual({ has: false });
+      for (let i = 0; i < 20; i++) expect(await who.onRequest!({ trackId: 'a'.repeat(64) }, { peerId: 'peer-a' })).toEqual({ has: true });
+      expect(await who.onRequest!({ trackId: 'a'.repeat(64) }, { peerId: 'peer-a' })).toEqual({ has: false });
+      t.close();
     });
 
     it('sends a targeted track and resolves holders and positions through request actions', async () => {

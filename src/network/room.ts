@@ -2,7 +2,7 @@ import * as Y from 'yjs';
 import type { JoinRoom, JoinRoomConfig, MessageAction, RequestAction, Room } from '@trystero-p2p/core';
 import { validateAudioTransferMeta, type AudioPositionBody, type AudioTransferMeta } from '../game/audio';
 import { roomNetworkConfig, signalingIsLoopback } from './config';
-import { ACTION_TOKEN_BURST, ACTION_TOKEN_REFILL_PER_SECOND, ADMITTED_PARTICIPANTS, AUDIO_BYTES, AUDIO_MAX_DURATION_MS, AUDIO_TRANSFER_BYTES, AWARENESS_BYTES, CONTROL_BYTES, CONTROL_ENTRIES, EXPIRY_MS, HEARTBEAT_MS, INCOMPLETE_TRANSFERS, MESSAGE_BYTES, NATIVE_REMOTE_CONNECTIONS, PENDING_ADMISSIONS, PENDING_INBOUND_BYTES, TRANSFER_TIMEOUT_MS } from './limits';
+import { ACTION_TOKEN_BURST, ACTION_TOKEN_REFILL_PER_SECOND, ADMITTED_PARTICIPANTS, AUDIO_BYTES, AUDIO_MAX_DURATION_MS, AUDIO_TRANSFER_BYTES, AWARENESS_BYTES, CONTROL_BYTES, CONTROL_ENTRIES, EXPIRY_MS, HEARTBEAT_MS, INCOMPLETE_TRANSFERS, MESSAGE_BYTES, NATIVE_REMOTE_CONNECTIONS, PENDING_ADMISSIONS, PENDING_INBOUND_BYTES, PROBE_TIMEOUT_MS, TRANSFER_TIMEOUT_MS } from './limits';
 import type { RoomLink } from './room-link';
 import { createBoundedRtcRuntime, type RtcConstructors } from './rtc-runtime';
 
@@ -22,7 +22,11 @@ export type RoomAudioHandlers = {
 };
 export type RoomAudio = {
   setHandlers(handlers: RoomAudioHandlers): void;
-  /** Audio metadata is validated here, so the transport accepts any shape and rejects bad ones. */
+  /**
+   * Sends one audio payload with `AUDIO_BYTES`-bounded metadata. The metadata is validated here,
+   * so the parameter accepts any shape; an invalid payload or an unwired room rejects the promise,
+   * and callers must handle that failure.
+   */
   sendTrack(bytes: Uint8Array, meta: unknown, target?: string | string[], onProgress?: (fraction: number, peerId: string) => void): Promise<void>;
   requestHolders(trackId: string): Promise<string[]>;
   requestFetch(trackId: string, peerId: string): Promise<boolean>;
@@ -260,7 +264,8 @@ export function createRoomTransport(doc: Y.Doc, link: RoomLink, participantId: s
       const targets = [...peers];
       if (targets.length === 0) return [];
       try {
-        const results = await action.requestMany({ trackId: id }, { targets });
+        // An unresponsive peer must not hold the poll open forever.
+        const results = await action.requestMany({ trackId: id }, { targets, timeoutMs: PROBE_TIMEOUT_MS });
         const holders: string[] = [];
         for (const result of results) {
           if (result.status !== 'fulfilled') continue;
@@ -275,7 +280,7 @@ export function createRoomTransport(doc: Y.Doc, link: RoomLink, participantId: s
       const action = audioFetch;
       if (id === null || action === undefined || !peers.has(peerId)) return false;
       try {
-        const value: unknown = await action.request({ trackId: id }, { target: peerId });
+        const value: unknown = await action.request({ trackId: id }, { target: peerId, timeoutMs: PROBE_TIMEOUT_MS });
         return value !== null && typeof value === 'object' && (value as { accepted?: unknown }).accepted === true;
       } catch { return false; }
     },
@@ -283,21 +288,25 @@ export function createRoomTransport(doc: Y.Doc, link: RoomLink, participantId: s
       const id = audioTrackId({ trackId });
       const action = audioPosition;
       if (id === null || action === undefined) return null;
+      // Preferred peer and fallback share one probe budget: a silent preferred peer cannot stall the fallback.
+      const deadline = Date.now() + PROBE_TIMEOUT_MS;
       if (preferredPeer !== undefined && peers.has(preferredPeer)) {
         const started = Date.now();
         try {
-          const value: unknown = await action.request({ trackId: id }, { target: preferredPeer });
+          const value: unknown = await action.request({ trackId: id }, { target: preferredPeer, timeoutMs: deadline - started });
           const position = audioPositionBody(value, id);
           if (position !== null) return { peerId: preferredPeer, position, rttMs: Date.now() - started };
-        } catch { /* try the remaining peers below */ }
+        } catch { /* timed out or rejected: use whatever budget remains below */ }
       }
       const targets = [...peers].filter(peer => peer !== preferredPeer);
-      if (targets.length === 0) return null;
+      const remaining = deadline - Date.now();
+      if (targets.length === 0 || remaining <= 0) return null;
       const answeredAt = new Map<string, number>();
       const started = Date.now();
       try {
         const results = await action.requestMany({ trackId: id }, {
           targets,
+          timeoutMs: remaining,
           onResult: result => { answeredAt.set(result.peerId, Date.now()); },
         });
         for (const result of results) {
@@ -355,6 +364,7 @@ export function createRoomTransport(doc: Y.Doc, link: RoomLink, participantId: s
         return meta !== null && meta.size === context.byteLength && admission(AUDIO_ACTION, AUDIO_BYTES, context);
       },
       onReceiveProgress: (progress, context) => {
+        if (closed || !peers.has(context.peerId)) return;
         audioProgress(progress, context);
         const meta = audioMeta(context.metadata);
         if (meta !== null) safely(() => audioHandlers.onProgress?.(progress, meta, context.peerId));
