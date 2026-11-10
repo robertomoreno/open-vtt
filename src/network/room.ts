@@ -1,10 +1,13 @@
 import * as Y from 'yjs';
 import type { JoinRoom, JoinRoomConfig, MessageAction, RequestAction, Room } from '@trystero-p2p/core';
 import { validateAudioTransferMeta, type AudioPositionBody, type AudioTransferMeta } from '../game/audio';
-import { roomNetworkConfig, signalingIsLoopback } from './config';
-import { ACTION_TOKEN_BURST, ACTION_TOKEN_REFILL_PER_SECOND, ADMITTED_PARTICIPANTS, AUDIO_BYTES, AUDIO_MAX_DURATION_MS, AUDIO_TRANSFER_BYTES, AWARENESS_BYTES, CONTROL_BYTES, CONTROL_ENTRIES, EXPIRY_MS, HEARTBEAT_MS, INCOMPLETE_TRANSFERS, MESSAGE_BYTES, NATIVE_REMOTE_CONNECTIONS, PENDING_ADMISSIONS, PENDING_INBOUND_BYTES, PROBE_TIMEOUT_MS, TRANSFER_TIMEOUT_MS } from './limits';
+import { rtcConfiguration } from './config';
+import { ACTION_TOKEN_BURST, ACTION_TOKEN_REFILL_PER_SECOND, ADMITTED_PARTICIPANTS, AUDIO_BYTES, AUDIO_MAX_DURATION_MS, AWARENESS_BYTES, CONTROL_BYTES, CONTROL_ENTRIES, EXPIRY_MS, HEARTBEAT_MS, INCOMPLETE_TRANSFERS, MESSAGE_BYTES, NATIVE_REMOTE_CONNECTIONS, PENDING_ADMISSIONS, PENDING_INBOUND_BYTES, PROBE_TIMEOUT_MS, TRANSFER_TIMEOUT_MS } from './limits';
 import type { RoomLink } from './room-link';
 import { createBoundedRtcRuntime, type RtcConstructors } from './rtc-runtime';
+import { signalingConfig } from './signaling/config';
+import { resolveSignalingPlan } from './signaling/resolve';
+import type { SignalingPlan } from './signaling/types';
 
 export type RoomTransportView = {
   phase: 'looking' | 'connected' | 'failed' | 'closed';
@@ -33,7 +36,7 @@ export type RoomAudio = {
   requestPosition(trackId: string, preferredPeer?: string): Promise<AudioPositionResult | null>;
 };
 export type RoomTransport = { getView(): RoomTransportView; subscribe(fn: () => void): () => void; close(): void; audio: RoomAudio };
-export type RoomTransportOptions = { join?: JoinRoom<JoinRoomConfig>; native?: RtcConstructors };
+export type RoomTransportOptions = { join?: JoinRoom<JoinRoomConfig>; plan?: SignalingPlan; native?: RtcConstructors };
 
 const participantPattern = /^[A-Za-z0-9_-]{1,64}$/;
 const audioIdPattern = /^[0-9a-f]{64}$/;
@@ -132,27 +135,28 @@ export function createRoomTransport(doc: Y.Doc, link: RoomLink, participantId: s
   }
 
   async function start() {
-    let join: JoinRoom<JoinRoomConfig>;
+    let plan: SignalingPlan;
     try {
-      join = options.join ?? (await import('./trystero-signaling')).createGatherSignalingStrategy();
+      plan = options.plan ?? await resolveSignalingPlan(signalingConfig);
     } catch {
       fail('The room transport could not be loaded.');
       return;
     }
     await Promise.resolve();
     if (closed) return;
+    const join = options.join ?? plan.join;
     runtime = createBoundedRtcRuntime({ native: options.native, now: () => Date.now(), onChange: notify, onError: peerError });
     try {
       room = join({
-        appId: 'gather-v2',
+        ...plan.base,
         password: link.secret,
-        maxReceiveBytes: AUDIO_TRANSFER_BYTES,
-        relayConfig: { urls: roomNetworkConfig.signaling },
-        rtcConfig: roomNetworkConfig.rtc,
+        relayConfig: plan.relayConfig,
+        rtcConfig: rtcConfiguration,
         rtcPolyfill: runtime.rtcPolyfill,
-        // When signaling is loopback every peer is on this machine, so the
-        // browser's mDNS-obfuscated host candidates can safely become 127.0.0.1.
-        ...(signalingIsLoopback ? { _test_only_mdnsHostFallbackToLoopback: true } : {}),
+        // When the plan's signaling is loopback every peer is on this machine,
+        // so the browser's mDNS-obfuscated host candidates can safely become
+        // 127.0.0.1.
+        ...(plan.allowsLoopbackCandidateFallback ? { _test_only_mdnsHostFallbackToLoopback: true } : {}),
       }, link.roomId, {
         onPeerHandshake: handshake,
         onJoinError: (details) => {

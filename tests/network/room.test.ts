@@ -1,9 +1,10 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import * as Y from 'yjs';
-import { roomNetworkConfig, rtcConfiguration } from '../../src/network/config';
+import { rtcConfiguration } from '../../src/network/config';
 import { AUDIO_BYTES, PROBE_TIMEOUT_MS } from '../../src/network/limits';
 import { createRoomLink } from '../../src/network/room-link';
 import { createRoomTransport, type RoomTransportOptions } from '../../src/network/room';
+import type { SignalingPlan } from '../../src/network/signaling/types';
 
 class FakeChannel extends EventTarget {
   label = 'data'; ordered = true; maxRetransmits: number | null = null; maxPacketLifeTime: number | null = null;
@@ -55,10 +56,18 @@ const stubBrowser = () => {
   vi.stubGlobal('WebSocket', class {});
 };
 const link = () => createRoomLink('game-1');
+const plan = (join: NonNullable<RoomTransportOptions['join']>, overrides: Partial<SignalingPlan> = {}): SignalingPlan => ({
+  id: 'wss',
+  join,
+  base: { appId: 'gather-v2', maxReceiveBytes: 12 * 1024 * 1024 },
+  relayConfig: { urls: ['wss://signal.example'] },
+  allowsLoopbackCandidateFallback: false,
+  ...overrides,
+});
 const start = async (doc = new Y.Doc(), participant = 'me') => {
   stubBrowser();
   const fake = fakeJoin();
-  const t = createRoomTransport(doc, link(), participant, { join: fake.join, native: { RTCPeerConnection: FakePc as any } });
+  const t = createRoomTransport(doc, link(), participant, { plan: plan(fake.join), native: { RTCPeerConnection: FakePc as any } });
   await vi.waitFor(() => expect(fake.state.room).toBeDefined());
   const join = (peerId: string) => { fake.state.peers[peerId] = { close: vi.fn() }; fake.state.room.onPeerJoin?.(peerId); };
   return { doc, t, ...fake, join };
@@ -84,13 +93,24 @@ describe('room transport', () => {
     expect(state.configs).toHaveLength(1);
     expect(config.appId).toBe('gather-v2');
     expect(config.maxReceiveBytes).toBe(12 * 1024 * 1024);
-    expect(config.relayConfig).toEqual({ urls: roomNetworkConfig.signaling });
-    expect(config.rtcConfig).toBe(roomNetworkConfig.rtc);
-    expect(config.rtcConfig.iceServers).toEqual(rtcConfiguration.iceServers);
-    expect(config.rtcConfig.iceServers.flatMap((s: any) => s.urls).every((u: string) => u.startsWith('stun:'))).toBe(true);
-    expect(typeof config.rtcPolyfill).toBe('function');
+    expect(config.relayConfig).toEqual({ urls: ['wss://signal.example'] });
+    expect(config.rtcConfig).toBe(rtcConfiguration);
+    expect(config.rtcConfig.iceServers?.flatMap((server: any) => server.urls).every((url: string) => url.startsWith('stun:'))).toBe(true);
     expect(config.password).toHaveLength(43);
+    expect(config._test_only_mdnsHostFallbackToLoopback).toBeUndefined();
     expect(JSON.stringify(t.getView())).not.toContain(config.password);
+    t.close();
+  });
+
+  it('enables the loopback candidate rewrite only when the plan allows it', async () => {
+    stubBrowser();
+    const fake = fakeJoin();
+    const t = createRoomTransport(new Y.Doc(), link(), 'me', {
+      plan: plan(fake.join, { allowsLoopbackCandidateFallback: true }),
+      native: { RTCPeerConnection: FakePc as any },
+    });
+    await vi.waitFor(() => expect(fake.state.room).toBeDefined());
+    expect(fake.state.configs[0]._test_only_mdnsHostFallbackToLoopback).toBe(true);
     t.close();
   });
 
@@ -482,7 +502,7 @@ describe('room transport', () => {
     it('close before the async start finishes never joins, and notifies subscribers once', async () => {
       stubBrowser();
       const fake = fakeJoin();
-      const t = createRoomTransport(new Y.Doc(), link(), 'p1', { join: fake.join });
+      const t = createRoomTransport(new Y.Doc(), link(), 'p1', { plan: plan(fake.join) });
       let calls = 0;
       t.subscribe(() => { calls++; });
       t.close();
@@ -501,7 +521,8 @@ describe('room transport', () => {
 
     it('turns a join failure into a safe failed phase', async () => {
       stubBrowser();
-      const t = createRoomTransport(new Y.Doc(), link(), 'p1', { join: () => { throw new Error('wss://secret.example sdp'); } });
+      const join = () => { throw new Error('wss://secret.example sdp'); };
+      const t = createRoomTransport(new Y.Doc(), link(), 'p1', { plan: plan(join) });
       await vi.waitFor(() => expect(t.getView().phase).toBe('failed'));
       expect(t.getView().error).toBe('The room transport could not start.');
       t.close();

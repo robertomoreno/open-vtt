@@ -25,7 +25,18 @@ async function connectPair() {
   const bus = createBus(), net = createNet(), link = createRoomLink('game-1');
   const docA = new Y.Doc(), docB = new Y.Doc();
   const make = async (name: string, doc: Y.Doc) => {
-    const t = createRoomTransport(doc, link, name, { join: await loadCoreJoiner(bus), native: { RTCPeerConnection: createFakeRtc(net, name) as any } });
+    const join = await loadCoreJoiner(bus);
+    const t = createRoomTransport(doc, link, name, {
+      join,
+      plan: {
+        id: 'wss',
+        join,
+        base: { appId: 'gather-v2', maxReceiveBytes: 12 * 1024 * 1024 },
+        relayConfig: { urls: ['ws://127.0.0.1:4444'] },
+        allowsLoopbackCandidateFallback: true,
+      },
+      native: { RTCPeerConnection: createFakeRtc(net, name) as any },
+    });
     transports.push(t);
     return t;
   };
