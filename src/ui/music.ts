@@ -10,6 +10,7 @@ const EMPTY_LIBRARY = 'No music in this room yet.';
 const GAIN_MAX = 200;
 const LOCAL_MAX = 100;
 const SEEK_STEP_MS = 100;
+const RECENT_INTERACTION_MS = 400;
 
 function clamp(value: number, min: number, max: number): number {
   if (!Number.isFinite(value)) return min;
@@ -44,6 +45,13 @@ function availability(track: AudioTrackView): string {
   return 'Ready';
 }
 
+/**
+ * Interaction state per range input. Focus is deliberately not part of it: a focused but
+ * idle slider must accept a shared update. Only an active pointer drag, or a keyboard/input
+ * event from the last few hundred milliseconds, holds the user's value against a tick.
+ */
+type RangeGuard = { dragging: boolean; interactedAt: number };
+
 type TrackRow = {
   id: string;
   row: HTMLLIElement;
@@ -56,16 +64,17 @@ type TrackRow = {
   current: HTMLElement;
   ended: HTMLElement;
   select: HTMLButtonElement;
+  retry: HTMLButtonElement;
   remove: HTMLButtonElement;
 };
 
 /**
  * Builds the provisional music panel around a persistent audio controller view.
  *
- * The structure is created once; `update` only rewrites the text and disabled state of the
- * existing nodes. Track rows keep their identity while the ordered id list is unchanged,
- * and a range that has focus is never rewritten, so a pointer drag is not interrupted by
- * the controller's tick notifications.
+ * The structure is created once; `update` only rewrites text and state that actually
+ * changed. Track rows keep their identity while the ordered id list is unchanged, and the
+ * status live region and hints compare before writing so an unchanged view never churns
+ * their text nodes.
  */
 export function createMusicView(root: HTMLElement, initial: AudioPanelView, actions: AudioActions): MusicView {
   const controller = new AbortController();
@@ -183,14 +192,38 @@ export function createMusicView(root: HTMLElement, initial: AudioPanelView, acti
   );
   root.replaceChildren(section);
 
+  let current: AudioPanelView = initial;
   let trackKey: string | null = null;
   let rows: TrackRow[] = [];
+  const progressGuard: RangeGuard = { dragging: false, interactedAt: 0 };
+  const gainGuard: RangeGuard = { dragging: false, interactedAt: 0 };
+  const localGuard: RangeGuard = { dragging: false, interactedAt: 0 };
 
-  /** Writes a range's value only while the user is not interacting with it. */
-  function setRange(input: HTMLInputElement, value: number): void {
-    if (document.activeElement === input) return;
+  /** Writes text only when it differs, so an unchanged update keeps the same text node. */
+  function setText(node: HTMLElement, text: string): void {
+    if (node.textContent !== text) node.textContent = text;
+  }
+
+  function held(guard: RangeGuard): boolean {
+    return guard.dragging || Date.now() - guard.interactedAt < RECENT_INTERACTION_MS;
+  }
+
+  /** Returns the value the user should see: the held one during interaction, else the view's. */
+  function syncRange(input: HTMLInputElement, value: number, guard: RangeGuard): number {
+    if (held(guard)) {
+      const shown = Number(input.value);
+      return Number.isFinite(shown) ? shown : value;
+    }
     const next = String(value);
     if (input.value !== next) input.value = next;
+    return value;
+  }
+
+  function renderTime(positionMs: number, durationMs: number): void {
+    const duration = Math.max(0, Math.round(durationMs));
+    const position = clamp(positionMs, 0, duration);
+    setText(time, `${clock(position)} / ${clock(duration)}`);
+    progress.setAttribute('aria-valuetext', `${clock(position)} of ${clock(duration)}`);
   }
 
   function buildRow(track: AudioTrackView): TrackRow {
@@ -207,38 +240,61 @@ export function createMusicView(root: HTMLElement, initial: AudioPanelView, acti
     const size = el('span', '', 'music-track-size');
     const gainLabel = el('span', '', 'music-track-gain');
     const state = el('span', '', 'music-track-state');
-    const current = el('span', '', 'music-track-current');
+    const currentMarker = el('span', '', 'music-track-current');
     const ended = el('span', '', 'music-track-ended');
-    meta.append(duration, size, gainLabel, state, current, ended);
+    meta.append(duration, size, gainLabel, state, currentMarker, ended);
 
     const rowActions = el('div', '', 'music-track-actions');
-    const select = el('button', 'Play');
+    const select = el('button', 'Select');
     select.type = 'button';
     select.dataset.trackSelect = '';
     select.addEventListener('click', () => actions.select(track.id), { signal });
+    const retry = el('button', 'Retry download');
+    retry.type = 'button';
+    retry.dataset.trackRetry = '';
+    retry.addEventListener('click', () => { void actions.retry(track.id); }, { signal });
     const remove = el('button', 'Remove');
     remove.type = 'button';
     remove.dataset.trackRemove = '';
     remove.addEventListener('click', () => actions.remove(track.id), { signal });
-    rowActions.append(select, remove);
+    rowActions.append(select, retry, remove);
 
     row.append(head, meta, rowActions);
-    return { id: track.id, row, name, uploader, duration, size, gain: gainLabel, state, current, ended, select, remove };
+    return {
+      id: track.id,
+      row,
+      name,
+      uploader,
+      duration,
+      size,
+      gain: gainLabel,
+      state,
+      current: currentMarker,
+      ended,
+      select,
+      retry,
+      remove,
+    };
   }
 
   function syncRow(record: TrackRow, track: AudioTrackView, view: AudioPanelView): void {
-    record.name.textContent = track.name;
-    record.uploader.textContent = `Added by ${track.addedBy || FORMER_PLAYER}`;
-    record.duration.textContent = clock(track.durationMs);
-    record.size.textContent = fileSize(track.size);
-    record.gain.textContent = `Shared gain ${clamp(track.gain, 0, GAIN_MAX)}%`;
-    record.state.textContent = availability(track);
-    record.current.textContent = track.current ? 'Current track' : '';
-    record.ended.textContent = track.ended ? 'Ended' : '';
-    record.select.disabled = !view.canControl || track.current || !track.available;
-    record.select.textContent = track.current ? 'Selected' : 'Play';
+    setText(record.name, track.name);
+    setText(record.uploader, `Added by ${track.addedBy || FORMER_PLAYER}`);
+    setText(record.duration, clock(track.durationMs));
+    setText(record.size, fileSize(track.size));
+    setText(record.gain, `Shared gain ${clamp(track.gain, 0, GAIN_MAX)}%`);
+    setText(record.state, availability(track));
+    setText(record.current, track.current ? 'Current track' : '');
+    setText(record.ended, track.ended ? 'Ended' : '');
+    // Availability is not a reason to block a selection: making a peer-only track current
+    // is what lets the controller fetch it locally.
+    record.select.disabled = !view.canControl || track.current;
+    setText(record.select, track.current ? 'Current' : 'Select');
     record.select.setAttribute('aria-pressed', String(track.current));
-    record.select.setAttribute('aria-label', track.current ? `${track.name} is the current track` : `Play ${track.name}`);
+    record.select.setAttribute('aria-label', track.current ? `${track.name} is the current track` : `Select ${track.name}`);
+    record.retry.hidden = !(track.current && !track.available && !track.downloading);
+    record.retry.disabled = !view.canControl;
+    record.retry.setAttribute('aria-label', `Retry download for ${track.name}`);
     record.remove.disabled = !view.canRemove;
     record.remove.setAttribute('aria-label', `Remove ${track.name}`);
   }
@@ -258,56 +314,54 @@ export function createMusicView(root: HTMLElement, initial: AudioPanelView, acti
   }
 
   function apply(view: AudioPanelView): void {
-    const current = view.tracks.find((track) => track.id === view.currentTrackId) ?? null;
-    const ready = current !== null && current.available;
+    current = view;
+    const currentTrack = view.tracks.find((track) => track.id === view.currentTrackId) ?? null;
+    const ready = currentTrack !== null && currentTrack.available;
 
-    playButton.textContent = view.playing ? 'Stop' : 'Start';
+    setText(playButton, view.playing ? 'Stop' : 'Start');
     playButton.setAttribute('aria-pressed', String(view.playing));
     playButton.disabled = !view.canControl || !ready;
     playButton.setAttribute('aria-label', view.playing ? 'Stop shared playback' : 'Start shared playback');
 
     const duration = Math.max(0, Math.round(view.durationMs));
-    const position = clamp(view.positionMs, 0, duration);
-    progress.max = String(duration);
-    setRange(progress, position);
+    const max = String(duration);
+    if (progress.max !== max) progress.max = max;
+    const shownPosition = syncRange(progress, clamp(view.positionMs, 0, duration), progressGuard);
     progress.disabled = !view.canControl || !ready;
-    progress.setAttribute('aria-valuetext', `${clock(position)} of ${clock(duration)}`);
-    time.textContent = `${clock(position)} / ${clock(duration)}`;
+    renderTime(shownPosition, duration);
 
-    const gainValueNumber = clamp(view.gain, 0, GAIN_MAX);
-    setRange(gain, gainValueNumber);
+    const shownGain = clamp(syncRange(gain, clamp(view.gain, 0, GAIN_MAX), gainGuard), 0, GAIN_MAX);
     gain.disabled = !view.canControl || !ready;
-    gainValue.textContent = `${gainValueNumber}%`;
+    setText(gainValue, `${shownGain}%`);
 
-    const localValueNumber = clamp(view.localVolume, 0, LOCAL_MAX);
-    setRange(local, localValueNumber);
-    localValue.textContent = `${localValueNumber}%`;
+    const shownLocal = clamp(syncRange(local, clamp(view.localVolume, 0, LOCAL_MAX), localGuard), 0, LOCAL_MAX);
+    setText(localValue, `${shownLocal}%`);
 
     addButton.disabled = !view.canAdd;
     fileInput.disabled = !view.canAdd;
-    usage.textContent = `Using ${fileSize(view.usageBytes)} of ${megabytes(AUDIO_BYTES)}`;
+    setText(usage, `Using ${fileSize(view.usageBytes)} of ${megabytes(AUDIO_BYTES)}`);
 
     const permissionParts: string[] = [];
     if (!view.canAdd) permissionParts.push('Choose your player before adding music.');
     if (!view.canRemove) permissionParts.push('Choose your player before removing tracks.');
-    permissionHint.textContent = permissionParts.join(' ');
+    setText(permissionHint, permissionParts.join(' '));
 
     let controlReason = '';
     if (!view.connected) controlReason = 'Connect to the room to control playback.';
-    else if (!view.canControl) controlReason = 'Only the host can control playback.';
-    else if (current === null) controlReason = 'Add or select a track to use the transport.';
-    else if (!current.available) {
-      controlReason = current.downloading
+    else if (!view.canControl) controlReason = 'Choose your player to control playback.';
+    else if (currentTrack === null) controlReason = 'Add or select a track to use the transport.';
+    else if (!currentTrack.available) {
+      controlReason = currentTrack.downloading
         ? 'This track is still downloading.'
-        : 'This track is not available in this room yet.';
+        : 'This track’s file is not available here yet; use Retry download.';
     }
-    controlHint.textContent = controlReason;
+    setText(controlHint, controlReason);
 
     const notices: string[] = [];
     if (!view.connected) notices.push('Connect to the room to play music with everyone.');
     if (view.needsSound) notices.push('This browser blocked the sound; use Enable sound to start it.');
     if (view.status) notices.push(view.status);
-    statusLine.textContent = notices.join(' ');
+    setText(statusLine, notices.join(' '));
 
     if (view.needsSound) {
       if (enableSound.parentNode !== soundSlot) soundSlot.append(enableSound);
@@ -318,12 +372,67 @@ export function createMusicView(root: HTMLElement, initial: AudioPanelView, acti
     renderTracks(view);
   }
 
+  // ── range interaction guards ───────────────────────────────────────────────────────
+  // Pointer drags hold the slider value against controller ticks; keyboard/input events
+  // hold it briefly. Blur always resyncs from the latest view so the user never keeps a
+  // stale value after leaving the control.
+  function guardRange(input: HTMLInputElement, state: RangeGuard): void {
+    input.addEventListener('pointerdown', () => {
+      state.dragging = true;
+      state.interactedAt = 0;
+    }, { signal });
+    input.addEventListener('pointerup', () => {
+      state.dragging = false;
+      state.interactedAt = 0;
+    }, { signal });
+    input.addEventListener('pointercancel', () => {
+      state.dragging = false;
+      state.interactedAt = 0;
+    }, { signal });
+    input.addEventListener('input', () => {
+      if (!state.dragging) state.interactedAt = Date.now();
+    }, { signal });
+    input.addEventListener('blur', () => {
+      state.dragging = false;
+      state.interactedAt = 0;
+      apply(current);
+    }, { signal });
+  }
+
+  guardRange(progress, progressGuard);
+  guardRange(gain, gainGuard);
+  guardRange(local, localGuard);
+
   playButton.addEventListener('click', () => actions.toggle(), { signal });
-  progress.addEventListener('change', () => actions.seek(Number(progress.value)), { signal });
-  const commitGain = (): void => actions.setGain(Number(gain.value));
-  gain.addEventListener('input', commitGain, { signal });
-  gain.addEventListener('change', commitGain, { signal });
-  local.addEventListener('input', () => actions.setLocalVolume(Number(local.value)), { signal });
+
+  progress.addEventListener('input', () => {
+    const shown = Number(progress.value);
+    renderTime(Number.isFinite(shown) ? shown : 0, current.durationMs);
+  }, { signal });
+  progress.addEventListener('change', () => {
+    progressGuard.dragging = false;
+    progressGuard.interactedAt = 0;
+    actions.seek(Number(progress.value));
+  }, { signal });
+
+  // Shared gain is previewed locally while dragging and committed once on release.
+  gain.addEventListener('input', () => {
+    const preview = clamp(Number(gain.value), 0, GAIN_MAX);
+    setText(gainValue, `${preview}%`);
+  }, { signal });
+  gain.addEventListener('change', () => {
+    gainGuard.dragging = false;
+    gainGuard.interactedAt = 0;
+    actions.setGain(Number(gain.value));
+  }, { signal });
+
+  // Device volume stays local and immediate.
+  local.addEventListener('input', () => {
+    const preview = clamp(Number(local.value), 0, LOCAL_MAX);
+    setText(localValue, `${preview}%`);
+    actions.setLocalVolume(Number(local.value));
+  }, { signal });
+
   enableSound.addEventListener('click', () => { void actions.enableSound(); }, { signal });
   addButton.addEventListener('click', () => fileInput.click(), { signal });
   fileInput.addEventListener('change', () => {

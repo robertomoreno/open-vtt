@@ -51,3 +51,75 @@ it('preserves focus and slider drags across updates and does not rebuild unchang
   expect(document.activeElement).toBe(gain);
   m.destroy();
 });
+
+it('allows selecting a peer-only track instead of disabling the control', () => {
+  const a = actions();
+  const missing = { ...track, available: false, downloading: false, progress: 0, current: false, ended: false };
+  const m = createMusicView(document.querySelector('main')!, view({ tracks: [missing], currentTrackId: null, durationMs: 0 }), a);
+  const select = document.querySelector<HTMLButtonElement>('[data-track-select]')!;
+  expect(select.disabled).toBe(false);
+  expect(select.textContent).toBe('Select');
+  expect(select.getAttribute('aria-label')).toBe('Select Theme.mp3');
+  select.click();
+  expect(a.select).toHaveBeenCalledWith(track.id);
+  m.destroy();
+});
+
+it('offers retry for a current track whose file is missing here', () => {
+  const a = actions();
+  const missing = { ...track, available: false, downloading: false, progress: 0, current: true, ended: false };
+  const m = createMusicView(document.querySelector('main')!, view({ tracks: [missing], currentTrackId: track.id }), a);
+  const retry = document.querySelector<HTMLButtonElement>('[data-track-retry]')!;
+  expect(retry.hidden).toBe(false);
+  retry.click();
+  expect(a.retry).toHaveBeenCalledWith(track.id);
+  m.destroy();
+});
+
+it('accepts shared gain changes on a focused idle slider but resists them while dragging', () => {
+  const v = view(); const m = createMusicView(document.querySelector('main')!, v, actions());
+  const gain = document.querySelector<HTMLInputElement>('#music-gain')!;
+  gain.focus();
+  m.update({ ...v, gain: 150 });
+  expect(gain.value).toBe('150');
+  gain.dispatchEvent(new Event('pointerdown', { bubbles: true }));
+  gain.value = '60';
+  gain.dispatchEvent(new Event('input', { bubbles: true }));
+  m.update({ ...v, gain: 150 });
+  expect(gain.value).toBe('60');
+  gain.dispatchEvent(new Event('pointerup', { bubbles: true }));
+  m.update({ ...v, gain: 150 });
+  expect(gain.value).toBe('150');
+  m.destroy();
+});
+
+it('keeps the status text node across identical updates', () => {
+  const v = view({ status: 'Saved to this browser.' });
+  const m = createMusicView(document.querySelector('main')!, v, actions());
+  const status = document.querySelector('#music-status')!;
+  const text = status.firstChild;
+  expect(text).not.toBeNull();
+  m.update({ ...v });
+  expect(status.firstChild).toBe(text);
+  m.destroy();
+});
+
+it('explains the unseated control reason without blaming a host', () => {
+  const m = createMusicView(document.querySelector('main')!, view({ connected: true, canControl: false }), actions());
+  const hint = document.querySelector('.music-transport .music-hint')!.textContent ?? '';
+  expect(hint).toMatch(/player/i);
+  expect(hint).not.toMatch(/host/i);
+  m.destroy();
+});
+
+it('forwards a file chosen through the hidden input and clears it', () => {
+  const a = actions();
+  const m = createMusicView(document.querySelector('main')!, view(), a);
+  const input = document.querySelector<HTMLInputElement>('#music-file')!;
+  const file = new File([new Uint8Array(4)], 'theme.mp3', { type: 'audio/mpeg' });
+  Object.defineProperty(input, 'files', { configurable: true, value: [file] });
+  input.dispatchEvent(new Event('change', { bubbles: true }));
+  expect(a.add).toHaveBeenCalledWith(file);
+  expect(input.value).toBe('');
+  m.destroy();
+});
