@@ -82,12 +82,12 @@ Gather supports two signaling providers: `wss`, a y-webrtc-compatible WebSocket 
 |---|---|---|
 | `VITE_GATHER_SIGNALING_PROVIDER` | `wss` or `nostr` | `nostr` in production; `wss` in development and Playwright |
 | `VITE_GATHER_SIGNALING_URLS` | Comma-separated relay URLs | None; the development `wss` default is `ws://127.0.0.1:4444` |
-| `VITE_GATHER_SIGNALING_REDUNDANCY` | Integer 1–8, `nostr` only | `8` |
+| `VITE_GATHER_SIGNALING_REDUNDANCY` | Integer 1–8, `nostr` only; used when no URL list is supplied | `8` |
 
 - `VITE_GATHER_SIGNALING_URLS` without a provider implies `wss` for backward compatibility.
 - A production `wss` configuration requires explicit URLs; there is no public y-webrtc fallback and no implicit endpoint.
 - `wss` accepts 1–4 URLs. Development also accepts `ws://` URLs; URLs with credentials, query strings, or fragments are rejected.
-- `VITE_GATHER_SIGNALING_REDUNDANCY` applies only to `nostr` and is rejected for `wss`. It is an integer from 1 to 8 (default 8) and controls how many relays receive an announcement. `nostr` also accepts an explicit list of 1–8 relay URLs in `VITE_GATHER_SIGNALING_URLS`.
+- `VITE_GATHER_SIGNALING_REDUNDANCY` applies only to `nostr` and is rejected for `wss`. When no URL list is supplied it selects how many of the default relays receive an announcement: an integer from 1 to 8 (default 8). When `VITE_GATHER_SIGNALING_URLS` lists 1–8 relays, every listed relay is used and `redundancy` does not limit them.
 - Invalid configuration stops startup with an error. Gather never silently falls back to another provider or endpoint.
 - In development only, `localStorage['gather:dev:signaling']` overrides the environment and accepts a JSON object (`{"provider":"wss","urls":"ws://127.0.0.1:4444"}`) or the legacy comma-separated WSS URL list. It is ignored in production.
 
