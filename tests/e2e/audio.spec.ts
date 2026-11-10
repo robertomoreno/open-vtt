@@ -23,9 +23,15 @@ test('players hear the same track and keep private volume', async ({ browser }) 
     await expect.poll(async () => host.app.music.currentTime()).toBeGreaterThan(0);
     await expect.poll(async () => bea.app.music.currentTime()).toBeGreaterThan(0);
     await expect.poll(async () => Math.abs(await host.app.music.currentTime() - await bea.app.music.currentTime())).toBeLessThan(0.75);
+    // Get both playheads clearly past the seek target first, so moving backwards is observable.
+    await expect.poll(async () => Math.min(await host.app.music.currentTime(), await bea.app.music.currentTime())).toBeGreaterThan(5);
     await host.app.music.seek(3000);
-    await expect.poll(async () => host.app.music.currentTime()).toBeGreaterThan(2.5);
-    await expect.poll(async () => bea.app.music.currentTime()).toBeGreaterThan(2.5);
+    // A shared seek must move both playheads back to ~3 s, not merely leave them past 2.5 s.
+    await expect.poll(async () => {
+      const hostTime = await host.app.music.currentTime();
+      const beaTime = await bea.app.music.currentTime();
+      return hostTime >= 2.5 && beaTime >= 2.5 && hostTime < 4.5 && beaTime < 4.5 && Math.abs(hostTime - beaTime) < 0.75;
+    }).toBe(true);
     await host.app.music.setGain(160);
     await expect(bea.app.music.gainValue()).toHaveValue('160');
     await host.app.music.setLocal(20);
@@ -54,17 +60,20 @@ test('the library persists across reloads and a new holder can serve a late join
     await host.app.page.reload();
     await host.app.start.continueGame('The Music Table');
     await host.app.restore.open();
-    await expect(host.app.music.trackRow('theme.wav')).toContainText('Ready');
+    await expect(host.app.music.trackRow('theme.wav')).toContainText('Ready', { timeout: 60_000 });
 
     // The original uploader leaves; Bea still holds the bytes. Cy joins the same room
     // link and must fetch the track from Bea, not from the absent uploader.
     await host.close();
     await cy.app.joinSharedRoom(link);
     await cy.app.claimPlayer('Cy');
-    // A late joiner does not auto-download the library: selecting the missing current
-    // track is what requests the bytes from a connected holder.
+    // A late joiner does not auto-download the library: the row is listed without bytes
+    // until selecting the missing current track requests them from a connected holder.
+    const cyRow = cy.app.music.trackRow('theme.wav');
+    await expect(cyRow).toBeVisible({ timeout: 60_000 });
+    await expect(cyRow).not.toContainText('Ready');
     await cy.app.music.select('theme.wav');
-    await expect(cy.app.music.trackRow('theme.wav')).toContainText('Ready', { timeout: 90_000 });
+    await expect(cyRow).toContainText('Ready', { timeout: 90_000 });
     await cy.app.music.toggle();
     await cy.app.music.enableSoundIfNeeded();
     await expect.poll(async () => cy.app.music.currentTime()).toBeGreaterThan(0);

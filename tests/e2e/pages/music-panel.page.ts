@@ -14,9 +14,7 @@ export type AudioUpload = { name: string; mimeType: string; buffer: Buffer };
 export class MusicPanel {
   readonly page: Page;
   readonly section: Locator;
-  readonly library: Locator;
   readonly fileInput: Locator;
-  readonly addButton: Locator;
   readonly playButton: Locator;
   readonly progress: Locator;
   readonly gain: Locator;
@@ -28,9 +26,7 @@ export class MusicPanel {
   constructor(page: Page) {
     this.page = page;
     this.section = page.locator('.music');
-    this.library = page.locator('.music-tracks');
     this.fileInput = page.locator('#music-file');
-    this.addButton = page.locator('#music-add');
     this.playButton = page.locator('#music-play');
     this.progress = page.locator('#music-progress');
     this.gain = page.locator('#music-gain');
@@ -90,9 +86,9 @@ export class MusicPanel {
     try {
       await this.soundButton.waitFor({ state: 'visible', timeout: 5_000 });
     } catch {
-      return;
+      return; // Audio was not blocked, so there is nothing to enable.
     }
-    await this.soundButton.click({ timeout: 5_000 }).catch(() => {});
+    await this.soundButton.click({ timeout: 5_000 });
   }
 
   async currentTime(): Promise<number> {
