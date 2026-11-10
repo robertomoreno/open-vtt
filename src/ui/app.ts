@@ -390,12 +390,17 @@ export function mountApp(root: HTMLElement, deps: AppDependencies = {}) {
     try {
       const controller = createAudioController({ session, repository, gameId: game.id });
       audioController = controller;
-      // Ticks and transfer progress repaint the table, whose panel updates in place.
-      audioUnsubscribe = controller.subscribe(() => { if (!destroyed) renderSession(); });
+      // Audio notifications repaint only the mounted music panel. A controller tick must
+      // never run a full session render: that rebuilds the player chooser (and resets its
+      // pending selection) several times per second. With no table mounted it is a no-op.
+      audioUnsubscribe = controller.subscribe(() => {
+        if (!destroyed) tableView?.updateAudio(controller.getView());
+      });
     } catch (e) {
-      // A browser that cannot build the player must not take the whole table down. The
-      // game key is kept so a failing construction is not retried on every render.
-      report(e);
+      // The in-render error region is cleared later in this same render, so report the
+      // failure on the persistent warning surface and leave the key clear for a retry.
+      destroyAudio();
+      warning.textContent = e instanceof Error && e.message ? e.message : String(e);
     }
   }
 

@@ -446,11 +446,40 @@ it('follows a replaced audio controller without leaving a stale panel', () => {
   t.destroy();
 });
 
-it('keeps the table content when the music panel is destroyed', () => {
+it('mounts the music panel without replacing the panel’s siblings', () => {
   const t = createTableView(main(), { ...makeView(), audioPanel: musicView() }, actions({ audio: musicActions() }));
+  expect(document.querySelector('.music')).not.toBeNull();
+  // The music view replaces its own container's children, never the right-hand panel's.
+  expect(document.querySelector('#roll')).not.toBeNull();
+  expect(document.querySelector('#chat-form')).not.toBeNull();
+  expect(document.querySelector('.ledger')).not.toBeNull();
+  expect(document.querySelector('#download')).not.toBeNull();
+  expect(document.querySelector('#choose-player')).not.toBeNull();
   t.destroy();
   expect(document.querySelector('#roll')).toBeNull();
   expect(document.body.textContent).not.toContain('Theme.wav');
+});
+
+it('updates only the music panel through updateAudio', () => {
+  const t = createTableView(main(), { ...makeView(), audioPanel: musicView() }, actions({ audio: musicActions() }));
+  const row = document.querySelector('[data-track]');
+  const roll = document.querySelector('#roll');
+  const ledger = document.querySelector('.ledger');
+  t.updateAudio(musicView({ positionMs: 5000, playing: true }));
+  expect(document.querySelector('[data-track]')).toBe(row);
+  expect(document.querySelector('#roll')).toBe(roll);
+  expect(document.querySelector('.ledger')).toBe(ledger);
+  expect(document.querySelector('#music-play')!.textContent).toBe('Stop');
+  t.destroy();
+});
+
+it('ignores updateAudio when no music panel is mounted', () => {
+  const t = createTableView(main(), makeView(), actions({ audio: musicActions() }));
+  const roll = document.querySelector('#roll');
+  t.updateAudio(musicView());
+  expect(document.querySelector('.music')).toBeNull();
+  expect(document.querySelector('#roll')).toBe(roll);
+  t.destroy();
 });
 
 // ── app wiring: the controller is created when a joining session adopts audio ────────
@@ -521,7 +550,7 @@ function lateAudioSession(game: Game): LateAudioSession {
   };
 }
 
-function audioSessionView(): AudioSessionView {
+function audioSessionView(overrides: Partial<AudioSessionView> = {}): AudioSessionView {
   return {
     tracks: [musicTrack],
     tombstones: [],
@@ -534,6 +563,7 @@ function audioSessionView(): AudioSessionView {
     approximate: false,
     connected: false,
     canControl: false,
+    ...overrides,
   };
 }
 
@@ -551,11 +581,81 @@ it('mounts the music panel when a session adopts an audio view after joining', a
   expect(main().querySelector('.music')).toBeNull();
 
   // Adopting a workspace exposes audio, and the app must mount the panel without a reload.
-  session.setAudio(audioSessionView());  await vi.waitFor(() => expect(main().querySelector('.music')).not.toBeNull());
+  session.setAudio(audioSessionView());
+  await vi.waitFor(() => expect(main().querySelector('.music')).not.toBeNull());
   expect(main().querySelector('[data-track]')).not.toBeNull();
 
   // Leaving the session destroys the persistent player with it.
   app.destroy();
   expect(main().querySelector('.music')).toBeNull();
   expect(document.querySelector('#music-audio')).toBeNull();
+});
+
+it('repaints the mounted music panel on audio ticks without a full render', async () => {
+  const session = lateAudioSession(fixtureGame());
+  session.setAudio(audioSessionView({ currentTrackId: musicTrack.id, playing: true, startedAt: Date.now() }));
+  const repo = createWorkspaceRepository({ indexedDB: new IDBFactory(), dbName: randomUUID(), runtime: runtime() });
+  const app = mountApp(main(), { repository: repo, runtime: runtime(), createSession: () => session });
+
+  await vi.waitFor(() => expect(main().querySelector('#new-game')).not.toBeNull());
+  main().querySelector<HTMLInputElement>('#game-name')!.value = 'Music Table';
+  main().querySelector<HTMLInputElement>('#creator-name')!.value = 'Alex';
+  main().querySelector<HTMLFormElement>('#new-game')!.requestSubmit();
+  await vi.waitFor(() => expect(main().querySelector('#music-progress')).not.toBeNull());
+
+  const progress = main().querySelector<HTMLInputElement>('#music-progress')!;
+  const row = main().querySelector('[data-track]');
+  const roll = main().querySelector('#roll');
+  const start = Number(progress.value);
+
+  // One controller tick repaints the panel in place: the playhead moves while every
+  // sibling node keeps its identity, proving no full session/table render ran.
+  await vi.waitFor(() => expect(Number(progress.value)).toBeGreaterThan(start + 100));
+  expect(main().querySelector('[data-track]')).toBe(row);
+  expect(main().querySelector('#roll')).toBe(roll);
+  expect(main().querySelector('#music-progress')).toBe(progress);
+
+  app.destroy();
+});
+
+it('leaves the player chooser untouched while audio ticks', async () => {
+  const game: Game = {
+    ...fixtureGame(),
+    players: [
+      { id: 'alex', name: 'Alex', role: 'gm' },
+      { id: 'bea', name: 'Bea', role: 'pj' },
+    ],
+  };
+  const session = lateAudioSession(game);
+  session.setAudio(audioSessionView());
+  const repo = createWorkspaceRepository({ indexedDB: new IDBFactory(), dbName: randomUUID(), runtime: runtime() });
+  const app = mountApp(main(), { repository: repo, runtime: runtime(), createSession: () => session });
+
+  await vi.waitFor(() => expect(main().querySelector('#new-game')).not.toBeNull());
+  main().querySelector<HTMLInputElement>('#game-name')!.value = 'Music Table';
+  main().querySelector<HTMLInputElement>('#creator-name')!.value = 'Alex';
+  main().querySelector<HTMLFormElement>('#new-game')!.requestSubmit();
+  await vi.waitFor(() => expect(main().querySelector('#roll')).not.toBeNull());
+  expect(main().querySelector('.music')).not.toBeNull();
+
+  main().querySelector<HTMLButtonElement>('#choose-player')!.click();
+  await vi.waitFor(() => expect(main().querySelector('#player-existing')).not.toBeNull());
+
+  // A pending "Join as …" choice must survive controller ticks. The chooser rebuilds and
+  // resets its selection on every `update`, so a tick routed through the full session
+  // render would silently revert this value four times a second.
+  const select = main().querySelector<HTMLSelectElement>('#player-existing')!;
+  const options = [...select.options];
+  select.value = 'bea';
+  select.dispatchEvent(new Event('change', { bubbles: true }));
+  expect(main().querySelector('#join-selected-player')!.textContent).toBe('Join as Bea');
+
+  await new Promise((resolve) => setTimeout(resolve, 550));
+
+  expect(main().querySelector('#player-existing')).toBe(select);
+  expect([...select.options]).toEqual(options);
+  expect(select.value).toBe('bea');
+  expect(main().querySelector('#join-selected-player')!.textContent).toBe('Join as Bea');
+
+  app.destroy();
 });

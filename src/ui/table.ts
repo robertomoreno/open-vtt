@@ -21,7 +21,12 @@ export type TableActions = {
   /** Present only when the application has a persistent audio controller. */
   audio?: AudioActions;
 };
-export type TableView = { update(view: TableViewData): void; destroy(): void };
+export type TableView = {
+  update(view: TableViewData): void;
+  /** Repaints only the mounted music panel; a no-op when no panel is mounted. */
+  updateAudio(panel: AudioPanelView): void;
+  destroy(): void;
+};
 
 export type TableViewData = PeerSessionView & { audioPanel?: AudioPanelView };
 export type TableActionSet = TableActions;
@@ -446,6 +451,11 @@ export function createTableView(root: HTMLElement, view: TableViewData, actions:
   apply(view);
   return {
     update: apply,
+    // Ticks are deliberately narrow: they repaint the panel and must never rebuild the
+    // table, the player chooser, or any other screen.
+    updateAudio(panel: AudioPanelView) {
+      if (music) music.update(panel);
+    },
     destroy() {
       music?.destroy();
       music = null;
