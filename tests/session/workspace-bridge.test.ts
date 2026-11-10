@@ -7,7 +7,7 @@ import type { Game, Runtime } from '../../src/game/types';
 import { validateOperation } from '../../src/game/history';
 import { ValidationError } from '../../src/game/validation';
 import { createWorkspace, type Workspace } from '../../src/game/workspace';
-import { AUDIO_COMMANDS, AUDIO_COMMAND_BYTES, CONTROL_ENTRIES, GAME_OPERATIONS, MISSING_DEPENDENCY_OPERATIONS } from '../../src/network/limits';
+import { AUDIO_COMMANDS, AUDIO_COMMAND_BYTES, AUDIO_TOMBSTONES, AUDIO_TRACKS, CONTROL_ENTRIES, GAME_OPERATIONS, MISSING_DEPENDENCY_OPERATIONS } from '../../src/network/limits';
 import {
   STAGE_AUDIO,
   STAGE_CHAT,
@@ -349,7 +349,7 @@ describe('staged audio', () => {
     expect(() => writePlaybackCommand(stage, { ...command(999), id: 'x'.repeat(AUDIO_COMMAND_BYTES) })).toThrow(/command/i);
   });
 
-  it('survives a transient-stage clear and does not let audio overflow a history publish', () => {
+  it('survives a transient-stage clear and does not disturb an ordinary history publish', () => {
     const { stage, ws, bridge } = setup();
     const t = createAudioTrack({ id: 'a'.repeat(64), name: 'Theme.mp3', type: 'audio/mpeg', size: 1000, durationMs: 60_000 }, 'alex', AT);
     publishAudio(stage, [t], []);
@@ -358,5 +358,32 @@ describe('staged audio', () => {
     expect(readStagedAudio(stage).tracks).toHaveLength(1);
     expect(readPlaybackCommands(stage)).toHaveLength(1);
     expect(() => bridge.publish(ws.getHistory())).not.toThrow();
+  });
+
+  it('caps staged audio reads at the canonical record limits, deterministically', () => {
+    const { stage } = setup();
+    const audioId = (n: number) => n.toString(16).padStart(64, '0');
+    const tracks = Array.from({ length: AUDIO_TRACKS + 5 }, (_, n) =>
+      createAudioTrack({ id: audioId(n), name: 'Theme.mp3', type: 'audio/mpeg', size: 1000, durationMs: 60_000 }, 'alex', AT));
+    const tombstones = Array.from({ length: AUDIO_TOMBSTONES + 5 }, (_, n) => ({ id: audioId(n), at: AT, by: 'alex' }));
+    publishAudio(stage, tracks, tombstones);
+    const read = readStagedAudio(stage);
+    expect(read.tracks).toHaveLength(AUDIO_TRACKS);
+    expect(read.tracks[AUDIO_TRACKS - 1].id).toBe(audioId(AUDIO_TRACKS - 1));
+    expect(read.tracks.some(track => track.id === audioId(AUDIO_TRACKS))).toBe(false);
+    expect(read.tombstones).toHaveLength(AUDIO_TOMBSTONES);
+    expect(read.tombstones[AUDIO_TOMBSTONES - 1].id).toBe(audioId(AUDIO_TOMBSTONES - 1));
+  });
+
+  it('rolls back an audio publish that overflows the stage and keeps existing audio intact', () => {
+    const { stage } = setup();
+    const existing = createAudioTrack({ id: 'a'.repeat(64), name: 'Theme.mp3', type: 'audio/mpeg', size: 1000, durationMs: 60_000 }, 'alex', AT);
+    publishAudio(stage, [existing], []);
+    // Game entries are never shrink victims: this ballast cannot be freed to make room.
+    stage.transact(() => stage.getMap(STAGE_ENTRIES).set(JSON.stringify([`junk-${'x'.repeat(2 * 1024 * 1024)}`, soloGame()]), true));
+    const added = createAudioTrack({ id: 'b'.repeat(64), name: 'Sfx.mp3', type: 'audio/mpeg', size: 1000, durationMs: 60_000 }, 'alex', AT);
+    expect(() => publishAudio(stage, [existing, added], [])).toThrow(/Room data limit/);
+    expect(stage.getMap(STAGE_AUDIO).has(added.id)).toBe(false);
+    expect(stage.getMap(STAGE_AUDIO).get(existing.id)).toBe(JSON.stringify(existing));
   });
 });

@@ -13,8 +13,8 @@ import type { Game, Role } from '../game/types';
 import { check, id, validateGame } from '../game/validation';
 import type { Workspace } from '../game/workspace';
 import {
-  AUDIO_COMMANDS, AUDIO_COMMAND_BYTES, CHAT_RECORDS, CONTROL_BYTES, CONTROL_ENTRIES,
-  ENCODED_OPERATION_BYTES, GAME_OPERATIONS, PENDING_ADMISSIONS,
+  AUDIO_COMMANDS, AUDIO_COMMAND_BYTES, AUDIO_TOMBSTONES, AUDIO_TRACKS, CHAT_RECORDS,
+  CONTROL_BYTES, CONTROL_ENTRIES, ENCODED_OPERATION_BYTES, GAME_OPERATIONS, PENDING_ADMISSIONS,
 } from '../network/limits';
 import { validateMembershipEvent, type MembershipEvent } from './membership';
 
@@ -417,8 +417,10 @@ function stagedAudioTombstone(key: string, value: unknown): AudioTombstone | nul
 }
 
 /**
- * Valid staged audio metadata, deterministically ordered. Invalid, noncanonical, or
- * ID-rewritten records are skipped individually: one malicious record never hides the rest.
+ * Valid staged audio metadata, deterministically ordered and bounded by the canonical
+ * record limits. Invalid, noncanonical, or ID-rewritten records are skipped individually:
+ * one malicious record never hides the rest. Sorting happens before the cap so every peer
+ * keeps the same subset, and excess records are dropped here rather than thrown downstream.
  */
 export function readStagedAudio(stage: Y.Doc): { tracks: AudioTrack[]; tombstones: AudioTombstone[] } {
   const tracks: AudioTrack[] = [];
@@ -432,23 +434,40 @@ export function readStagedAudio(stage: Y.Doc): { tracks: AudioTrack[]; tombstone
     if (tombstone) tombstones.push(tombstone);
   }
   return {
-    tracks: tracks.sort(compareAudioTracks),
-    tombstones: tombstones.sort((a, b) => (a.id < b.id ? -1 : a.id > b.id ? 1 : 0)),
+    tracks: tracks.sort(compareAudioTracks).slice(0, AUDIO_TRACKS),
+    tombstones: tombstones
+      .sort((a, b) => (a.at !== b.at ? (a.at < b.at ? -1 : 1) : a.id < b.id ? -1 : a.id > b.id ? 1 : 0))
+      .slice(0, AUDIO_TOMBSTONES),
   };
 }
+
+type StagedAudioChange = { map: Y.Map<unknown>; key: string; encoded: string; previous: string | undefined };
 
 /**
  * Mirrors canonical audio metadata into staging, writing only records that are missing or
  * differ. Like chat, this runs on every session refresh, so a matching stage is left
- * byte-for-byte untouched. On overflow only our own writes are rolled back and chat/images
- * are pruned first by `shrinkTransientStage`; the accepted workspace is never touched.
+ * byte-for-byte untouched. Changes are keyed by record id, so duplicate input ids settle on
+ * the last value while still restoring the original staged value on rollback. On overflow
+ * only our own writes are rolled back and chat/images are pruned first by
+ * `shrinkTransientStage`; the accepted workspace is never touched.
  */
 export function publishAudio(stage: Y.Doc, tracks: readonly AudioTrack[], tombstones: readonly AudioTombstone[]): void {
-  const changes: Array<{ map: Y.Map<unknown>; key: string; encoded: string; previous: string | undefined }> = [];
+  const changes = new Map<Y.Map<unknown>, Map<string, StagedAudioChange>>();
   const addChange = (map: Y.Map<unknown>, key: string, encoded: string) => {
+    let byId = changes.get(map);
+    if (!byId) {
+      byId = new Map();
+      changes.set(map, byId);
+    }
+    const pending = byId.get(key);
+    if (pending) {
+      if (encoded === pending.previous) byId.delete(key);
+      else pending.encoded = encoded;
+      return;
+    }
     const previous = map.get(key);
     if (previous === encoded) return;
-    changes.push({ map, key, encoded, previous: typeof previous === 'string' ? previous : undefined });
+    byId.set(key, { map, key, encoded, previous: typeof previous === 'string' ? previous : undefined });
   };
   const audio = stage.getMap(STAGE_AUDIO);
   for (const value of tracks) {
@@ -460,11 +479,12 @@ export function publishAudio(stage: Y.Doc, tracks: readonly AudioTrack[], tombst
     const tombstone = validateAudioTombstone(value);
     addChange(graves, tombstone.id, JSON.stringify(tombstone));
   }
-  if (changes.length === 0) return;
-  stage.transact(() => { for (const change of changes) change.map.set(change.key, change.encoded); });
+  const pending = [...changes.values()].flatMap(byId => [...byId.values()]);
+  if (pending.length === 0) return;
+  stage.transact(() => { for (const change of pending) change.map.set(change.key, change.encoded); });
   if (shrinkTransientStage(stage)) return;
   stage.transact(() => {
-    for (const change of changes) {
+    for (const change of pending) {
       if (!change.map.has(change.key)) continue;
       if (change.previous === undefined) change.map.delete(change.key);
       else change.map.set(change.key, change.previous);
