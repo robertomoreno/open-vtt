@@ -1,5 +1,10 @@
 # Configurable Trystero Signaling Providers (Phase 1) Implementation Plan
 
+> **Status:** Phase 1 was implemented on branch `feat/signaling-providers`. The
+> task checkboxes below are the original plan, not a live completion tracker.
+> Gate evidence is in
+> `docs/superpowers/debugging/2026-11-10-nostr-provider-gate.md`.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Make Trystero's signaling provider configurable, default production to Nostr with eight relays, keep development on the loopback WSS relay, and leave the room/session/UI contract unchanged.

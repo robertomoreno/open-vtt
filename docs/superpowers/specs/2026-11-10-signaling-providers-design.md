@@ -1,8 +1,7 @@
 # Gather: configurable Trystero signaling providers (Phase 1)
 
-Status: proposed by the agent on 2026-11-10 after the signaling research.
-Implementation planning is authorized; application changes require the user to
-review the plan and choose an execution method first.
+Status: implemented on 2026-11-10 on branch `feat/signaling-providers`. Gate
+evidence is in `docs/superpowers/debugging/2026-11-10-nostr-provider-gate.md`.
 
 Related research:
 `docs/superpowers/research/2026-11-10-trystero-signaling-options.md`

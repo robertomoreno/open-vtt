@@ -14,6 +14,14 @@ describe('signaling plans', () => {
     expect(typeof plan.join).toBe('function');
   });
 
+  it('does not allow the loopback candidate rewrite for an empty URL list', async () => {
+    const plan = await resolveSignalingPlan(
+      { provider: 'wss', urls: [] },
+      { dev: true },
+    );
+    expect(plan.allowsLoopbackCandidateFallback).toBe(false);
+  });
+
   it('does not allow the loopback candidate rewrite for a remote URL', async () => {
     const plan = await resolveSignalingPlan(
       { provider: 'wss', urls: ['wss://relay.example'] },

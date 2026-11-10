@@ -20,6 +20,15 @@ describe('Nostr signaling plan', () => {
     expect(plan.allowsLoopbackCandidateFallback).toBe(false);
   });
 
+  it('omits an empty URL list so the default relays stay in effect', async () => {
+    const plan = await resolveSignalingPlan(
+      { provider: 'nostr', urls: [], redundancy: 8 },
+      { dev: false },
+    );
+    expect(plan.relayConfig).toStrictEqual({ redundancy: 8, warnOnRelayFailure: false });
+    expect(plan.relayConfig).not.toHaveProperty('urls');
+  });
+
   it('uses explicit relays and warns in development', async () => {
     const plan = await resolveSignalingPlan(
       { provider: 'nostr', urls: ['wss://a.example'], redundancy: 8 },

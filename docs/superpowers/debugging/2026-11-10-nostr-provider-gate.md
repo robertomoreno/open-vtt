@@ -64,8 +64,8 @@ complete base64 text. Both directions matched **byte-for-byte**:
 - after closing every relay socket on both pages: Bob's small message still
   arrived at Alice, and Alice → Bob seed 11 still matched exactly.
 
-This exercises the real bounded native RTC runtime, framing, and the 12 MiB
-receive budget, not a mock.
+This exercises the real bounded native RTC runtime and framing, not a mock. The
+1.5 MB payload is well below the 12 MiB receive budget.
 
 ## Scope of this evidence
 

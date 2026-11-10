@@ -12,7 +12,7 @@ export async function createNostrPlan(
     join: joinRoom,
     base: { appId: SIGNALING_APP_ID, maxReceiveBytes: AUDIO_TRANSFER_BYTES },
     relayConfig: {
-      ...(config.urls === undefined ? {} : { urls: config.urls }),
+      ...(config.urls?.length ? { urls: config.urls } : {}),
       redundancy: config.redundancy,
       warnOnRelayFailure: options.dev,
     },

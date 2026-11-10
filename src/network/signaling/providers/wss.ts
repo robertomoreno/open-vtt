@@ -14,6 +14,6 @@ export async function createWssPlan(
     base: { appId: SIGNALING_APP_ID, maxReceiveBytes: AUDIO_TRANSFER_BYTES },
     relayConfig: { urls: config.urls },
     allowsLoopbackCandidateFallback:
-      options.dev && config.urls.every(isLoopbackUrl),
+      options.dev && config.urls.length > 0 && config.urls.every(isLoopbackUrl),
   };
 }

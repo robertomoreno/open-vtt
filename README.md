@@ -50,7 +50,7 @@ A room closes when its participants leave. The host tab no longer owns all live 
 
 ### Testing peer connections locally
 
-Development and Playwright use the bundled loopback WSS relay by default, so no public signaling service is contacted:
+Development and Playwright use the bundled loopback WSS relay by default, so no public signaling service is contacted (except the opt-in `npm run test:e2e:nostr` gate):
 
 ```sh
 npm run signal:start   # terminal 1 (127.0.0.1:4444)
@@ -66,7 +66,7 @@ localStorage.setItem('gather:dev:signaling', 'ws://127.0.0.1:4444');
 location.reload();
 ```
 
-When every configured signaling URL is loopback, the app also rewrites browsers' mDNS-obfuscated `.local` host candidates to `127.0.0.1` for that room. Some macOS/browser configurations cannot resolve those candidates across processes, which otherwise leaves ICE stuck at `checking`/`failed` even though signaling works. This fallback is dev-only and only valid because loopback signaling means every peer is on the same machine; it is **not** TURN and does not make remote peers or NAT traversal work.
+When every configured signaling URL is loopback for the `wss` provider, the app also rewrites browsers' mDNS-obfuscated `.local` host candidates to `127.0.0.1` for that room. Some macOS/browser configurations cannot resolve those candidates across processes, which otherwise leaves ICE stuck at `checking`/`failed` even though signaling works. This fallback is dev-only and only valid because loopback signaling means every peer is on the same machine; it is **not** TURN and does not make remote peers or NAT traversal work.
 
 If ICE still fails, check the browser's macOS Local Network and incoming-connections permissions; a firewall-blocked browser cannot receive WebRTC traffic. Firefox in particular may be blocked by the application firewall even when Chromium works.
 
@@ -81,15 +81,15 @@ Gather supports two signaling providers: `wss`, a y-webrtc-compatible WebSocket 
 | Variable | Values | Default |
 |---|---|---|
 | `VITE_GATHER_SIGNALING_PROVIDER` | `wss` or `nostr` | `nostr` in production; `wss` in development and Playwright |
-| `VITE_GATHER_SIGNALING_URLS` | Comma-separated relay URLs | None; the development `wss` default is `ws://127.0.0.1:4444` |
+| `VITE_GATHER_SIGNALING_URLS` | Comma-separated relay URLs | None (Trystero's public Nostr relays for `nostr`); the development `wss` default is `ws://127.0.0.1:4444` |
 | `VITE_GATHER_SIGNALING_REDUNDANCY` | Integer 1–8, `nostr` only; used when no URL list is supplied | `8` |
 
 - `VITE_GATHER_SIGNALING_URLS` without a provider implies `wss` for backward compatibility.
 - A production `wss` configuration requires explicit URLs; there is no public y-webrtc fallback and no implicit endpoint.
 - `wss` accepts 1–4 URLs. Development also accepts `ws://` URLs; URLs with credentials, query strings, or fragments are rejected.
 - `VITE_GATHER_SIGNALING_REDUNDANCY` applies only to `nostr` and is rejected for `wss`. When no URL list is supplied it selects how many of the default relays receive an announcement: an integer from 1 to 8 (default 8). When `VITE_GATHER_SIGNALING_URLS` lists 1–8 relays, every listed relay is used and `redundancy` does not limit them.
-- Invalid configuration stops startup with an error. Gather never silently falls back to another provider or endpoint.
-- In development only, `localStorage['gather:dev:signaling']` overrides the environment and accepts a JSON object (`{"provider":"wss","urls":"ws://127.0.0.1:4444"}`) or the legacy comma-separated WSS URL list. It is ignored in production.
+- Invalid configuration stops startup with an error naming the invalid field; check the browser console for it. Gather never silently falls back to another provider or endpoint.
+- In development only, `localStorage['gather:dev:signaling']` overrides the environment and accepts a JSON object (`{"provider":"wss","urls":["wss://relay.example"]}`) or the legacy comma-separated WSS URL list. It is ignored in production.
 
 Nostr-only production build:
 
