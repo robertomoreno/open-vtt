@@ -12,7 +12,7 @@ npm run signal:start   # terminal 1: local signaling relay
 npm run dev            # terminal 2
 ```
 
-Open **http://localhost:5173**. The dev server binds only to localhost with a strict port. `file://` is unsupported. Development defaults to the bundled loopback relay; set `VITE_GATHER_SIGNALING_URLS` to use another relay. Production builds default to the public WSS endpoint unless configured. Each remote participant runs their own copy or opens a static HTTPS deployment; a link containing your `localhost` does not expose your computer to friends.
+Open **http://localhost:5173**. The dev server binds only to localhost with a strict port. `file://` is unsupported. Development defaults to the bundled loopback WSS relay; production builds default to public Nostr relays with eight-relay redundancy. All participants in a room must use the same signaling provider configuration. Each remote participant runs their own copy or opens a static HTTPS deployment; a link containing your `localhost` does not expose your computer to friends.
 
 ```sh
 npm run typecheck
@@ -22,7 +22,7 @@ npx playwright install chromium firefox webkit
 npm run test:e2e
 ```
 
-`npm run test:e2e` starts the local relay and a dedicated dev server on port 5174 with local signaling; it does not contact the public endpoint. `dist/` contains the production static files. Serve them over HTTPS; no application server is needed. The current desktop Chrome, Firefox, Edge, and Safari are the compatibility targets. Feature detection explains unavailable APIs rather than crashing.
+`npm run test:e2e` starts the local relay and a dedicated dev server on port 5174 with local signaling; it does not contact public relays. `npm run test:e2e:nostr` is the opt-in real-browser gate for the production default: it starts the same dedicated dev server configured for `nostr` (no local relay) and exercises public relays. It passed on 2026-11-10 for Chromium↔WebKit in both directions; see `docs/superpowers/debugging/2026-11-10-nostr-provider-gate.md`. `dist/` contains the production static files. Serve them over HTTPS; no application server is needed. The current desktop Chrome, Firefox, Edge, and Safari are the compatibility targets. Feature detection explains unavailable APIs rather than crashing.
 
 ## Save and restore
 
@@ -50,29 +50,62 @@ A room closes when its participants leave. The host tab no longer owns all live 
 
 ### Testing peer connections locally
 
-Development uses the bundled loopback relay by default, so no public signaling server is contacted:
+Development and Playwright use the bundled loopback WSS relay by default, so no public signaling service is contacted (except the opt-in `npm run test:e2e:nostr` gate):
 
 ```sh
 npm run signal:start   # terminal 1 (127.0.0.1:4444)
 npm run dev            # terminal 2
 ```
 
-Open a second tab or browser and join the room link. Production builds require `wss://` and default to the public endpoint.
+Open a second tab or browser and join the room link.
 
-To use a different dev relay, set `VITE_GATHER_SIGNALING_URLS` (loopback `ws://` endpoints are allowed in dev) or persist it in browser storage:
+To use a different dev relay, set `VITE_GATHER_SIGNALING_URLS` (loopback `ws://` endpoints are allowed in development) or persist an override in browser storage:
 
 ```js
 localStorage.setItem('gather:dev:signaling', 'ws://127.0.0.1:4444');
 location.reload();
 ```
 
-When every configured signaling URL is loopback, the app also rewrites browsers' mDNS-obfuscated `.local` host candidates to `127.0.0.1` for that room. Some macOS/browser configurations cannot resolve those candidates across processes, which otherwise leaves ICE stuck at `checking`/`failed` even though signaling works. This fallback is dev-only and only valid because loopback signaling means every peer is on the same machine; it is **not** TURN and does not make remote peers or NAT traversal work.
+When every configured signaling URL is loopback for the `wss` provider, the app also rewrites browsers' mDNS-obfuscated `.local` host candidates to `127.0.0.1` for that room. Some macOS/browser configurations cannot resolve those candidates across processes, which otherwise leaves ICE stuck at `checking`/`failed` even though signaling works. This fallback is dev-only and only valid because loopback signaling means every peer is on the same machine; it is **not** TURN and does not make remote peers or NAT traversal work.
 
 If ICE still fails, check the browser's macOS Local Network and incoming-connections permissions; a firewall-blocked browser cannot receive WebRTC traffic. Firefox in particular may be blocked by the application firewall even when Chromium works.
 
 If a connection fails, the table status now shows the transport error (for example, failed ICE or a room-password mismatch) instead of only “Waiting for connection.”
 
 Stop the relay with `npm run signal:stop`.
+
+### Signaling configuration
+
+Gather supports two signaling providers: `wss`, a y-webrtc-compatible WebSocket relay, and `nostr`, public Nostr relays. The room link does not carry a provider hint, so every participant must use the same provider configuration.
+
+| Variable | Values | Default |
+|---|---|---|
+| `VITE_GATHER_SIGNALING_PROVIDER` | `wss` or `nostr` | `nostr` in production; `wss` in development and Playwright |
+| `VITE_GATHER_SIGNALING_URLS` | Comma-separated relay URLs | None (Trystero's public Nostr relays for `nostr`); the development `wss` default is `ws://127.0.0.1:4444` |
+| `VITE_GATHER_SIGNALING_REDUNDANCY` | Integer 1–8, `nostr` only; used when no URL list is supplied | `8` |
+
+- `VITE_GATHER_SIGNALING_URLS` without a provider implies `wss` for backward compatibility.
+- A production `wss` configuration requires explicit URLs; there is no public y-webrtc fallback and no implicit endpoint.
+- `wss` accepts 1–4 URLs. Development also accepts `ws://` URLs; URLs with credentials, query strings, or fragments are rejected.
+- `VITE_GATHER_SIGNALING_REDUNDANCY` applies only to `nostr` and is rejected for `wss`. When no URL list is supplied it selects how many of the default relays receive an announcement: an integer from 1 to 8 (default 8). When `VITE_GATHER_SIGNALING_URLS` lists 1–8 relays, every listed relay is used and `redundancy` does not limit them.
+- Invalid configuration stops startup with an error naming the invalid field; check the browser console for it. Gather never silently falls back to another provider or endpoint.
+- In development only, `localStorage['gather:dev:signaling']` overrides the environment and accepts a JSON object (`{"provider":"wss","urls":["wss://relay.example"]}`) or the legacy comma-separated WSS URL list. It is ignored in production.
+
+Nostr-only production build:
+
+```bash
+VITE_GATHER_SIGNALING_PROVIDER=nostr \
+VITE_GATHER_SIGNALING_REDUNDANCY=8 \
+npm run build
+```
+
+Self-hosted WSS production build:
+
+```bash
+VITE_GATHER_SIGNALING_PROVIDER=wss \
+VITE_GATHER_SIGNALING_URLS=wss://relay.example \
+npm run build
+```
 
 ### Conflict and reconciliation rules
 
@@ -114,9 +147,13 @@ Audio is shared with every room participant and has no encryption beyond the tra
 - `stun:stun.l.google.com:19302`
 - `stun:stun1.l.google.com:19302`
 
-STUN discovers network addresses; it does **not** relay game data. The service sees discovery traffic, including your public address. Production signaling uses the configured WSS endpoint (`wss://y-webrtc-eu.fly.dev` by default); development and browser tests use the bundled loopback relay and do not contact it. Signaling exchanges room metadata only; it does not store gameplay state. WebRTC offer/reply links contain network details and temporary connection credentials. Use trusted sharing channels. Long links can be truncated by messengers; the share panel keeps the full link as selectable text, and an incomplete link can be pasted into the address bar. Consumed incoming fragments are removed from the current address bar, but Gather cannot erase a messenger’s storage or promise control of browser history. SDP/ICE is never saved with a game or logged by the application.
+STUN discovers network addresses; it does **not** relay game data. The service sees discovery traffic, including your public address.
 
-No TURN relay is configured. Corporate firewalls, restrictive NAT, or incompatible network policies can make direct connections impossible. Same-machine tests do not prove connectivity between homes.
+Production signaling defaults to public Nostr relays with eight-relay redundancy; development and the default browser tests use the bundled loopback WSS relay and do not contact public relays (the opt-in `npm run test:e2e:nostr` gate does). Nostr relays see participants' IP addresses, a random per-page public key, ephemeral event kinds, a hashed room topic, timing, and payload lengths. SDP/ICE is encrypted with the room secret, and announcements contain a peer ID. Public relays have no SLA and can rate-limit, block ephemeral event kinds, or disappear. All participants in a room must use the same provider configuration; the room link does not carry a provider. Signaling exchanges room metadata only; it does not store gameplay state.
+
+WebRTC offer/reply links contain network details and temporary connection credentials. Use trusted sharing channels. Long links can be truncated by messengers; the share panel keeps the full link as selectable text, and an incomplete link can be pasted into the address bar. Consumed incoming fragments are removed from the current address bar, but Gather cannot erase a messenger’s storage or promise control of browser history. SDP/ICE is never saved with a game or logged by the application.
+
+No TURN relay is configured. Public signaling does not make restrictive networks connect. Corporate firewalls, restrictive NAT, or incompatible network policies can make direct connections impossible. Same-machine tests do not prove connectivity between homes.
 
 Games support **32 players**, **100 recent rolls**, and one die per request (d4/d6/d8/d10/d12/d20/d100; default d20). The host supports at most 31 remote peers / 8 unapproved peers. Incoming requests have a 20-message burst and 10/second refill per peer. Accepted roll IDs remain deduplicated for that connection; after 4,096 accepted requests, reconnect to roll more. A flooding peer is closed independently. Frames are bounded to 16 KiB, reassembled messages to 2 MiB / 256 fragments, 4 incomplete transfers per peer within 10 seconds, and 16 MiB of pending inbound data per connection; outgoing buffering is limited to 1 MiB. Game files are capped at 1 MiB and portable backups at 4 MiB. The music library accepts files up to **10 MiB** and **4 hours** each, with a **12 MiB room audio payload ceiling**, at most **200 active tracks** and **200 tombstones** per game, a **64 KiB metadata budget**, and the newest **100 playback commands of at most 1 KiB each**; the 16 MiB pending-inbound and 2 MiB reassembled-message bounds are unchanged. History, causal operations, and chat retention (see **Shared rooms**) have finite bounds; the transient synchronization stage holds at most 1.75 MiB, and oversized backups are rejected.
 
@@ -124,21 +161,22 @@ Games support **32 players**, **100 recent rolls**, and one die per request (d4/
 
 Current desktop Chrome, Firefox, Edge, and Safari are the compatibility targets. Feature detection explains unavailable APIs rather than crashing.
 
-### Local relay run (2026-11-10, macOS)
+### Local relay and Nostr gate runs (2026-11-09/10, macOS)
 
 - Development and `npm run test:e2e` use the bundled loopback relay; no public signaling server is contacted.
+- The opt-in `npm run test:e2e:nostr` gate (public relays, no local relay) passed for Chromium↔WebKit in both directions on 2026-11-10: discovery through public Nostr relays opened native channels, 1.5 MB values matched byte-for-byte, delivery continued after the relay sockets were closed, and teardown succeeded. Two public relays were unreachable (one DNS, one HTTP 502) without blocking discovery; no event-kind rejection or rate limiting was observed. See `docs/superpowers/debugging/2026-11-10-nostr-provider-gate.md`.
 - The local shared-room connection suite passes for Chromium↔Chromium and both Chromium/WebKit cross directions (run 2026-11-09; Chromium↔Chromium and Chromium↔WebKit rechecked 2026-11-10): room synchronization, claims, rolls, leave/rejoin, and download. WebKit↔WebKit passed in an earlier run but can flake at the player-claim step; that is a game-UI timing race, not a signaling failure.
 - The shared-audio acceptance suite passes in headless Chromium: a >2 MiB WAV upload, holder fallback after the uploader leaves, same-browser persistence, shared play/seek/gain, and private device volume. Playwright launches Chromium with `--mute-audio`, so these tests assert media state and the shared playhead, not audible output.
 - The chat, games, and reconciliation suites also passed in Chromium on 2026-11-10.
 - Firefox directions fail on this runner because the macOS Application Firewall blocks incoming connections for the Playwright Firefox helper. Allow Firefox in System Settings → Network → Firewall to test it, or use Chromium/WebKit locally. This is an environment limitation, not a signaling-code failure.
-- Public-WSS and cross-network behavior remain unverified; the 2026-11-04 record below was blocked by public endpoint reachability.
+- Public Nostr relays work from this runner, but cross-network behavior, branded Chrome/Edge/Firefox/Safari, and shipping Safari remain unverified; same-machine tests do not prove NAT traversal. WebKit automation is not shipping Safari.
 
 ### Previous public-endpoint run (2026-11-04, macOS, Playwright current)
 
 - **312 unit/DOM tests passed**, with successful type checking and production build.
 - **`npm run test:e2e`: 16 passed, 14 failed.** The full browser gate is **not green**.
 - Non-connection browser tests pass in Chromium, Firefox, and WebKit: game creation, refresh/restore, portable file roundtrip, invalid/canceled imports, denied storage, missing WebRTC feedback, responsive layout, and keyboard roll.
-- Shared-room connection tests fail because the public signaling endpoint (`wss://y-webrtc-eu.fly.dev`) is unreachable from this runner; `npm run check:signaling` reports `could not connect`. These failures are environmental traversal/service limitations, not observed application assertion failures, but they are not proof of compatibility.
+- Shared-room connection tests fail because the public signaling endpoint was unreachable from this runner; `npm run check:signaling` reports `could not connect`. These failures are environmental traversal/service limitations, not observed application assertion failures, but they are not proof of compatibility.
 - Reconciliation browser tests fail for the same signaling reason.
 - Real Safari/Chrome, branded Edge/Firefox, and different-home-network smoke tests remain explicitly unrun.
 
@@ -148,7 +186,7 @@ WebKit automation is **not proof of shipping Safari behavior**, and Chromium aut
 
 - `src/game/`: durable schema, validation, immutable operations, chat records and audiences (`chat.ts`), causal reconciliation, unbiased Web Crypto dice.
 - `src/storage/`: IndexedDB-backed browser records, identity hints, validated JSON files, recovery copies.
-- `src/network/`: room links, bounded framing, native WebRTC lifecycle, public signaling/STUN configuration, shared size limits; no game rules/DOM.
+- `src/network/`: room links, bounded framing, native WebRTC lifecycle, signaling provider/STUN configuration, shared size limits; no game rules/DOM.
 - `src/session/`: causal peer session, membership, tenure, claims, request validation, chat and live-image staging, audio metadata/transfer orchestration, presence, snapshots; no storage/DOM.
 - `src/ui/`: replaceable views and application wiring, including in-browser chat image preparation (`image.ts`), the persistent music controller (`audio.ts`), and the provisional music panel (`music.ts`). The game-room layout is intentionally provisional.
 

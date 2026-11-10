@@ -13,6 +13,7 @@
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
     "test:e2e": "playwright test",
+    "test:e2e:nostr": "playwright test -c playwright.nostr.config.ts",
     "check:signaling": "node scripts/check-signaling.mjs",
     "signal:start": "node scripts/signaling-server.mjs",
     "signal:stop": "node scripts/signal-stop.mjs"
@@ -30,6 +31,7 @@
   },
   "dependencies": {
     "@trystero-p2p/core": "0.26.0",
+    "@trystero-p2p/nostr": "0.26.0",
     "yjs": "13.6.33"
   }
 }
