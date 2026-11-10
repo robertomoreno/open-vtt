@@ -13,6 +13,7 @@
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
     "test:e2e": "playwright test",
+    "test:e2e:nostr": "playwright test -c playwright.nostr.config.ts",
     "check:signaling": "node scripts/check-signaling.mjs",
     "signal:start": "node scripts/signaling-server.mjs",
     "signal:stop": "node scripts/signal-stop.mjs"

@@ -22,7 +22,7 @@ npx playwright install chromium firefox webkit
 npm run test:e2e
 ```
 
-`npm run test:e2e` starts the local relay and a dedicated dev server on port 5174 with local signaling; it does not contact public relays. `dist/` contains the production static files. Serve them over HTTPS; no application server is needed. The current desktop Chrome, Firefox, Edge, and Safari are the compatibility targets. Feature detection explains unavailable APIs rather than crashing.
+`npm run test:e2e` starts the local relay and a dedicated dev server on port 5174 with local signaling; it does not contact public relays. `npm run test:e2e:nostr` is the opt-in real-browser gate for the production default: it starts the same dedicated dev server configured for `nostr` (no local relay) and exercises public relays. It passed on 2026-11-10 for Chromium↔WebKit in both directions; see `docs/superpowers/debugging/2026-11-10-nostr-provider-gate.md`. `dist/` contains the production static files. Serve them over HTTPS; no application server is needed. The current desktop Chrome, Firefox, Edge, and Safari are the compatibility targets. Feature detection explains unavailable APIs rather than crashing.
 
 ## Save and restore
 
@@ -135,7 +135,7 @@ One message carries at most 2,000 characters and one image. Chat retains the new
 
 STUN discovers network addresses; it does **not** relay game data. The service sees discovery traffic, including your public address.
 
-Production signaling defaults to public Nostr relays with eight-relay redundancy; development and browser tests use the bundled loopback WSS relay and do not contact public relays. Nostr relays see participants' IP addresses, a random per-page public key, ephemeral event kinds, a hashed room topic, timing, and payload lengths. SDP/ICE is encrypted with the room secret, and announcements contain a peer ID. Public relays have no SLA and can rate-limit, block ephemeral event kinds, or disappear. All participants in a room must use the same provider configuration; the room link does not carry a provider. Signaling exchanges room metadata only; it does not store gameplay state.
+Production signaling defaults to public Nostr relays with eight-relay redundancy; development and the default browser tests use the bundled loopback WSS relay and do not contact public relays (the opt-in `npm run test:e2e:nostr` gate does). Nostr relays see participants' IP addresses, a random per-page public key, ephemeral event kinds, a hashed room topic, timing, and payload lengths. SDP/ICE is encrypted with the room secret, and announcements contain a peer ID. Public relays have no SLA and can rate-limit, block ephemeral event kinds, or disappear. All participants in a room must use the same provider configuration; the room link does not carry a provider. Signaling exchanges room metadata only; it does not store gameplay state.
 
 WebRTC offer/reply links contain network details and temporary connection credentials. Use trusted sharing channels. Long links can be truncated by messengers; the share panel keeps the full link as selectable text, and an incomplete link can be pasted into the address bar. Consumed incoming fragments are removed from the current address bar, but Gather cannot erase a messenger’s storage or promise control of browser history. SDP/ICE is never saved with a game or logged by the application.
 
@@ -147,12 +147,13 @@ Games support **32 players**, **100 recent rolls**, and one die per request (d4/
 
 Current desktop Chrome, Firefox, Edge, and Safari are the compatibility targets. Feature detection explains unavailable APIs rather than crashing.
 
-### Local relay run (2026-11-09, macOS)
+### Local relay and Nostr gate runs (2026-11-09/10, macOS)
 
 - Development and `npm run test:e2e` use the bundled loopback relay; no public signaling server is contacted.
+- The opt-in `npm run test:e2e:nostr` gate (public relays, no local relay) passed for Chromium↔WebKit in both directions on 2026-11-10: discovery through public Nostr relays opened native channels, 1.5 MB values matched byte-for-byte, delivery continued after the relay sockets were closed, and teardown succeeded. Two public relays were unreachable (one DNS, one HTTP 502) without blocking discovery; no event-kind rejection or rate limiting was observed. See `docs/superpowers/debugging/2026-11-10-nostr-provider-gate.md`.
 - The local shared-room connection suite passes for Chromium↔Chromium and both Chromium/WebKit cross directions: room synchronization, claims, rolls, leave/rejoin, and download. WebKit↔WebKit passed in an earlier run but can flake at the player-claim step; that is a game-UI timing race, not a signaling failure.
 - Firefox directions fail on this runner because the macOS Application Firewall blocks incoming connections for the Playwright Firefox helper. Allow Firefox in System Settings → Network → Firewall to test it, or use Chromium/WebKit locally. This is an environment limitation, not a signaling-code failure.
-- Public Nostr relay and cross-network behavior remain unverified; the 2026-11-04 record below was blocked by public endpoint reachability.
+- Public Nostr relays work from this runner, but cross-network behavior, branded Chrome/Edge/Firefox/Safari, and shipping Safari remain unverified; same-machine tests do not prove NAT traversal. WebKit automation is not shipping Safari.
 
 ### Previous public-endpoint run (2026-11-04, macOS, Playwright current)
 
