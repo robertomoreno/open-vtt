@@ -155,4 +155,60 @@ describe('session audio', () => {
     expect(readStagedAudio(stage).tracks.map(item => item.id).sort()).toEqual(workspace.getTracks().map(item => item.id).sort());
     expect(readStagedAudio(stage).tombstones.map(item => item.id)).toEqual([id(0)]);
   });
+
+  it('re-probes and re-anchors the applied playing command after a reconnect', async () => {
+    const { audio, stage, clock } = setup();
+    const t = track();
+    audio.setLocalPlayerId('alex');
+    audio.addTrack({ id: t.id, name: t.name, type: 'audio/mpeg', size: 1000, durationMs: 60_000 });
+    stage.transact(() => stage.getArray(STAGE_AUDIO_PLAYBACK).push([JSON.stringify({ id: 'c1', rev: 1, participantId: 'bea', trackId: t.id, playing: true, positionMs: 1000, at: AT })]));
+    const first = vi.fn(async () => ({ peerId: 'bea', position: { trackId: t.id, playing: true, positionMs: 5000 }, rttMs: 200 }));
+    audio.setTransport(transport({ requestPosition: first }));
+    audio.sync();
+    await vi.waitFor(() => expect(audio.getView().resyncPending).toBe(false));
+    expect(audio.getView().positionMs).toBe(5100);
+
+    clock.at = 1000;
+    audio.setTransport(null);
+    const second = vi.fn(async () => ({ peerId: 'bea', position: { trackId: t.id, playing: true, positionMs: 9000 }, rttMs: 100 }));
+    audio.setTransport(transport({ requestPosition: second }));
+    audio.sync();
+    await vi.waitFor(() => expect(second).toHaveBeenCalled());
+    await vi.waitFor(() => expect(audio.getView().resyncPending).toBe(false));
+    expect(audio.getView().positionMs).toBe(9050);
+    expect(audio.getView().startedAt).toBe(clock.at + 500);
+    expect(audio.getView().approximate).toBe(false);
+  });
+
+  it('does not treat a command after an empty first sync as a late join', () => {
+    const { audio, stage, clock } = setup();
+    const t = track();
+    audio.setLocalPlayerId('alex');
+    audio.addTrack({ id: t.id, name: t.name, type: 'audio/mpeg', size: 1000, durationMs: 60_000 });
+    const requestPosition = vi.fn(async () => null);
+    audio.setTransport(transport({ requestPosition }));
+    audio.sync();
+    stage.transact(() => stage.getArray(STAGE_AUDIO_PLAYBACK).push([JSON.stringify({ id: 'c1', rev: 1, participantId: 'bea', trackId: t.id, playing: true, positionMs: 2000, at: AT })]));
+    audio.sync();
+    expect(requestPosition).not.toHaveBeenCalled();
+    expect(audio.getView().resyncPending).toBe(false);
+    expect(audio.getView().playing).toBe(true);
+    expect(audio.getView().positionMs).toBe(2000);
+    expect(audio.getView().startedAt).toBe(clock.at + 500);
+  });
+
+  it('restarts an ended track from zero when play is pressed', () => {
+    const { audio, stage } = setup();
+    const t = track();
+    audio.setLocalPlayerId('alex');
+    audio.addTrack({ id: t.id, name: t.name, type: 'audio/mpeg', size: 1000, durationMs: 60_000 });
+    stage.transact(() => stage.getArray(STAGE_AUDIO_PLAYBACK).push([JSON.stringify({ id: 'c-end', rev: 1, participantId: 'bea', trackId: t.id, playing: false, positionMs: 60_000, at: AT })]));
+    audio.setTransport(transport());
+    audio.sync();
+    expect(audio.getView().positionMs).toBe(60_000);
+
+    audio.playTrack();
+    const commands = [...stage.getArray(STAGE_AUDIO_PLAYBACK)].map(value => JSON.parse(value as string));
+    expect(commands.at(-1)).toMatchObject({ playing: true, positionMs: 0 });
+  });
 });

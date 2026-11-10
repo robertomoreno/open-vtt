@@ -306,10 +306,15 @@ export function createAudioSession(options: AudioSessionOptions): AudioSession {
     approximate = false;
     resync = null;
     resyncPending = false;
-    const token = ++resyncToken;
+    resyncToken++;
     if (!requestPosition || !command.playing || command.participantId === participantId) return;
-    // First sync after connecting: derive a best-effort anchor now, then refine it from
-    // the command issuer (or another holder) once the probe answers.
+    startProbe(command);
+  }
+
+  /** Requests the room's current position and re-anchors when the answer is still current. */
+  function startProbe(command: PlaybackCommand): void {
+    const token = ++resyncToken;
+    // Until an answer arrives the current anchor is only best effort.
     approximate = true;
     resyncPending = true;
     resync = { token, command };
@@ -318,11 +323,19 @@ export function createAudioSession(options: AudioSessionOptions): AudioSession {
 
   function syncPlayback(): void {
     const latest = latestPlaybackCommand(readPlaybackCommands(stage));
-    if (latest === null) return;
-    if (currentCommand === null || comparePlaybackCommands(latest, currentCommand) > 0) {
-      applyCommand(latest, pendingJoin);
-    }
+    // The first connected sync consumes the join marker even when no command exists yet,
+    // so a later ordinary command is not mistaken for a late join.
+    const joining = pendingJoin;
     pendingJoin = false;
+    if (latest === null) return;
+    const applied = currentCommand !== null && comparePlaybackCommands(latest, currentCommand) <= 0;
+    if (!applied) {
+      applyCommand(latest, joining);
+      return;
+    }
+    // Reconnect: the same playing command is already applied locally, but this peer may
+    // have missed playback while disconnected. Re-anchor from the room again.
+    if (joining && latest.playing && comparePlaybackCommands(latest, currentCommand!) === 0) startProbe(latest);
   }
 
   function sync(): void {
@@ -461,13 +474,22 @@ export function createAudioSession(options: AudioSessionOptions): AudioSession {
       if (previous !== undefined && previous !== next?.audio) {
         try { previous.setHandlers({}); } catch { /* the old transport may be closed */ }
       }
-      // Any transport replacement starts a fresh connection tenure: the next sync decides
-      // whether this is a late join that needs a position request.
+      // Any transport replacement starts a fresh connection tenure and invalidates an
+      // in-flight probe: a response from the old connection must not re-anchor this one.
       wasConnected = false;
       pendingJoin = false;
+      resync = null;
+      resyncPending = false;
+      resyncToken++;
       if (next !== null) {
-        try { unsubTransport = next.subscribe(() => { if (!destroyed) onDirty(); }); } catch { unsubTransport = null; }
-        registerHandlers();
+        try {
+          unsubTransport = next.subscribe(() => { if (!destroyed) onDirty(); });
+          registerHandlers();
+        } catch (error) {
+          unsubTransport?.();
+          unsubTransport = null;
+          onError(message(error, 'The audio transport could not be prepared.'));
+        }
       }
       onDirty();
     },
@@ -502,7 +524,11 @@ export function createAudioSession(options: AudioSessionOptions): AudioSession {
     playTrack() {
       transportCommand(() => {
         check(currentTrackId !== null, 'Choose a track first.');
-        issueCommand(currentTrackId, true, derivedPosition());
+        const trackId = currentTrackId;
+        const position = derivedPosition();
+        // An ended track restarts from the beginning instead of issuing a play command
+        // at the final sample (the playhead is clamped at the duration).
+        issueCommand(trackId, true, position >= durationOf(trackId) ? 0 : position);
       });
     },
 
