@@ -17,6 +17,13 @@ describe('signaling configuration', () => {
     expect(loadSignalingConfig(prod)).toEqual({ provider: 'nostr', redundancy: 8 });
   });
 
+  it('switches production to Nostr when the provider is explicitly selected', () => {
+    expect(loadSignalingConfig({ ...prod, provider: 'nostr' })).toEqual({
+      provider: 'nostr',
+      redundancy: 8,
+    });
+  });
+
   it('treats a URL-only production override as WSS for compatibility', () => {
     expect(loadSignalingConfig({ ...prod, urls: 'wss://relay.example' })).toEqual({
       provider: 'wss',

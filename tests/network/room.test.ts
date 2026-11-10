@@ -114,6 +114,23 @@ describe('room transport', () => {
     t.close();
   });
 
+  it('passes Nostr relay config and no loopback rewrite to the room', async () => {
+    stubBrowser();
+    const fake = fakeJoin();
+    const t = createRoomTransport(new Y.Doc(), link(), 'me', {
+      plan: plan(fake.join, {
+        id: 'nostr',
+        relayConfig: { redundancy: 8, warnOnRelayFailure: false },
+        allowsLoopbackCandidateFallback: false,
+      }),
+      native: { RTCPeerConnection: FakePc as any },
+    });
+    await vi.waitFor(() => expect(fake.state.room).toBeDefined());
+    expect(fake.state.configs[0].relayConfig).toEqual({ redundancy: 8, warnOnRelayFailure: false });
+    expect(fake.state.configs[0]._test_only_mdnsHostFallbackToLoopback).toBeUndefined();
+    t.close();
+  });
+
   it('sends the full state only to a joining peer and later updates to every connected peer except their origin', async () => {
     const doc = new Y.Doc();
     doc.getMap('m').set('before', 1);

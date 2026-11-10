@@ -30,6 +30,7 @@
   },
   "dependencies": {
     "@trystero-p2p/core": "0.26.0",
+    "@trystero-p2p/nostr": "0.26.0",
     "yjs": "13.6.33"
   }
 }
