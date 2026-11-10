@@ -3,7 +3,8 @@ import * as Y from 'yjs';
 import { createAudioTrack } from '../../src/game/audio';
 import { createTestWorkspace } from '../helpers/workspace';
 import { createAudioSession } from '../../src/session/audio';
-import { STAGE_AUDIO, STAGE_AUDIO_PLAYBACK, STAGE_AUDIO_TOMBSTONES } from '../../src/session/workspace-bridge';
+import { STAGE_AUDIO, STAGE_AUDIO_PLAYBACK, STAGE_AUDIO_TOMBSTONES, readStagedAudio } from '../../src/session/workspace-bridge';
+import { AUDIO_TRACKS } from '../../src/network/limits';
 import type { RoomTransport } from '../../src/network/room';
 
 const AT = '2026-11-10T10:00:00.000Z';
@@ -130,5 +131,28 @@ describe('session audio', () => {
     expect(onTrack).toHaveBeenCalledTimes(1);
     audio.setTransport(null);
     expect(audio.getView().connected).toBe(false);
+  });
+
+  it('keeps an over-cap staged track available to roomier peers and warns once', () => {
+    const { audio, workspace, stage, errors } = setup();
+    audio.setLocalPlayerId('alex');
+    const id = (n: number) => String(n).padStart(64, '0');
+    for (let n = 0; n < AUDIO_TRACKS; n++) {
+      workspace.addTrack(createAudioTrack({ id: id(n), name: `t${n}`, type: 'audio/mpeg', size: 1, durationMs: 1 }, 'alex', AT));
+    }
+    const extra = createAudioTrack({ id: 'e'.repeat(64), name: '0-extra.mp3', type: 'audio/mpeg', size: 1, durationMs: 1000 }, 'alex', AT);
+    stage.transact(() => stage.getMap(STAGE_AUDIO).set(extra.id, JSON.stringify(extra)));
+
+    expect(() => { audio.sync(); audio.sync(); }).not.toThrow();
+    expect(workspace.getTracks()).toHaveLength(AUDIO_TRACKS);
+    expect(readStagedAudio(stage).tracks.some(item => item.id === extra.id)).toBe(true);
+    expect(errors.filter(message => /full/i.test(message))).toHaveLength(1);
+
+    audio.removeTrack(id(0));
+    audio.sync();
+    expect(workspace.getTracks()).toHaveLength(AUDIO_TRACKS);
+    expect(workspace.getTracks().some(item => item.id === extra.id)).toBe(true);
+    expect(readStagedAudio(stage).tracks.map(item => item.id).sort()).toEqual(workspace.getTracks().map(item => item.id).sort());
+    expect(readStagedAudio(stage).tombstones.map(item => item.id)).toEqual([id(0)]);
   });
 });

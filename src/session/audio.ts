@@ -138,6 +138,11 @@ export function createAudioSession(options: AudioSessionOptions): AudioSession {
   let wasConnected = false;
   let pendingJoin = false;
 
+  // True while a local bound prevents at least one valid staged record from merging.
+  // The warning is surfaced on the complete → blocked transition only, and cleared
+  // once a later merge proves the library fits again.
+  let libraryBlocked = false;
+
   function connected(): boolean {
     if (destroyed || transport === null) return false;
     const view = transport.getView();
@@ -168,14 +173,16 @@ export function createAudioSession(options: AudioSessionOptions): AudioSession {
   /**
    * An overflow in the staged/durable audio window is not a data-validity problem: the
    * durable library wins, and staged records that do not fit are skipped (tombstones first,
-   * because they always win). The stage is pruned afterwards, so the warning is reported once.
+   * because they always win). Returns true when at least one valid staged record was
+   * skipped for local capacity, so the caller can leave it staged for roomier peers.
    */
-  function salvageLibrary(tracks: readonly AudioTrack[], tombstones: readonly AudioTombstone[]): void {
+  function salvageLibrary(tracks: readonly AudioTrack[], tombstones: readonly AudioTombstone[]): boolean {
+    let lossy = false;
     try {
       workspace.mergeAudio([], tombstones);
     } catch {
       for (const tombstone of tombstones) {
-        try { workspace.mergeAudio([], [tombstone]); } catch { /* bound reached; skip */ }
+        try { workspace.mergeAudio([], [tombstone]); } catch { lossy = true; }
       }
     }
     const removed = new Set(workspace.getTombstones().map(tombstone => tombstone.id));
@@ -187,36 +194,45 @@ export function createAudioSession(options: AudioSessionOptions): AudioSession {
       const existing = simulated.get(incoming.id);
       const merged = existing === undefined ? incoming : mergeAudioTrack(existing, incoming);
       const nextBytes = bytes - (existing === undefined ? 0 : audioTrackBytes(existing)) + audioTrackBytes(merged);
-      if (simulated.size + (existing === undefined ? 1 : 0) > AUDIO_TRACKS) continue;
-      if (nextBytes > AUDIO_METADATA_BYTES) continue;
+      if (simulated.size + (existing === undefined ? 1 : 0) > AUDIO_TRACKS) { lossy = true; continue; }
+      if (nextBytes > AUDIO_METADATA_BYTES) { lossy = true; continue; }
       simulated.set(merged.id, merged);
       bytes = nextBytes;
       chosen.push(merged);
     }
-    if (chosen.length === 0) return;
-    try {
-      workspace.mergeAudio(chosen, []);
-    } catch {
-      for (const track of chosen) {
-        try { workspace.mergeAudio([track], []); } catch { /* bound reached; skip */ }
+    if (chosen.length > 0) {
+      try {
+        workspace.mergeAudio(chosen, []);
+      } catch {
+        for (const track of chosen) {
+          try { workspace.mergeAudio([track], []); } catch { lossy = true; }
+        }
       }
     }
+    return lossy;
   }
 
-  function mergeStagedAudio(tracks: readonly AudioTrack[], tombstones: readonly AudioTombstone[]): void {
+  /** Merges staged audio; returns true when a local bound skipped a valid staged record. */
+  function mergeStagedAudio(tracks: readonly AudioTrack[], tombstones: readonly AudioTombstone[]): boolean {
     try {
       workspace.mergeAudio(tracks, tombstones);
+      libraryBlocked = false;
+      return false;
     } catch {
-      onError('The shared audio library is full; some shared changes could not be merged.');
-      try { salvageLibrary(tracks, tombstones); } catch { /* keep the accepted library */ }
+      let lossy = true;
+      try { lossy = salvageLibrary(tracks, tombstones); } catch { /* keep the accepted library */ }
+      if (lossy && !libraryBlocked) onError('The shared audio library is full; some shared changes could not be merged.');
+      libraryBlocked = lossy;
+      return lossy;
     }
   }
 
-  function publishLibrary(): void {
+  function publishLibrary(prune: boolean): void {
     try {
       const tracks = workspace.getTracks(), tombstones = workspace.getTombstones();
       publishAudio(stage, tracks, tombstones);
-      pruneStagedAudio(stage, tracks, tombstones);
+      // Records skipped for local capacity stay staged: a roomier peer may accept them.
+      if (prune) pruneStagedAudio(stage, tracks, tombstones);
     } catch (error) {
       onError(message(error, 'The audio library could not be synchronized.'));
     }
@@ -231,11 +247,14 @@ export function createAudioSession(options: AudioSessionOptions): AudioSession {
 
   function syncLibrary(): void {
     const staged = readStagedAudio(stage);
+    let lossy = false;
     if (staged.tracks.length > 0 || staged.tombstones.length > 0) {
-      mergeStagedAudio(staged.tracks, staged.tombstones);
+      lossy = mergeStagedAudio(staged.tracks, staged.tombstones);
       reconcileTombstonedCurrent();
     }
-    publishLibrary();
+    // Never prune records this peer could not merge: another peer with room can still
+    // accept them. A complete merge is the only safe moment to shrink staging.
+    publishLibrary(!lossy);
     reconcileTombstonedCurrent();
   }
 
@@ -321,7 +340,9 @@ export function createAudioSession(options: AudioSessionOptions): AudioSession {
   }
 
   function emitLibraryChange(): void {
-    publishLibrary();
+    // A local edit publishes but never prunes while a local bound is blocking merge:
+    // the blocked records must stay visible to roomier peers until a sync succeeds.
+    publishLibrary(!libraryBlocked);
     onDirty();
   }
 
