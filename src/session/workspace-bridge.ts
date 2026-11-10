@@ -1,5 +1,9 @@
 import * as Y from 'yjs';
 import {
+  compareAudioTracks, validateAudioTrack, validateAudioTombstone, validatePlaybackCommand,
+  type AudioTrack, type AudioTombstone, type PlaybackCommand,
+} from '../game/audio';
+import {
   chatImageBytes, chatMessageBytes, sortChatRecords, trimChatImages, trimChatMessages,
   validateChatImage, validateChatMessage, type ChatImage, type ChatMessage,
 } from '../game/chat';
@@ -8,7 +12,10 @@ import type { GameHistory, GameOperation, WorkspaceSnapshot } from '../game/sync
 import type { Game, Role } from '../game/types';
 import { check, id, validateGame } from '../game/validation';
 import type { Workspace } from '../game/workspace';
-import { CHAT_RECORDS, CONTROL_BYTES, CONTROL_ENTRIES, ENCODED_OPERATION_BYTES, GAME_OPERATIONS, PENDING_ADMISSIONS } from '../network/limits';
+import {
+  AUDIO_COMMANDS, AUDIO_COMMAND_BYTES, CHAT_RECORDS, CONTROL_BYTES, CONTROL_ENTRIES,
+  ENCODED_OPERATION_BYTES, GAME_OPERATIONS, PENDING_ADMISSIONS,
+} from '../network/limits';
 import { validateMembershipEvent, type MembershipEvent } from './membership';
 
 /**
@@ -24,6 +31,9 @@ import { validateMembershipEvent, type MembershipEvent } from './membership';
  * - `gather.claims`: claim confirmations written only by the priority participant.
  * - `gather.chat`: durable chat text mirrored to peers, one canonical JSON key per message.
  * - `gather.chat-live`: live-only image payloads; they never reach the workspace or a save.
+ * - `gather.audio`: durable audio metadata mirrored to peers, one canonical JSON key per track.
+ * - `gather.audio-tombstones`: durable audio deletions mirrored to peers, keyed by track id.
+ * - `gather.audio-playback`: the bounded, live-only playback command log (never saved).
  *
  * Everything read back from staging is treated as malicious until validated: canonical
  * keys, normalized payloads, immutable IDs, allowed roots and size bounds are checked
@@ -35,6 +45,9 @@ export const STAGE_INTENTS = 'gather.intents';
 export const STAGE_CLAIMS = 'gather.claims';
 export const STAGE_CHAT = 'gather.chat';
 export const STAGE_CHAT_LIVE = 'gather.chat-live';
+export const STAGE_AUDIO = 'gather.audio';
+export const STAGE_AUDIO_TOMBSTONES = 'gather.audio-tombstones';
+export const STAGE_AUDIO_PLAYBACK = 'gather.audio-playback';
 
 const encoder = new TextEncoder();
 const MiB = 1024 * 1024;
@@ -383,6 +396,136 @@ export function removeLiveImage(stage: Y.Doc, imageId: string): void {
   stage.transact(() => map.delete(imageId));
 }
 
+/** Parses one staged audio track; malformed, noncanonical, or ID-mismatched records drop out. */
+function stagedAudioTrack(key: string, value: unknown): AudioTrack | null {
+  if (typeof value !== 'string') return null;
+  let parsed: unknown;
+  try { parsed = JSON.parse(value); } catch { return null; }
+  let track: AudioTrack;
+  try { track = validateAudioTrack(parsed); } catch { return null; }
+  return track.id === key && JSON.stringify(track) === value ? track : null;
+}
+
+/** Parses one staged audio tombstone; malformed, noncanonical, or ID-mismatched records drop out. */
+function stagedAudioTombstone(key: string, value: unknown): AudioTombstone | null {
+  if (typeof value !== 'string') return null;
+  let parsed: unknown;
+  try { parsed = JSON.parse(value); } catch { return null; }
+  let tombstone: AudioTombstone;
+  try { tombstone = validateAudioTombstone(parsed); } catch { return null; }
+  return tombstone.id === key && JSON.stringify(tombstone) === value ? tombstone : null;
+}
+
+/**
+ * Valid staged audio metadata, deterministically ordered. Invalid, noncanonical, or
+ * ID-rewritten records are skipped individually: one malicious record never hides the rest.
+ */
+export function readStagedAudio(stage: Y.Doc): { tracks: AudioTrack[]; tombstones: AudioTombstone[] } {
+  const tracks: AudioTrack[] = [];
+  for (const [key, value] of stage.getMap(STAGE_AUDIO)) {
+    const track = stagedAudioTrack(key, value);
+    if (track) tracks.push(track);
+  }
+  const tombstones: AudioTombstone[] = [];
+  for (const [key, value] of stage.getMap(STAGE_AUDIO_TOMBSTONES)) {
+    const tombstone = stagedAudioTombstone(key, value);
+    if (tombstone) tombstones.push(tombstone);
+  }
+  return {
+    tracks: tracks.sort(compareAudioTracks),
+    tombstones: tombstones.sort((a, b) => (a.id < b.id ? -1 : a.id > b.id ? 1 : 0)),
+  };
+}
+
+/**
+ * Mirrors canonical audio metadata into staging, writing only records that are missing or
+ * differ. Like chat, this runs on every session refresh, so a matching stage is left
+ * byte-for-byte untouched. On overflow only our own writes are rolled back and chat/images
+ * are pruned first by `shrinkTransientStage`; the accepted workspace is never touched.
+ */
+export function publishAudio(stage: Y.Doc, tracks: readonly AudioTrack[], tombstones: readonly AudioTombstone[]): void {
+  const changes: Array<{ map: Y.Map<unknown>; key: string; encoded: string; previous: string | undefined }> = [];
+  const addChange = (map: Y.Map<unknown>, key: string, encoded: string) => {
+    const previous = map.get(key);
+    if (previous === encoded) return;
+    changes.push({ map, key, encoded, previous: typeof previous === 'string' ? previous : undefined });
+  };
+  const audio = stage.getMap(STAGE_AUDIO);
+  for (const value of tracks) {
+    const track = validateAudioTrack(value);
+    addChange(audio, track.id, JSON.stringify(track));
+  }
+  const graves = stage.getMap(STAGE_AUDIO_TOMBSTONES);
+  for (const value of tombstones) {
+    const tombstone = validateAudioTombstone(value);
+    addChange(graves, tombstone.id, JSON.stringify(tombstone));
+  }
+  if (changes.length === 0) return;
+  stage.transact(() => { for (const change of changes) change.map.set(change.key, change.encoded); });
+  if (shrinkTransientStage(stage)) return;
+  stage.transact(() => {
+    for (const change of changes) {
+      if (!change.map.has(change.key)) continue;
+      if (change.previous === undefined) change.map.delete(change.key);
+      else change.map.set(change.key, change.previous);
+    }
+  });
+  check(false, LIMIT_MESSAGE);
+}
+
+/** Removes staged audio records outside the canonical keep sets; a matching stage is untouched. */
+export function pruneStagedAudio(stage: Y.Doc, tracks: readonly AudioTrack[], tombstones: readonly AudioTombstone[]): void {
+  const trackIds = new Set(tracks.map(value => validateAudioTrack(value).id));
+  const tombstoneIds = new Set(tombstones.map(value => validateAudioTombstone(value).id));
+  const audio = stage.getMap(STAGE_AUDIO);
+  const staleTracks = [...audio.keys()].filter(key => !trackIds.has(key));
+  const graves = stage.getMap(STAGE_AUDIO_TOMBSTONES);
+  const staleTombstones = [...graves.keys()].filter(key => !tombstoneIds.has(key));
+  if (staleTracks.length === 0 && staleTombstones.length === 0) return;
+  stage.transact(() => {
+    for (const key of staleTracks) audio.delete(key);
+    for (const key of staleTombstones) graves.delete(key);
+  });
+}
+
+/** Validates a playback command, reporting any rejection in the command's own vocabulary. */
+function stagePlaybackCommand(value: PlaybackCommand): PlaybackCommand {
+  try {
+    return validatePlaybackCommand(value);
+  } catch {
+    check(false, 'Invalid playback command.');
+  }
+}
+
+/**
+ * Appends one validated playback command to the bounded live-only log. Commands are
+ * transient events: only the newest `AUDIO_COMMANDS` are retained so a long session
+ * cannot grow the stage without bound. An oversized command is refused before any write.
+ */
+export function writePlaybackCommand(stage: Y.Doc, command: PlaybackCommand): void {
+  const encoded = JSON.stringify(stagePlaybackCommand(command));
+  check(encoder.encode(encoded).byteLength <= AUDIO_COMMAND_BYTES, 'Playback command exceeds the room limit.');
+  const array = stage.getArray(STAGE_AUDIO_PLAYBACK);
+  stage.transact(() => {
+    array.push([encoded]);
+    while (array.length > AUDIO_COMMANDS) array.delete(0, 1);
+  });
+}
+
+/** Valid playback commands in log order (oldest first); malformed entries are skipped. */
+export function readPlaybackCommands(stage: Y.Doc): PlaybackCommand[] {
+  const commands: PlaybackCommand[] = [];
+  for (const item of stage.getArray(STAGE_AUDIO_PLAYBACK).toArray()) {
+    if (typeof item !== 'string') continue;
+    let parsed: unknown;
+    try { parsed = JSON.parse(item); } catch { continue; }
+    let command: PlaybackCommand;
+    try { command = validatePlaybackCommand(parsed); } catch { continue; }
+    if (JSON.stringify(command) === item) commands.push(command);
+  }
+  return commands.slice(-AUDIO_COMMANDS);
+}
+
 export function createWorkspaceBridge(stage: Y.Doc, workspace: Workspace): WorkspaceBridge {
   let destroyed = false;
   const ensureOpen = () => check(!destroyed, 'Bridge is closed.');
@@ -533,7 +676,8 @@ export function writeClaimConfirmation(stage: Y.Doc, confirmation: ClaimConfirma
 
 /**
  * Clears intents and claim confirmations; they are per-connection and must never replay.
- * Staged chat and live images survive a reconnect within the same session.
+ * Staged chat, live images, audio metadata, and the playback log survive a reconnect
+ * within the same session.
  */
 export function clearTransientStage(stage: Y.Doc): void {
   stage.transact(() => {

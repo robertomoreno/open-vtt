@@ -1,27 +1,34 @@
 import { describe, expect, it } from 'vitest';
 import * as Y from 'yjs';
+import { createAudioTrack, validatePlaybackCommand } from '../../src/game/audio';
 import type { ChatImage, ChatMessage } from '../../src/game/chat';
 import type { GameHistory, GameOperation } from '../../src/game/sync-types';
 import type { Game, Runtime } from '../../src/game/types';
 import { validateOperation } from '../../src/game/history';
 import { ValidationError } from '../../src/game/validation';
 import { createWorkspace, type Workspace } from '../../src/game/workspace';
-import { CONTROL_ENTRIES, GAME_OPERATIONS, MISSING_DEPENDENCY_OPERATIONS } from '../../src/network/limits';
+import { AUDIO_COMMANDS, AUDIO_COMMAND_BYTES, CONTROL_ENTRIES, GAME_OPERATIONS, MISSING_DEPENDENCY_OPERATIONS } from '../../src/network/limits';
 import {
+  STAGE_AUDIO,
   STAGE_CHAT,
   STAGE_CONTROL,
   STAGE_ENTRIES,
   clearTransientStage,
   createWorkspaceBridge,
+  pruneStagedAudio,
   pruneStagedChat,
+  publishAudio,
   publishChat,
   readControlEvents,
   readLiveImages,
+  readPlaybackCommands,
+  readStagedAudio,
   readStagedChat,
   readStagedHistory,
   snapshotFromHistory,
   writeControlEvent,
   writeLiveImage,
+  writePlaybackCommand,
 } from '../../src/session/workspace-bridge';
 import type { MembershipEvent } from '../../src/session/membership';
 import { createTestWorkspace, fixtureRoster, namedRuntime } from '../helpers/workspace';
@@ -304,5 +311,52 @@ describe('staged chat', () => {
     const seedKey = JSON.stringify([seed, ws.getHistory().seeds[seed]]);
     expect(() => bridge.publish(ws.getHistory())).toThrow(/Room data limit/);
     expect(stage.getMap(STAGE_ENTRIES).has(seedKey)).toBe(false);
+  });
+});
+
+describe('staged audio', () => {
+  it('round-trips active tracks and tombstones and skips malformed records', () => {
+    const { stage } = setup();
+    const t = createAudioTrack({ id: 'a'.repeat(64), name: 'Theme.mp3', type: 'audio/mpeg', size: 1000, durationMs: 60_000 }, 'alex', AT);
+    publishAudio(stage, [t], []);
+    stage.transact(() => {
+      stage.getMap(STAGE_AUDIO).set('bad', '{"id":"bad"}');
+      stage.getMap(STAGE_AUDIO).set('rewrite', JSON.stringify({ ...t, id: 'b'.repeat(64) }));
+    });
+    expect(readStagedAudio(stage).tracks.map(x => x.id)).toEqual([t.id]);
+    publishAudio(stage, [t], [{ id: t.id, at: AT, by: 'bea' }]);
+    expect(readStagedAudio(stage).tombstones).toHaveLength(1);
+  });
+
+  it('prunes staged audio to the shared keep set without touching a matching stage', () => {
+    const { stage } = setup();
+    const t = createAudioTrack({ id: 'a'.repeat(64), name: 'Theme.mp3', type: 'audio/mpeg', size: 1000, durationMs: 60_000 }, 'alex', AT);
+    publishAudio(stage, [t], []);
+    const before = Y.encodeStateAsUpdate(stage);
+    pruneStagedAudio(stage, [t], []);
+    expect(Y.encodeStateAsUpdate(stage)).toEqual(before);
+    pruneStagedAudio(stage, [], []);
+    expect(readStagedAudio(stage).tracks).toEqual([]);
+  });
+
+  it('keeps a bounded playback command log and rejects oversized commands', () => {
+    const { stage } = setup();
+    const command = (rev: number) => validatePlaybackCommand({ id: `c${rev}`, rev, participantId: 'alex', trackId: 'a'.repeat(64), playing: true, positionMs: rev * 100, at: AT });
+    for (let i = 0; i < AUDIO_COMMANDS + 5; i++) writePlaybackCommand(stage, command(i));
+    const commands = readPlaybackCommands(stage);
+    expect(commands).toHaveLength(AUDIO_COMMANDS);
+    expect(commands[0].rev).toBe(5);
+    expect(() => writePlaybackCommand(stage, { ...command(999), id: 'x'.repeat(AUDIO_COMMAND_BYTES) })).toThrow(/command/i);
+  });
+
+  it('survives a transient-stage clear and does not let audio overflow a history publish', () => {
+    const { stage, ws, bridge } = setup();
+    const t = createAudioTrack({ id: 'a'.repeat(64), name: 'Theme.mp3', type: 'audio/mpeg', size: 1000, durationMs: 60_000 }, 'alex', AT);
+    publishAudio(stage, [t], []);
+    writePlaybackCommand(stage, validatePlaybackCommand({ id: 'c1', rev: 1, participantId: 'alex', trackId: t.id, playing: false, positionMs: 0, at: AT }));
+    clearTransientStage(stage);
+    expect(readStagedAudio(stage).tracks).toHaveLength(1);
+    expect(readPlaybackCommands(stage)).toHaveLength(1);
+    expect(() => bridge.publish(ws.getHistory())).not.toThrow();
   });
 });
