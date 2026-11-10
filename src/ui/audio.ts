@@ -111,6 +111,9 @@ type Graph = {
 const MASTER_KEY = 'gather:audio:master';
 const TICK_MS = 250;
 const PROGRESS_NOTIFY_MS = 100;
+const PROBE_INITIAL_MS = 4_000;
+const PROBE_MAX_MS = 30_000;
+const RESUME_TIMEOUT_MS = 500;
 const PERSISTENCE_WARNING = 'Audio is in memory only; this browser could not persist the file, so it must be fetched again after reload.';
 const UNAVAILABLE_MESSAGE = 'That track is not available in this room; waiting for a participant with the file.';
 const SEND_FAILURE = 'That track could not be sent to peers.';
@@ -128,11 +131,11 @@ function toArrayBuffer(bytes: Uint8Array): ArrayBuffer {
 }
 
 function defaultConfirm(message: string): boolean {
-  if (typeof globalThis.confirm !== 'function') return true;
+  if (typeof globalThis.confirm !== 'function') return false;
   try {
     return globalThis.confirm(message);
   } catch {
-    return true;
+    return false;
   }
 }
 
@@ -175,6 +178,32 @@ function ramp(parameter: AudioParam | undefined, value: number, context: AudioCo
   } catch {
     /* a closed or partially implemented context must never break playback */
   }
+}
+
+/**
+ * A gesture-blocked `AudioContext.resume()` is allowed to stay pending forever in some
+ * browsers. Never await it unbounded: a suspended context after a short grace period is
+ * treated exactly like a rejected play, so the Enable sound prompt still appears.
+ */
+function resumeWithin(context: AudioContext, timeoutMs = RESUME_TIMEOUT_MS): Promise<boolean> {
+  if (context.state === 'running') return Promise.resolve(true);
+  return new Promise<boolean>(resolve => {
+    let settled = false;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const finish = () => {
+      if (settled) return;
+      settled = true;
+      if (timer !== undefined) clearTimeout(timer);
+      resolve(context.state === 'running');
+    };
+    timer = setTimeout(finish, timeoutMs);
+    (timer as { unref?: () => void }).unref?.();
+    try {
+      Promise.resolve(context.resume()).then(finish, finish);
+    } catch {
+      finish();
+    }
+  });
 }
 
 /**
@@ -221,7 +250,12 @@ export function createAudioController(options: AudioControllerOptions): AudioCon
   const downloading = new Set<string>();
   const receiving = new Set<string>();
   const progressById = new Map<string, number>();
+  const progressAt = new Map<string, number>();
   let availabilityLoaded = false;
+  let lastCurrentTrackId: string | null = null;
+  let lastPeerSignature: string | null = null;
+  let nextProbeAt = 0;
+  let probeDelay = PROBE_INITIAL_MS;
 
   let destroyed = false;
   let statusMessage: string | null = null;
@@ -239,6 +273,7 @@ export function createAudioController(options: AudioControllerOptions): AudioCon
   let graphAttempted = false;
   let graph: Graph | null = null;
   let playAttempt = 0;
+  let playPending = false;
   let lastConnected = false;
   let lastProgressNotify = Number.NEGATIVE_INFINITY;
 
@@ -293,6 +328,17 @@ export function createAudioController(options: AudioControllerOptions): AudioCon
     return memoryBytes.has(id) || storedIds.has(id) || diskIds.has(id);
   }
 
+  /**
+   * Peer bytes and progress are accepted only for an active library track or an id this
+   * controller is actually fetching; both paths validate the reference before storage.
+   */
+  function expectsIncoming(id: string): boolean {
+    return trackFor(audioView(), id) !== undefined
+      || fetching.has(id)
+      || downloading.has(id)
+      || receiving.has(id);
+  }
+
   async function readLocal(id: string): Promise<ArrayBuffer | null> {
     const memory = memoryBytes.get(id);
     if (memory !== undefined) return memory;
@@ -305,7 +351,9 @@ export function createAudioController(options: AudioControllerOptions): AudioCon
     } catch {
       /* fall through to unavailable */
     }
+    // A durable read that did not produce bytes invalidates both kinds of local claim.
     diskIds.delete(id);
+    storedIds.delete(id);
     return null;
   }
 
@@ -329,6 +377,7 @@ export function createAudioController(options: AudioControllerOptions): AudioCon
     diskIds.delete(id);
     downloading.delete(id);
     progressById.delete(id);
+    progressAt.delete(id);
     fetching.delete(id);
     attempted.delete(id);
     try { await repository.removeAudio(gameId, id); } catch { /* best effort */ }
@@ -345,7 +394,7 @@ export function createAudioController(options: AudioControllerOptions): AudioCon
       /* keep whatever was already known */
     }
     availabilityLoaded = true;
-    await reconcile();
+    reconcilePlayback();
     notify();
   }
 
@@ -489,7 +538,7 @@ export function createAudioController(options: AudioControllerOptions): AudioCon
     } finally {
       if (loadingId === trackId) loadingId = null;
     }
-    await reconcile();
+    reconcilePlayback();
     notify();
   }
 
@@ -500,37 +549,40 @@ export function createAudioController(options: AudioControllerOptions): AudioCon
   }
 
   async function attemptPlay(force = false): Promise<void> {
-    if (destroyed) return;
+    if (destroyed || playPending) return;
     const view = audioView();
     if (view === undefined || view.currentTrackId === null || loadedId !== view.currentTrackId) return;
     if (!view.connected || !view.playing) return;
     if (!force && needsSound) return;
+    playPending = true;
     const token = ++playAttempt;
-    const active = ensureGraph();
-    if (active !== null) {
-      if (active.context.state !== 'running') {
-        try { await active.context.resume(); } catch { /* blocked */ }
+    try {
+      const active = ensureGraph();
+      if (active !== null) {
+        const running = active.context.state === 'running' || await resumeWithin(active.context);
+        if (!running) {
+          if (!destroyed && token === playAttempt) blockSound();
+          return;
+        }
         if (destroyed || token !== playAttempt) return;
       }
-      if (active.context.state !== 'running') {
+      try {
+        await audio.play();
+      } catch {
+        if (!destroyed && token === playAttempt) blockSound();
+        return;
+      }
+      if (destroyed || token !== playAttempt) return;
+      // A resolved promise with a still-paused element is another blocked-autoplay signal.
+      if (audio.paused) {
         blockSound();
         return;
       }
+      needsSound = false;
+      notify();
+    } finally {
+      playPending = false;
     }
-    try {
-      await audio.play();
-    } catch {
-      if (!destroyed && token === playAttempt) blockSound();
-      return;
-    }
-    if (destroyed || token !== playAttempt) return;
-    // A resolved promise with a still-paused element is another blocked-autoplay signal.
-    if (audio.paused) {
-      blockSound();
-      return;
-    }
-    needsSound = false;
-    notify();
   }
 
   function durationOfView(view: AudioSessionView): number {
@@ -596,18 +648,37 @@ export function createAudioController(options: AudioControllerOptions): AudioCon
     applyGains(view);
   }
 
-  async function reconcile(): Promise<void> {
-    reconcilePlayback();
+  // ── incoming/outgoing transfers ────────────────────────────────────────────────────
+  function resetProbe(): void {
+    nextProbeAt = 0;
+    probeDelay = PROBE_INITIAL_MS;
   }
 
-  // ── incoming/outgoing transfers ────────────────────────────────────────────────────
   function maybeAutoFetch(): void {
     if (!availabilityLoaded || destroyed) return;
     const view = audioView();
     if (view === undefined || !view.connected || view.currentTrackId === null) return;
     const id = view.currentTrackId;
-    if (hasLocal(id) || attempted.has(id) || fetching.has(id)) return;
-    void fetchTrack(id, false);
+    if (hasLocal(id) || fetching.has(id)) return;
+    if (now() < nextProbeAt) return;
+    if (attempted.has(id)) {
+      const lastProgress = progressAt.get(id);
+      if (lastProgress !== undefined && now() - lastProgress < PROBE_INITIAL_MS) {
+        // The transfer is still moving; keep waiting instead of requesting a duplicate.
+        nextProbeAt = now() + probeDelay;
+        return;
+      }
+      // A transient failure or a silent holder must not leave a permanent spinner:
+      // clear the attempt and its stale progress before re-probing with backoff.
+      attempted.delete(id);
+      downloading.delete(id);
+      progressById.delete(id);
+      progressAt.delete(id);
+      notify();
+    }
+    nextProbeAt = now() + probeDelay;
+    probeDelay = Math.min(probeDelay * 2, PROBE_MAX_MS);
+    void fetchTrack(id, true);
   }
 
   let incoming: Promise<void> = Promise.resolve();
@@ -625,6 +696,7 @@ export function createAudioController(options: AudioControllerOptions): AudioCon
     fetching.add(id);
     downloading.add(id);
     progressById.set(id, 0);
+    progressAt.delete(id);
     notify();
     // One logical incoming transfer: a holder request queues behind the active one while
     // duplicate requests for the same id are rejected above.
@@ -646,6 +718,7 @@ export function createAudioController(options: AudioControllerOptions): AudioCon
         fetching.delete(id);
         if (!accepted || hasLocal(id)) {
           downloading.delete(id);
+          progressAt.delete(id);
           if (!hasLocal(id)) progressById.delete(id);
         }
         notify();
@@ -656,6 +729,9 @@ export function createAudioController(options: AudioControllerOptions): AudioCon
   async function receive(bytes: Uint8Array, meta: AudioTransferMeta, _peerId: string): Promise<void> {
     if (destroyed) return;
     if (isTombstoned(meta.trackId)) return;
+    // An unsolicited payload for an unknown id must not consume IndexedDB quota. It is
+    // recoverable later through the holder/fetch path once its metadata is visible.
+    if (!expectsIncoming(meta.trackId)) return;
     if (!(bytes instanceof Uint8Array) || bytes.byteLength < 1 || bytes.byteLength > AUDIO_BYTES || bytes.byteLength !== meta.size) {
       statusMessage = 'Incoming audio did not match its declared size.';
       notify();
@@ -664,7 +740,8 @@ export function createAudioController(options: AudioControllerOptions): AudioCon
     if (hasLocal(meta.trackId)) {
       downloading.delete(meta.trackId);
       progressById.delete(meta.trackId);
-      await reconcile();
+      progressAt.delete(meta.trackId);
+      reconcilePlayback();
       notify();
       return;
     }
@@ -688,13 +765,14 @@ export function createAudioController(options: AudioControllerOptions): AudioCon
         return;
       }
       if (!stored) statusMessage = PERSISTENCE_WARNING;
-      await reconcile();
+      reconcilePlayback();
     } catch {
       statusMessage = 'Incoming audio could not be verified or stored.';
     } finally {
       receiving.delete(meta.trackId);
       downloading.delete(meta.trackId);
       progressById.delete(meta.trackId);
+      progressAt.delete(meta.trackId);
       notify();
     }
   }
@@ -734,32 +812,49 @@ export function createAudioController(options: AudioControllerOptions): AudioCon
 
   function onSessionChanged(): void {
     if (destroyed) return;
-    const view = audioView();
+    const peerView = session.getView();
+    const view = peerView.audio;
     const connected = view?.connected ?? false;
+    const peerSignature = `${peerView.onlinePlayerIds.join(',')}|${peerView.unseatedParticipantCount}`;
+    const peersChanged = lastPeerSignature !== null && peerSignature !== lastPeerSignature;
+    lastPeerSignature = peerSignature;
     if (view !== undefined) {
       for (const id of view.tombstones) tombstoneIds.add(id);
       purgeTombstones(view);
       syncGainOverride(view);
       if (!view.playing || !view.connected) needsSound = false;
+      if (view.currentTrackId !== lastCurrentTrackId) {
+        // Switching away from a failed track and back must be able to probe again.
+        lastCurrentTrackId = view.currentTrackId;
+        attempted.clear();
+        resetProbe();
+      }
+      if (peersChanged && connected && view.currentTrackId !== null && !hasLocal(view.currentTrackId)) {
+        // A newly reachable participant may hold the missing bytes.
+        attempted.delete(view.currentTrackId);
+        resetProbe();
+      }
     }
     registerTransfers();
     if (connected && !lastConnected) {
       attempted.clear();
+      resetProbe();
       void refreshAvailability();
     }
     if (!connected) {
       // A lost channel cannot finish an incoming transfer; do not keep advertising it.
       downloading.clear();
       progressById.clear();
+      progressAt.clear();
     }
     lastConnected = connected;
-    void reconcile();
+    reconcilePlayback();
     notify();
   }
 
   function onLoadedMetadata(): void {
     applyPendingSeek();
-    void reconcile();
+    reconcilePlayback();
     notify();
   }
 
@@ -793,9 +888,11 @@ export function createAudioController(options: AudioControllerOptions): AudioCon
     }
     transferUnsubscribers.push(session.onAudioTrack((bytes, meta, peerId) => receive(bytes, meta, peerId)));
     transferUnsubscribers.push(session.onAudioProgress((fraction, meta) => {
-      if (destroyed || hasLocal(meta.trackId) || isTombstoned(meta.trackId)) return;
+      if (destroyed || isTombstoned(meta.trackId) || !expectsIncoming(meta.trackId)) return;
+      if (hasLocal(meta.trackId)) return;
       downloading.add(meta.trackId);
       progressById.set(meta.trackId, clamp(fraction, 0, 1));
+      progressAt.set(meta.trackId, now());
       notifyProgress();
     }));
     transferUnsubscribers.push(session.onAudioWho((trackId) => {
@@ -842,13 +939,13 @@ export function createAudioController(options: AudioControllerOptions): AudioCon
   const visibilityTarget = typeof document === 'undefined' ? null : document;
   const onVisibility = () => {
     if (visibilityTarget?.visibilityState === 'hidden') return;
-    void reconcile();
+    reconcilePlayback();
     notify();
   };
   visibilityTarget?.addEventListener('visibilitychange', onVisibility);
 
   const timer = setInterval(() => {
-    void reconcile();
+    reconcilePlayback();
     notify();
   }, TICK_MS);
   (timer as { unref?: () => void }).unref?.();
@@ -919,6 +1016,9 @@ export function createAudioController(options: AudioControllerOptions): AudioCon
         const accepted = session.addTrack(prepared.input);
         if (!accepted) {
           statusMessage ??= session.getView().error ?? 'Choose your player first.';
+          // The library rejected the metadata, so no peer could ever legitimately fetch
+          // these bytes; do not leave an invisible orphan in durable storage.
+          await forget(prepared.input.id);
         } else {
           try {
             await broadcast(prepared.bytes, prepared.meta);
@@ -926,7 +1026,7 @@ export function createAudioController(options: AudioControllerOptions): AudioCon
             statusMessage ??= SEND_FAILURE;
           }
         }
-        await reconcile();
+        reconcilePlayback();
       } catch (error) {
         statusMessage = error instanceof Error && error.message ? error.message : 'The audio file could not be added.';
       }
@@ -1004,7 +1104,11 @@ export function createAudioController(options: AudioControllerOptions): AudioCon
       }
       const active = ensureGraph();
       if (active !== null && active.context.state !== 'running') {
-        try { await active.context.resume(); } catch { /* not required for paused playback */ }
+        const running = await resumeWithin(active.context);
+        if (!running) {
+          blockSound();
+          return;
+        }
       }
       if (!view.connected || !view.playing) {
         needsSound = false;
@@ -1023,6 +1127,7 @@ export function createAudioController(options: AudioControllerOptions): AudioCon
     async retry(id: string): Promise<void> {
       if (destroyed) return;
       attempted.delete(id);
+      resetProbe();
       statusMessage = null;
       await fetchTrack(id, true);
       notify();

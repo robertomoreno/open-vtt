@@ -44,15 +44,21 @@ type FakeSession = AudioSessionPort & {
   position(trackId: string, peerId: string): AudioPositionBody | null | Promise<AudioPositionBody | null>;
   progress(fraction: number, meta: AudioTransferMeta, peerId: string): void;
   setAudio(next: AudioSessionView | undefined): void;
+  setPeers(onlinePlayerIds: string[], unseatedParticipantCount?: number): void;
   emit(): void;
 };
 
-function peerView(audio: AudioSessionView | undefined, localPlayerId: string | null): PeerSessionView {
+function peerView(
+  audio: AudioSessionView | undefined,
+  localPlayerId: string | null,
+  onlinePlayerIds: string[] = [],
+  unseatedParticipantCount = 0,
+): PeerSessionView {
   return {
     game: null,
     phase: 'ready',
     localPlayerId,
-    onlinePlayerIds: [],
+    onlinePlayerIds,
     priorityParticipantId: null,
     canCreatePlayer: false,
     canRoll: localPlayerId !== null,
@@ -61,7 +67,7 @@ function peerView(audio: AudioSessionView | undefined, localPlayerId: string | n
     liveImages: [],
     hasRecovery: false,
     hasRoomLink: false,
-    unseatedParticipantCount: 0,
+    unseatedParticipantCount,
     conflicts: [],
     error: null,
     connectionError: null,
@@ -82,9 +88,11 @@ function fakeSession(options: Partial<AudioSessionPort> & { view?: AudioSessionV
   const hasView = Object.prototype.hasOwnProperty.call(options, 'view');
   let audio = hasView ? options.view : view();
   let localPlayerId = options.localPlayerId === undefined ? 'alex' : options.localPlayerId;
+  let onlinePlayerIds: string[] = [];
+  let unseatedParticipantCount = 0;
   const listener = (fn: () => void) => { listeners.add(fn); return () => { listeners.delete(fn); }; };
   const session = {
-    getView: vi.fn(() => peerView(audio, localPlayerId)),
+    getView: vi.fn(() => peerView(audio, localPlayerId, onlinePlayerIds, unseatedParticipantCount)),
     subscribe: vi.fn(listener),
     addTrack: vi.fn(() => true),
     removeTrack: vi.fn(),
@@ -138,6 +146,10 @@ function fakeSession(options: Partial<AudioSessionPort> & { view?: AudioSessionV
     },
     setAudio(next: AudioSessionView | undefined) {
       audio = next;
+    },
+    setPeers(next: string[], unseated = 0) {
+      onlinePlayerIds = next;
+      unseatedParticipantCount = unseated;
     },
     emit() {
       for (const fn of [...listeners]) fn();
@@ -280,12 +292,14 @@ it('adds a track by storing bytes before publishing metadata and sending to peer
 });
 
 it('stores verified incoming bytes and rejects a hash mismatch', async () => {
-  const session = fakeSession({ view: view({ currentTrackId: null }) });
+  const bytes = new Uint8Array([1, 2, 3]);
+  const id = await sha256Hex(bytes);
+  // Both ids are active library tracks, so the reference gate accepts the payloads and
+  // the integrity check is what rejects the second one.
+  const session = fakeSession({ view: view({ tracks: [makeTrack(id, 'x', 3), makeTrack()], currentTrackId: null }) });
   const store = fakeStore();
   const c = build({ session, repository: store, gameId: 'game', createAudio: fakeAudio, createContext: fakeContext });
 
-  const bytes = new Uint8Array([1, 2, 3]);
-  const id = await sha256Hex(bytes);
   await session.receive(bytes, { trackId: id, name: 'x', type: 'audio/mpeg', size: 3 }, 'peer-a');
   expect(store.putAudio).toHaveBeenCalledWith('game', id, expect.any(ArrayBuffer));
 
@@ -374,6 +388,27 @@ it('enableSound resumes the context, seeks to the anchor and clears the prompt',
   expect(c.getView().playing).toBe(true);
 });
 
+it('shows Enable sound when AudioContext.resume never settles', async () => {
+  const audio = fakeAudio();
+  audio.duration = 6;
+  const context = fakeContext();
+  context.state = 'suspended';
+  context.resume.mockImplementation(() => new Promise(() => {}));
+  const session = fakeSession({ view: view({ playing: true, currentTrackId: ID, startedAt: 0 }) });
+  const c = build({
+    session,
+    repository: fakeStore({}, { seed: [ID] }),
+    gameId: 'game',
+    now: () => 1000,
+    createAudio: () => audio,
+    createContext: () => context,
+  });
+
+  await vi.waitFor(() => expect(c.getView().needsSound).toBe(true), { timeout: 2000 });
+  expect(c.getView().playing).toBe(false);
+  expect(audio.play).not.toHaveBeenCalled();
+});
+
 it('pauses on disconnect without issuing a command', async () => {
   const audio = fakeAudio();
   const session = fakeSession({ view: view({ playing: true, currentTrackId: ID, startedAt: 0 }) });
@@ -420,6 +455,70 @@ it('auto-fetches the current track when it is missing locally', async () => {
   build({ session, repository: fakeStore(), gameId: 'game', createAudio: fakeAudio, createContext: fakeContext });
 
   await vi.waitFor(() => expect(session.requestAudioTrack).toHaveBeenCalledWith(ID, 'peer-b'));
+});
+
+it('retries a missing current track when a peer joins the connected room', async () => {
+  const session = fakeSession({ view: view({ currentTrackId: ID }) });
+  const holders = vi.mocked(session.requestAudioHolders);
+  const request = vi.mocked(session.requestAudioTrack);
+  holders.mockResolvedValue([]);
+  request.mockResolvedValue(true);
+  const c = build({ session, repository: fakeStore(), gameId: 'game', createAudio: fakeAudio, createContext: fakeContext });
+
+  await vi.waitFor(() => expect(holders).toHaveBeenCalledTimes(1));
+  await vi.waitFor(() => expect(c.getView().status).toMatch(/not available/i));
+
+  holders.mockResolvedValue(['peer-c']);
+  session.setPeers(['bea'], 1);
+  session.emit();
+
+  await vi.waitFor(() => expect(holders.mock.calls.filter(([id]) => id === ID)).toHaveLength(2));
+  expect(request).toHaveBeenCalledWith(ID, 'peer-c');
+});
+
+it('re-probes when switching away from a failed current track and back', async () => {
+  const second = makeTrack(OTHER, 'B.wav');
+  const session = fakeSession({ view: view({ tracks: [makeTrack(), second], currentTrackId: ID }) });
+  const holders = vi.mocked(session.requestAudioHolders);
+  holders.mockResolvedValue([]);
+  const c = build({ session, repository: fakeStore(), gameId: 'game', createAudio: fakeAudio, createContext: fakeContext });
+
+  await vi.waitFor(() => expect(holders).toHaveBeenCalledTimes(1));
+  await vi.waitFor(() => expect(c.getView().status).toMatch(/not available/i));
+
+  session.setAudio(view({ tracks: [makeTrack(), second], currentTrackId: OTHER }));
+  session.emit();
+  session.setAudio(view({ tracks: [makeTrack(), second], currentTrackId: ID }));
+  session.emit();
+
+  await vi.waitFor(() => expect(holders.mock.calls.filter(([id]) => id === ID)).toHaveLength(2));
+});
+
+it('periodically re-probes with backoff while the track is still missing', async () => {
+  let clock = 0;
+  const session = fakeSession({ view: view({ currentTrackId: ID }) });
+  const holders = vi.mocked(session.requestAudioHolders);
+  const request = vi.mocked(session.requestAudioTrack);
+  holders.mockResolvedValue([]);
+  request.mockResolvedValue(true);
+  const c = build({
+    session,
+    repository: fakeStore(),
+    gameId: 'game',
+    now: () => clock,
+    createAudio: fakeAudio,
+    createContext: fakeContext,
+  });
+
+  await vi.waitFor(() => expect(holders).toHaveBeenCalledTimes(1));
+  await vi.waitFor(() => expect(c.getView().status).toMatch(/not available/i));
+
+  holders.mockResolvedValue(['peer-b']);
+  clock = 5000;
+  session.emit();
+
+  await vi.waitFor(() => expect(holders).toHaveBeenCalledTimes(2));
+  expect(request).toHaveBeenCalledWith(ID, 'peer-b');
 });
 
 it('answers who and position requests from local state', async () => {
@@ -487,6 +586,46 @@ it('keeps bytes in memory and warns when durable storage fails', async () => {
   expect(c.getView().status).toMatch(/persist|memory/i);
   const added = vi.mocked(session.addTrack).mock.calls[0][0];
   expect(await session.who(added.id, 'peer-a')).toBe(true);
+});
+
+it('removes stored bytes when publishing the track is rejected', async () => {
+  const session = fakeSession({ view: view({ currentTrackId: null }) });
+  vi.mocked(session.addTrack).mockReturnValue(false);
+  const store = fakeStore();
+  const c = build({
+    session,
+    repository: store,
+    gameId: 'game',
+    createAudio: fakeAudio,
+    createContext: fakeContext,
+    probeDuration: async () => 6000,
+    canPlay: () => true,
+  });
+
+  await c.actions.add(new File([new Uint8Array(4)], 'rejected.wav', { type: 'audio/wav' }));
+
+  const id = store.putAudio.mock.calls[0][1] as string;
+  expect(store.removeAudio).toHaveBeenCalledWith('game', id);
+  expect(await session.who(id, 'peer-a')).toBe(false);
+  expect(session.sendAudioTrack).not.toHaveBeenCalled();
+});
+
+it('discards unsolicited bytes and progress for unknown track ids', async () => {
+  const bytes = new Uint8Array([4, 5, 6]);
+  const id = await sha256Hex(bytes);
+  const store = fakeStore();
+  const session = fakeSession({ view: view({ tracks: [], currentTrackId: null }) });
+  const c = build({ session, repository: store, gameId: 'game', createAudio: fakeAudio, createContext: fakeContext });
+
+  await session.receive(bytes, { trackId: id, name: 'orphan', type: 'audio/mpeg', size: 3 }, 'peer-a');
+  expect(store.putAudio).not.toHaveBeenCalled();
+
+  session.progress(0.7, { trackId: id, name: 'orphan', type: 'audio/mpeg', size: 3 }, 'peer-a');
+  session.setAudio(view({ tracks: [makeTrack(id, 'orphan', 3)], currentTrackId: null }));
+  session.emit();
+
+  expect(c.getView().tracks[0]?.downloading).toBe(false);
+  expect(c.getView().tracks[0]?.progress).toBe(0);
 });
 
 it('discards an incoming track that is already tombstoned', async () => {
