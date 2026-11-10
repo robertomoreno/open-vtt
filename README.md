@@ -1,6 +1,6 @@
 # Gather
 
-A small, local-first virtual tabletop for your stories. Create or restore a game, open a shared room, choose approved player identities, and share dice rolls and table chat. No accounts, application backend, gameplay relay, analytics, or cloud saves.
+A small, local-first virtual tabletop for your stories. Create or restore a game, open a shared room, choose approved player identities, and share dice rolls, table chat, and music. No accounts, application backend, gameplay relay, analytics, or cloud saves.
 
 ## Run
 
@@ -93,6 +93,18 @@ Images can be attached to a message from the composer. Supported sources are PNG
 
 One message carries at most 2,000 characters and one image. Chat retains the newest **100 messages** (256 KiB total) and up to **4 live images** (192 KiB each, 512 KiB total).
 
+### Music
+
+Any seated player can add an audio file to the game’s shared library, select one track, start or stop it, seek, and set that track’s **Track volume (everyone)**. Each listener also has a private **Your volume (this device)** control for their own speakers; it is stored in that browser and never changes anyone else’s playback. One track plays at a time: there is no playlist, queue, automatic advance, mixing, or crossfade, and selecting another track stops the current one at 0:00. Supported files are MP3, M4A, AAC, OGG/Opus, WAV, WebM, and FLAC up to 10 MB.
+
+Uploaded audio is distributed browser-to-browser, not streamed from a server. Every connected participant receives and stores a copy, and any participant who holds the bytes can later serve someone who joins without them. A late joiner lists the whole library but does not download it in the background; selecting a track requests its bytes from a connected holder, and **Retry download** appears for a current track that is not yet available here. If no connected participant has the file, the track stays listed as not available in this room — metadata alone cannot recreate the audio.
+
+The library metadata and tombstones are saved with the game, and each browser keeps its own audio bytes, so reopening a saved game on the same browser restores the tracks and their audio. A different browser or a restored JSON backup lists the tracks but must fetch each file from a connected holder; audio bytes are never included in JSON backups. Deleting a track removes its bytes on every peer that receives the tombstone, and a peer that is offline removes them when it next synchronizes. If browser storage fails, the track remains usable in memory for that session and must be fetched again after a reload.
+
+Browsers may block sound until the page receives a user gesture. When that happens the panel shows **Enable sound**; press it once to start the current track. Headless automation cannot prove that sound is audible, so browser tests assert media state and the shared playhead instead.
+
+Audio is shared with every room participant and has no encryption beyond the transport and no access control. Treat the whole table as trusted: every participant can receive, store, and play the library, and the shared gain is a listening preference, not a permission.
+
 ## Network privacy and limits
 
 `src/network/config.ts` uses public Google STUN:
@@ -104,7 +116,7 @@ STUN discovers network addresses; it does **not** relay game data. The service s
 
 No TURN relay is configured. Corporate firewalls, restrictive NAT, or incompatible network policies can make direct connections impossible. Same-machine tests do not prove connectivity between homes.
 
-Games support **32 players**, **100 recent rolls**, and one die per request (d4/d6/d8/d10/d12/d20/d100; default d20). The host supports at most 31 remote peers / 8 unapproved peers. Incoming requests have a 20-message burst and 10/second refill per peer. Accepted roll IDs remain deduplicated for that connection; after 4,096 accepted requests, reconnect to roll more. A flooding peer is closed independently. Frames are bounded to 16 KiB, reassembled messages to 2 MiB / 256 fragments, 4 incomplete transfers per peer within 10 seconds, and 16 MiB of pending inbound data per connection; outgoing buffering is limited to 1 MiB. Game files are capped at 1 MiB and portable backups at 4 MiB. History, causal operations, and chat retention (see **Shared rooms**) have finite bounds; the transient synchronization stage holds at most 1.75 MiB, and oversized backups are rejected.
+Games support **32 players**, **100 recent rolls**, and one die per request (d4/d6/d8/d10/d12/d20/d100; default d20). The host supports at most 31 remote peers / 8 unapproved peers. Incoming requests have a 20-message burst and 10/second refill per peer. Accepted roll IDs remain deduplicated for that connection; after 4,096 accepted requests, reconnect to roll more. A flooding peer is closed independently. Frames are bounded to 16 KiB, reassembled messages to 2 MiB / 256 fragments, 4 incomplete transfers per peer within 10 seconds, and 16 MiB of pending inbound data per connection; outgoing buffering is limited to 1 MiB. Game files are capped at 1 MiB and portable backups at 4 MiB. The music library accepts files up to **10 MiB per file**, with a **12 MiB room audio payload ceiling**, at most **200 active tracks** and **200 tombstones** per game, a **64 KiB metadata budget**, and the newest **100 playback commands of at most 1 KiB each**; the 16 MiB pending-inbound and 2 MiB reassembled-message bounds are unchanged. History, causal operations, and chat retention (see **Shared rooms**) have finite bounds; the transient synchronization stage holds at most 1.75 MiB, and oversized backups are rejected.
 
 ## Compatibility
 
@@ -133,7 +145,7 @@ WebKit automation is **not proof of shipping Safari behavior**, and Chromium aut
 - `src/game/`: durable schema, validation, immutable operations, chat records and audiences (`chat.ts`), causal reconciliation, unbiased Web Crypto dice.
 - `src/storage/`: IndexedDB-backed browser records, identity hints, validated JSON files, recovery copies.
 - `src/network/`: room links, bounded framing, native WebRTC lifecycle, public signaling/STUN configuration, shared size limits; no game rules/DOM.
-- `src/session/`: causal peer session, membership, tenure, claims, request validation, chat and live-image staging, presence, snapshots; no storage/DOM.
-- `src/ui/`: replaceable views and application wiring, including in-browser chat image preparation (`image.ts`). The game-room layout is intentionally provisional.
+- `src/session/`: causal peer session, membership, tenure, claims, request validation, chat and live-image staging, audio metadata/transfer orchestration, presence, snapshots; no storage/DOM.
+- `src/ui/`: replaceable views and application wiring, including in-browser chat image preparation (`image.ts`), the persistent music controller (`audio.ts`), and the provisional music panel (`music.ts`). The game-room layout is intentionally provisional.
 
 No maps, tokens, sheets, voice/video, cloud saves, automatic host migration, seamless reconnection, or PWA are included in this foundation.

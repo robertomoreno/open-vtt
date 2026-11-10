@@ -1,5 +1,6 @@
 import { expect, type Page } from '@playwright/test';
 import { PlayerChooserPage } from './player-chooser.page';
+import { MusicPanel } from './music-panel.page';
 import { RestoreGamePage } from './restore-game.page';
 import { ShareRoomPage } from './share-room.page';
 import { StartPage } from './start.page';
@@ -12,6 +13,7 @@ export class GatherApp {
   readonly playerChooser: PlayerChooserPage;
   readonly restore: RestoreGamePage;
   readonly share: ShareRoomPage;
+  readonly music: MusicPanel;
 
   constructor(page: Page) {
     this.page = page;
@@ -20,6 +22,7 @@ export class GatherApp {
     this.playerChooser = new PlayerChooserPage(page);
     this.restore = new RestoreGamePage(page);
     this.share = new ShareRoomPage(page);
+    this.music = new MusicPanel(page);
   }
 
   async createGame(name = 'The Lantern Road', creator = 'Alex'): Promise<void> {
