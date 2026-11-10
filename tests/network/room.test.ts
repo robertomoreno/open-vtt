@@ -418,6 +418,9 @@ describe('room transport', () => {
       const result = await t.audio.requestPosition(trackId, 'peer-a');
       expect(position.request).toHaveBeenCalledWith({ trackId }, expect.objectContaining({ target: 'peer-a', timeoutMs: expect.any(Number) }));
       expect(position.requestMany).toHaveBeenCalledWith({ trackId }, expect.objectContaining({ targets: ['peer-b'], timeoutMs: expect.any(Number) }));
+      const preferredOptions = position.request.mock.calls.at(-1)![1];
+      expect(preferredOptions.timeoutMs).toBeGreaterThan(0);
+      expect(preferredOptions.timeoutMs).toBeLessThanOrEqual(Math.floor(PROBE_TIMEOUT_MS / 2));
       const fallbackOptions = position.requestMany.mock.calls.at(-1)![1];
       expect(fallbackOptions.timeoutMs).toBeGreaterThan(0);
       expect(fallbackOptions.timeoutMs).toBeLessThanOrEqual(PROBE_TIMEOUT_MS);

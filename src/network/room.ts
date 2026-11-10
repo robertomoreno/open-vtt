@@ -288,25 +288,25 @@ export function createRoomTransport(doc: Y.Doc, link: RoomLink, participantId: s
       const id = audioTrackId({ trackId });
       const action = audioPosition;
       if (id === null || action === undefined) return null;
-      // Preferred peer and fallback share one probe budget: a silent preferred peer cannot stall the fallback.
+      // The preferred peer gets at most half the probe budget, so a silent peer still leaves time for the fallback.
       const deadline = Date.now() + PROBE_TIMEOUT_MS;
+      const preferredBudget = Math.floor(PROBE_TIMEOUT_MS / 2);
       if (preferredPeer !== undefined && peers.has(preferredPeer)) {
         const started = Date.now();
         try {
-          const value: unknown = await action.request({ trackId: id }, { target: preferredPeer, timeoutMs: deadline - started });
+          const value: unknown = await action.request({ trackId: id }, { target: preferredPeer, timeoutMs: preferredBudget });
           const position = audioPositionBody(value, id);
           if (position !== null) return { peerId: preferredPeer, position, rttMs: Date.now() - started };
-        } catch { /* timed out or rejected: use whatever budget remains below */ }
+        } catch { /* timed out or rejected: the fallback below uses the remaining budget */ }
       }
       const targets = [...peers].filter(peer => peer !== preferredPeer);
-      const remaining = deadline - Date.now();
-      if (targets.length === 0 || remaining <= 0) return null;
+      if (targets.length === 0) return null;
       const answeredAt = new Map<string, number>();
       const started = Date.now();
       try {
         const results = await action.requestMany({ trackId: id }, {
           targets,
-          timeoutMs: remaining,
+          timeoutMs: Math.max(1, deadline - Date.now()),
           onResult: result => { answeredAt.set(result.peerId, Date.now()); },
         });
         for (const result of results) {
