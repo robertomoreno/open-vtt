@@ -7,9 +7,9 @@ export const rtcConfiguration: RTCConfiguration = {iceServers:[{urls:['stun:stun
 const publicSignalingUrl = 'wss://y-webrtc-eu.fly.dev';
 const localSignalingUrl = 'ws://127.0.0.1:4444';
 
-export function parseSignalingUrls(input: string, allowWs = false): string[] {
+export function parseSignalingUrls(input: string, allowWs = false, limit = SIGNALING_URL_LIMIT): string[] {
   const urls = input.split(',').map(url => url.trim()).filter(Boolean);
-  check(urls.length >= 1 && urls.length <= SIGNALING_URL_LIMIT, `Configure 1–${SIGNALING_URL_LIMIT} signaling URLs.`);
+  check(urls.length >= 1 && urls.length <= limit, `Configure 1–${limit} signaling URLs.`);
   for (const url of urls) {
     let parsed: URL;
     try {
@@ -17,8 +17,10 @@ export function parseSignalingUrls(input: string, allowWs = false): string[] {
     } catch {
       throw new Error('Signaling URLs must be valid wss:// URLs.');
     }
+    check(!parsed.username && !parsed.password, 'Signaling URLs must not contain credentials.');
     const ok = parsed.host.length > 0 && (parsed.protocol === 'wss:' || (allowWs && parsed.protocol === 'ws:'));
     check(ok, 'Signaling URLs must be valid wss:// URLs.');
+    check(!parsed.search && !parsed.hash, 'Signaling URLs must be valid wss:// URLs.');
   }
   return urls;
 }
@@ -61,7 +63,7 @@ if (import.meta.env.DEV) {
 // public STUN candidates and ICE fails. When every signaling URL is loopback,
 // all participants must be on this machine, so rewriting host candidates to
 // 127.0.0.1 is exact. This is dev-only; a production build never enables it.
-function isLoopbackUrl(value: string): boolean {
+export function isLoopbackUrl(value: string): boolean {
   try {
     const hostname = new URL(value).hostname.replace(/^\[|\]$/g, '');
     return hostname === '127.0.0.1' || hostname === 'localhost' || hostname === '::1';
