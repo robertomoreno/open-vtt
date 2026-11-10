@@ -1,8 +1,10 @@
+import type { AudioPositionBody, AudioTrackInput, AudioTransferMeta } from '../game/audio';
 import type { ChatImage, ChatImageInput, ChatMessage, ChatRecipients } from '../game/chat';
 import type { ConflictNotice, LocalEdit, WorkspaceSnapshot } from '../game/sync-types';
 import type { DieSides, Game, Role, Runtime } from '../game/types';
 import type { RoomLink } from '../network/room-link';
-import type { createRoomTransport } from '../network/room';
+import type { AudioPositionResult, createRoomTransport } from '../network/room';
+import type { AudioSessionView } from './audio';
 
 /**
  * Shared session contracts. Task 7 contributes the transient membership types; Task 8
@@ -54,6 +56,8 @@ export type PeerSessionView = {
   error: string | null;
   /** Live transport error (for example failed ICE or wrong room password), if any. */
   connectionError: string | null;
+  /** Shared audio library and transient playback state; absent in unrelated UI fixtures. */
+  audio?: AudioSessionView;
   /**
    * Monotonic per-controller counter that changes only for accepted workspace changes.
    * It is never the game revision and never a global counter.
@@ -94,6 +98,23 @@ export type PeerSession = {
   sendMessage(draft: ChatDraft): boolean;
   roll(sides: DieSides): void;
   edit(edit: LocalEdit): void;
+  /** Adds an audio track as the seated player; false when no workspace exists or the action failed. */
+  addTrack(input: AudioTrackInput): boolean;
+  removeTrack(trackId: string): void;
+  /** Sets a shared track gain; false when no workspace exists or the action failed. */
+  setTrackGain(trackId: string, gain: number): boolean;
+  selectTrack(trackId: string): void;
+  playTrack(): void;
+  stopTrack(): void;
+  seekTrack(positionMs: number): void;
+  sendAudioTrack(bytes: Uint8Array, meta: AudioTransferMeta, target?: string | string[], onProgress?: (fraction: number, peerId: string) => void): Promise<void>;
+  requestAudioHolders(trackId: string): Promise<string[]>;
+  requestAudioTrack(trackId: string, peerId: string): Promise<boolean>;
+  requestAudioPosition(trackId: string, preferredPeer?: string): Promise<AudioPositionResult | null>;
+  onAudioTrack(fn: (bytes: Uint8Array, meta: AudioTransferMeta, peerId: string) => void): () => void;
+  onAudioFetch(fn: (trackId: string, peerId: string) => boolean | Promise<boolean>): () => void;
+  onAudioWho(fn: (trackId: string, peerId: string) => boolean | Promise<boolean>): () => void;
+  onAudioPosition(fn: (trackId: string, peerId: string) => AudioPositionBody | null | Promise<AudioPositionBody | null>): () => void;
   disconnect(): void;
   close(): void;
 };

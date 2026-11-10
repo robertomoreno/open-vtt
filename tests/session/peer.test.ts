@@ -689,3 +689,55 @@ describe('peer chat', () => {
     h.destroy();
   }, 120_000);
 });
+
+describe('peer audio', () => {
+  it('shares a track and its shared gain, then persists it in the snapshot', async () => {
+    const h = createSessionHarness();
+    const a = h.add('a', chatSnapshot('seed'), 'alex');
+    const b = h.add('b', null, 'bea');
+    h.connect('a', 'b'); await h.flush();
+    const id = 'a'.repeat(64);
+    expect(a.addTrack({ id, name: 'Theme.mp3', type: 'audio/mpeg', size: 1000, durationMs: 60_000 })).toBe(true);
+    await h.flush();
+    expect(b.getView().audio!.tracks.map(t => t.name)).toEqual(['Theme.mp3']);
+    expect(a.setTrackGain(id, 150)).toBe(true);
+    await h.flush();
+    expect(b.getView().audio!.tracks[0].gain).toBe(150);
+    const restored = createWorkspace(a.getSnapshot()!, namedRuntime('restored'));
+    expect(restored.getTracks()[0].gain).toBe(150);
+    restored.destroy();
+    h.destroy();
+  });
+
+  it('converges play/stop commands and exposes canControl only when seated and connected', async () => {
+    const h = createSessionHarness();
+    const a = h.add('a', chatSnapshot('seed'), 'alex');
+    const b = h.add('b', null);
+    h.connect('a', 'b'); await h.flush();
+    expect(b.getView().audio!.canControl).toBe(false);
+    const id = 'a'.repeat(64);
+    a.addTrack({ id, name: 'Theme.mp3', type: 'audio/mpeg', size: 1000, durationMs: 60_000 });
+    await h.flush();
+    a.selectTrack(id);
+    a.playTrack();
+    await h.flush();
+    expect(a.getView().audio!.playing).toBe(true);
+    expect(b.getView().audio!.playing).toBe(true);
+    a.stopTrack();
+    await h.flush();
+    expect(b.getView().audio!.playing).toBe(false);
+    h.destroy();
+  });
+
+  it('allows offline library edits and rejects offline transport commands', async () => {
+    const a = offlineSession('solo', { remembered: 'alex' });
+    const id = 'a'.repeat(64);
+    expect(a.addTrack({ id, name: 'Theme.mp3', type: 'audio/mpeg', size: 1000, durationMs: 60_000 })).toBe(true);
+    expect(a.setTrackGain(id, 80)).toBe(true);
+    a.playTrack();
+    expect(a.getView().error).toMatch(/connection/i);
+    a.removeTrack(id);
+    expect(a.getView().audio!.tracks).toEqual([]);
+    a.close();
+  });
+});

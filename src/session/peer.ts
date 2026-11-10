@@ -1,4 +1,5 @@
 import * as Y from 'yjs';
+import type { AudioPositionBody, AudioTrackInput, AudioTransferMeta } from '../game/audio';
 import { normalizeRecipients, trimChatMessages, validateChatImage } from '../game/chat';
 import { makeRosterAddition } from '../game/history';
 import { capturePriority, reconcileHistories } from '../game/reconcile';
@@ -8,7 +9,8 @@ import { check, id, role as roleValue, text } from '../game/validation';
 import { createWorkspace, type Workspace } from '../game/workspace';
 import { ACTION_TOKEN_BURST, ACTION_TOKEN_REFILL_PER_SECOND, EXPIRY_MS, HEARTBEAT_MS } from '../network/limits';
 import { createRoomLink, type RoomLink } from '../network/room-link';
-import { createRoomTransport, type RoomTransport } from '../network/room';
+import { createRoomTransport, type AudioPositionResult, type RoomTransport } from '../network/room';
+import { createAudioSession, emptyAudioSessionView, type AudioSession } from './audio';
 import { createMembership, type Membership, type MembershipEvent } from './membership';
 import type { ChatDraft, PeerSession, PeerSessionOptions, PeerSessionPhase, PeerSessionView } from './peer-types';
 import {
@@ -98,6 +100,7 @@ export function createPeerSession(options: PeerSessionOptions): PeerSession {
   let saveGeneration = 0;
   let recovery: WorkspaceSnapshot | null = null;
   let error: string | null = null;
+  let errorEpoch = 0;
   let conflicts: ConflictNotice[] = [];
   let localPlayerId: string | null = null;
   let remembered: string | null = typeof options.rememberedPlayerId === 'string' && options.rememberedPlayerId ? options.rememberedPlayerId : null;
@@ -113,6 +116,9 @@ export function createPeerSession(options: PeerSessionOptions): PeerSession {
   let teardownRequested = false;
   let tokens = ACTION_TOKEN_BURST;
   let tokenAt = now();
+
+  let audio: AudioSession | null = null;
+  audio = workspace ? openAudio(workspace) : null;
 
   // ── refresh loop ─────────────────────────────────────────────────────────────────────
   let refreshing = false;
@@ -166,10 +172,63 @@ export function createPeerSession(options: PeerSessionOptions): PeerSession {
     // Chat merges after the game work: game history stays the priority data and admitted
     // records are the baseline before anything staged is mirrored back.
     syncChat();
+    audio?.sync();
     processIntents();
     applyRemembered();
     if (localPlayerId !== null && connected() && claimIntentFor !== localPlayerId) publishClaimIntent();
     projectClaims();
+  }
+
+  // ── shared audio ─────────────────────────────────────────────────────────────────────
+  /**
+   * Replaces the audio session whenever the workspace is replaced. The old session is
+   * destroyed first so it cannot keep mirroring or answering for the previous workspace.
+   */
+  function openAudio(next: Workspace): AudioSession {
+    audio?.destroy();
+    const session = createAudioSession({
+      stage,
+      workspace: next,
+      now,
+      runtime,
+      participantId,
+      onError: audioFailure,
+      onDirty: audioDirty,
+    });
+    session.setLocalPlayerId(localPlayerId);
+    if (transport !== null) session.setTransport(transport);
+    return session;
+  }
+  function setLocalPlayer(value: string | null) {
+    localPlayerId = value;
+    audio?.setLocalPlayerId(value);
+  }
+  /**
+   * Audio publishes to the shared stage synchronously. Marking the loop dirty lets the
+   * current refresh pass (or the action that caused the change) emit the new state;
+   * calling refresh() here would recurse when the change originates inside step().
+   */
+  function audioDirty() {
+    dirty = true;
+  }
+  /** Surfaces audio faults through the session error state, like any other action failure. */
+  function audioFailure(message: string) {
+    error = actionable(message);
+    errorEpoch++;
+    if (refreshing) {
+      dirty = true;
+      return;
+    }
+    emit();
+  }
+  function audioAction(run: (session: AudioSession) => void): boolean {
+    const session = audio;
+    if (session === null) {
+      error = closed ? 'Session is closed.' : 'No game is loaded.';
+      emit();
+      return false;
+    }
+    return action(() => run(session));
   }
 
   // ── connection facts ─────────────────────────────────────────────────────────────────
@@ -210,6 +269,7 @@ export function createPeerSession(options: PeerSessionOptions): PeerSession {
     workspace = next;
     bridge = createWorkspaceBridge(stage, next);
     unsubWorkspace = next.subscribe(onWorkspaceChange);
+    audio = openAudio(next);
     saveGeneration++;
     publishPending = true;
     syncDirty = true;
@@ -462,7 +522,7 @@ export function createPeerSession(options: PeerSessionOptions): PeerSession {
       return;
     }
     if (!workspace.getSnapshot().game.players.some(player => player.id === remembered)) return;
-    localPlayerId = remembered;
+    setLocalPlayer(remembered);
     publishClaimIntent();
   }
   function projectClaims() {
@@ -470,13 +530,13 @@ export function createPeerSession(options: PeerSessionOptions): PeerSession {
     onlinePlayerIds = confirmations.filter(entry => reachable(entry.participantId)).map(entry => entry.playerId)
       .sort((a, b) => (a < b ? -1 : a > b ? 1 : 0));
     if (workspace && localPlayerId !== null && !workspace.getSnapshot().game.players.some(player => player.id === localPlayerId)) {
-      localPlayerId = null;
+      setLocalPlayer(null);
       claimIntentFor = null;
     }
     if (localPlayerId !== null && transport) {
       const owner = confirmations.find(entry => entry.playerId === localPlayerId);
       if (owner && owner.participantId !== participantId && reachable(owner.participantId)) {
-        localPlayerId = null;
+        setLocalPlayer(null);
         claimIntentFor = null;
         remembered = null;
         error = 'Another participant claimed this player first.';
@@ -493,6 +553,7 @@ export function createPeerSession(options: PeerSessionOptions): PeerSession {
     unsubTransport = transport.subscribe(onExternal);
     membership = createMembership({ localId: participantId, founder: asFounder, now, id: runtime.id, publish: publishControl });
     unsubMembership = membership.subscribe(onExternal);
+    audio?.setTransport(transport);
     requestId = null;
     lastRequestAt = Number.NEGATIVE_INFINITY;
     claimIntentFor = null;
@@ -503,6 +564,7 @@ export function createPeerSession(options: PeerSessionOptions): PeerSession {
     refresh();
   }
   function teardownTransport() {
+    audio?.setTransport(null);
     if (heartbeat !== null) { clearInterval(heartbeat); heartbeat = null; }
     unsubTransport?.(); unsubTransport = null;
     unsubMembership?.(); unsubMembership = null;
@@ -534,9 +596,12 @@ export function createPeerSession(options: PeerSessionOptions): PeerSession {
     // Rate-limit user actions, never sync fragments.
     if (!takeToken()) { error = 'Too many actions; wait a moment and try again.'; emit(); return false; }
     let accepted = true;
+    const epoch = errorEpoch;
     try {
       run();
-      error = null;
+      // A nested failure (for example an audio fault surfaced during the run) is the
+      // actual outcome; only a clean run clears the previous error.
+      if (errorEpoch === epoch) error = null;
     } catch (e) {
       accepted = false;
       error = actionable(e instanceof Error ? e.message : 'The action could not be completed.');
@@ -590,6 +655,7 @@ export function createPeerSession(options: PeerSessionOptions): PeerSession {
         conflicts: conflicts.map(notice => ({ ...notice })),
         error,
         connectionError: closed ? null : (transport?.getView().error ?? null),
+        audio: audio?.getView() ?? emptyAudioSessionView(),
         saveGeneration,
       };
     },
@@ -649,7 +715,7 @@ export function createPeerSession(options: PeerSessionOptions): PeerSession {
         check(workspace !== null, 'No game is loaded.');
         check(workspace.getSnapshot().game.players.some(player => player.id === pid), 'Unknown player reference.');
         remembered = null;
-        localPlayerId = pid;
+        setLocalPlayer(pid);
         claimIntentFor = null;
         // Offline (or pre-confirmation) selections stay local/unconfirmed.
         publishClaimIntent();
@@ -714,6 +780,56 @@ export function createPeerSession(options: PeerSessionOptions): PeerSession {
         workspace.applyLocal(edit);
       });
     },
+    addTrack(input: AudioTrackInput): boolean {
+      return audioAction(session => session.addTrack(input));
+    },
+    removeTrack(trackId: string): void {
+      audioAction(session => session.removeTrack(trackId));
+    },
+    setTrackGain(trackId: string, gain: number): boolean {
+      return audioAction(session => session.setTrackGain(trackId, gain));
+    },
+    selectTrack(trackId: string): void {
+      audioAction(session => session.selectTrack(trackId));
+    },
+    playTrack(): void {
+      audioAction(session => session.playTrack());
+    },
+    stopTrack(): void {
+      audioAction(session => session.stopTrack());
+    },
+    seekTrack(positionMs: number): void {
+      audioAction(session => session.seekTrack(positionMs));
+    },
+    async sendAudioTrack(bytes: Uint8Array, meta: AudioTransferMeta, target?: string | string[], onProgress?: (fraction: number, peerId: string) => void): Promise<void> {
+      const session = audio;
+      if (session === null) return;
+      await session.sendAudioTrack(bytes, meta, target, onProgress);
+    },
+    async requestAudioHolders(trackId: string): Promise<string[]> {
+      const session = audio;
+      return session === null ? [] : session.requestAudioHolders(trackId);
+    },
+    async requestAudioTrack(trackId: string, peerId: string): Promise<boolean> {
+      const session = audio;
+      return session === null ? false : session.requestAudioTrack(trackId, peerId);
+    },
+    async requestAudioPosition(trackId: string, preferredPeer?: string): Promise<AudioPositionResult | null> {
+      const session = audio;
+      return session === null ? null : session.requestAudioPosition(trackId, preferredPeer);
+    },
+    onAudioTrack(fn: (bytes: Uint8Array, meta: AudioTransferMeta, peerId: string) => void): () => void {
+      return audio?.onAudioTrack(fn) ?? (() => {});
+    },
+    onAudioFetch(fn: (trackId: string, peerId: string) => boolean | Promise<boolean>): () => void {
+      return audio?.onAudioFetch(fn) ?? (() => {});
+    },
+    onAudioWho(fn: (trackId: string, peerId: string) => boolean | Promise<boolean>): () => void {
+      return audio?.onAudioWho(fn) ?? (() => {});
+    },
+    onAudioPosition(fn: (trackId: string, peerId: string) => AudioPositionBody | null | Promise<AudioPositionBody | null>): () => void {
+      return audio?.onAudioPosition(fn) ?? (() => {});
+    },
     disconnect() {
       if (closed) { error = 'Session is closed.'; emit(); return; }
       // A graceful leave is best effort; peers expire the position on their own clocks.
@@ -728,6 +844,8 @@ export function createPeerSession(options: PeerSessionOptions): PeerSession {
       if (closed) return;
       closed = true;
       teardownTransport();
+      audio?.destroy();
+      audio = null;
       unsubWorkspace?.(); unsubWorkspace = null;
       stage.off('update', onExternal);
       bridge?.destroy(); bridge = null;
