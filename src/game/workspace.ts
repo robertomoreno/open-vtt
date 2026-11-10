@@ -1,16 +1,29 @@
 import * as Y from 'yjs';
-import { CHAT_HARD_RECORDS, ENCODED_OPERATION_BYTES, GAME_OPERATIONS } from '../network/limits';
+import {
+  AUDIO_METADATA_BYTES, AUDIO_TOMBSTONES, AUDIO_TRACKS,
+  CHAT_HARD_RECORDS, ENCODED_OPERATION_BYTES, GAME_OPERATIONS,
+} from '../network/limits';
 import type { Game, Runtime } from './types';
 import type { GameHistory, GameOperation, LocalEdit, WorkspaceSnapshot } from './sync-types';
 import { trimChatMessages, validateChatMessage, type ChatMessage } from './chat';
+import {
+  audioTrackBytes, compareAudioTracks, mergeAudioTombstone, mergeAudioTrack,
+  validateAudioTombstone, validateAudioTrack, type AudioTombstone, type AudioTrack,
+} from './audio';
 import { frontier, mergeHistory, projectHistory, validateHistory, validateOperation } from './history';
-import { ValidationError, check, id, object, role, sides, text, validateGame } from './validation';
+import { ValidationError, check, id, object, role, sides, text, timestamp, validateGame } from './validation';
 
 export type Workspace = {
   readonly replicaId: string;
   getMessages(): ChatMessage[];
   addMessage(message: ChatMessage): void;
   mergeMessages(messages: readonly ChatMessage[]): void;
+  getTracks(): AudioTrack[];
+  getTombstones(): AudioTombstone[];
+  addTrack(track: AudioTrack): void;
+  mergeAudio(tracks: readonly AudioTrack[], tombstones: readonly AudioTombstone[]): void;
+  setTrackGain(trackId: string, gain: number, by: string, at: string): void;
+  removeTrack(trackId: string, by: string, at: string): void;
   getHistory(): GameHistory;
   getSnapshot(): WorkspaceSnapshot;
   applyLocal(edit: LocalEdit): void;
@@ -19,8 +32,43 @@ export type Workspace = {
   destroy(): void;
 };
 
+const AUDIO_KEYS = ['audio', 'audio-tombstones'];
+
+function orderTracks(tracks: readonly AudioTrack[]): AudioTrack[] {
+  return [...tracks].sort(compareAudioTracks);
+}
+
+function orderTombstones(tombstones: readonly AudioTombstone[]): AudioTombstone[] {
+  return [...tombstones].sort((a, b) => a.at < b.at ? -1 : a.at > b.at ? 1 : a.id < b.id ? -1 : a.id > b.id ? 1 : 0);
+}
+
+function metadataBytes(tracks: readonly AudioTrack[]): number {
+  return tracks.reduce((total, track) => total + audioTrackBytes(track), 0);
+}
+
+/**
+ * An id is content-addressed, so two records with the same `(addedAt, addedBy)` describe
+ * the same upload event: the first active record keeps its cosmetic fields even when a
+ * duplicate copy renames it. Records from distinct uploads defer to the canonical
+ * `(addedAt, addedBy, canonical JSON)` ordering in `mergeAudioTrack`. Gain always follows
+ * the newest edit.
+ */
+function mergeTrackRecords(existing: AudioTrack, incoming: AudioTrack): AudioTrack {
+  const merged = mergeAudioTrack(existing, incoming);
+  if (existing.addedAt !== incoming.addedAt || existing.addedBy !== incoming.addedBy) return merged;
+  return {
+    ...merged,
+    name: existing.name,
+    type: existing.type,
+    size: existing.size,
+    durationMs: existing.durationMs,
+    addedAt: existing.addedAt,
+    addedBy: existing.addedBy,
+  };
+}
+
 function readDoc(doc: Y.Doc): GameHistory {
-  check([...doc.share.keys()].every(key => ['meta', 'seeds', 'operations', 'chat'].includes(key)), 'Unexpected workspace data.');
+  check([...doc.share.keys()].every(key => ['meta', 'seeds', 'operations', 'chat', ...AUDIO_KEYS].includes(key)), 'Unexpected workspace data.');
   const meta = doc.getMap('meta');
   check([...meta.keys()].every(key => key === 'modelVersion' || key === 'gameId') && meta.size === 2, 'Invalid workspace metadata.');
   // The canonical content is the map key: different payloads with the same
@@ -60,20 +108,51 @@ function readChat(doc: Y.Doc): ChatMessage[] {
   }
   return trimChatMessages(records);
 }
-function loadSnapshot(value: WorkspaceSnapshot): { doc: Y.Doc; history: GameHistory; game: Game; messages: ChatMessage[] } {
+type AudioState = { tracks: AudioTrack[]; tombstones: AudioTombstone[] };
+function readAudio(doc: Y.Doc): AudioState {
+  const audio = doc.getMap('audio'), stones = doc.getMap('audio-tombstones');
+  check(stones.size <= AUDIO_TOMBSTONES, 'Too many audio tombstones.');
+  const tombstones: AudioTombstone[] = [];
+  for (const [key, value] of stones) {
+    let tombstone: AudioTombstone;
+    try {
+      check(typeof value === 'string', 'Invalid audio tombstone.');
+      tombstone = validateAudioTombstone(JSON.parse(value));
+    } catch { throw new ValidationError('Invalid audio tombstone.'); }
+    check(key === tombstone.id && JSON.stringify(tombstone) === value, 'Noncanonical audio tombstone.');
+    tombstones.push(tombstone);
+  }
+  const removed = new Set(tombstones.map(tombstone => tombstone.id)), tracks: AudioTrack[] = [];
+  for (const [key, value] of audio) {
+    let track: AudioTrack;
+    try {
+      check(typeof value === 'string', 'Invalid audio record.');
+      track = validateAudioTrack(JSON.parse(value));
+    } catch { throw new ValidationError('Invalid audio record.'); }
+    check(key === track.id && JSON.stringify(track) === value, 'Noncanonical audio record.');
+    // Tombstones always win: a removed id never comes back from an old or merged record.
+    if (!removed.has(track.id)) tracks.push(track);
+  }
+  check(tracks.length <= AUDIO_TRACKS, 'Too many audio tracks.');
+  check(metadataBytes(tracks) <= AUDIO_METADATA_BYTES, 'Audio metadata limit reached.');
+  return { tracks: orderTracks(tracks), tombstones: orderTombstones(tombstones) };
+}
+function loadSnapshot(value: WorkspaceSnapshot): { doc: Y.Doc; history: GameHistory; game: Game; messages: ChatMessage[]; tracks: AudioTrack[]; tombstones: AudioTombstone[] } {
   const snapshot = object(value, ['game', 'history']);
   const game = validateGame(snapshot.game);
   check(snapshot.history instanceof Uint8Array && snapshot.history.byteLength > 0 && snapshot.history.byteLength <= ENCODED_OPERATION_BYTES, 'Invalid or oversized history.');
   const doc = new Y.Doc();
   try {
     Y.applyUpdate(doc, snapshot.history);
-    const history = readDoc(doc), projected = projectHistory(history), messages = readChat(doc);
+    const history = readDoc(doc), projected = projectHistory(history), messages = readChat(doc), audio = readAudio(doc);
     const keep = new Set(messages.map(message => message.id));
     const chat = doc.getMap('chat');
     if ([...chat.keys()].some(key => !keep.has(key))) doc.transact(() => { for (const key of [...chat.keys()]) if (!keep.has(key)) chat.delete(key); });
+    const keepTracks = new Set(audio.tracks.map(track => track.id)), audioMap = doc.getMap('audio');
+    if ([...audioMap.keys()].some(key => !keepTracks.has(key))) doc.transact(() => { for (const key of [...audioMap.keys()]) if (!keepTracks.has(key)) audioMap.delete(key); });
     check(JSON.stringify(game) === JSON.stringify(projected), 'Snapshot does not match history.');
     check(Y.encodeStateAsUpdate(doc).byteLength <= ENCODED_OPERATION_BYTES, 'History limit reached; download a backup.');
-    return { doc, history, game: projected, messages };
+    return { doc, history, game: projected, messages, tracks: audio.tracks, tombstones: audio.tombstones };
   } catch (error) { doc.destroy(); throw error; }
 }
 export function validateWorkspaceSnapshot(snapshot: WorkspaceSnapshot): WorkspaceSnapshot {
@@ -84,9 +163,9 @@ export function validateWorkspaceSnapshot(snapshot: WorkspaceSnapshot): Workspac
 
 export function createWorkspace(input: Game | WorkspaceSnapshot, runtime: Runtime, replicaId?: string): Workspace {
   const author = id(replicaId ?? runtime.id());
-  let doc: Y.Doc, history: GameHistory, game: Game, messages: ChatMessage[];
+  let doc: Y.Doc, history: GameHistory, game: Game, messages: ChatMessage[], tracks: AudioTrack[], tombstones: AudioTombstone[];
   if ('history' in input) {
-    ({ doc, history, game, messages } = loadSnapshot(input));
+    ({ doc, history, game, messages, tracks, tombstones } = loadSnapshot(input));
   } else {
     game = validateGame(input);
     const seedId = id(runtime.id());
@@ -94,7 +173,7 @@ export function createWorkspace(input: Game | WorkspaceSnapshot, runtime: Runtim
     doc = new Y.Doc();
     doc.transact(() => { doc.getMap('meta').set('modelVersion', 1); doc.getMap('meta').set('gameId', game.id); doc.getMap('seeds').set(JSON.stringify([seedId, game]), true); });
     check(Y.encodeStateAsUpdate(doc).byteLength <= ENCODED_OPERATION_BYTES, 'History limit reached; download a backup.');
-    messages = [];
+    messages = []; tracks = []; tombstones = [];
   }
   let destroyed = false;
   const listeners = new Set<() => void>();
@@ -149,6 +228,36 @@ export function createWorkspace(input: Game | WorkspaceSnapshot, runtime: Runtim
     }
     notify();
   }
+  function commitAudio(nextTracks: AudioTrack[], nextTombstones: AudioTombstone[]) {
+    ensureOpen();
+    // Audio is the lowest-priority durable data: refuse to shrink game history or chat for it.
+    check(nextTracks.length <= AUDIO_TRACKS, 'Audio track limit reached.');
+    check(nextTombstones.length <= AUDIO_TOMBSTONES, 'Audio tombstone limit reached.');
+    check(metadataBytes(nextTracks) <= AUDIO_METADATA_BYTES, 'Audio metadata limit reached.');
+    const previous = Y.encodeStateAsUpdate(doc), previousTracks = tracks, previousTombstones = tombstones;
+    try {
+      const keepTracks = new Set(nextTracks.map(track => track.id));
+      const keepTombstones = new Set(nextTombstones.map(tombstone => tombstone.id));
+      doc.transact(() => {
+        const audio = doc.getMap('audio'), stones = doc.getMap('audio-tombstones');
+        for (const key of [...audio.keys()]) if (!keepTracks.has(key)) audio.delete(key);
+        for (const key of [...stones.keys()]) if (!keepTombstones.has(key)) stones.delete(key);
+        for (const track of nextTracks) {
+          const serialized = JSON.stringify(track);
+          if (audio.get(track.id) !== serialized) audio.set(track.id, serialized);
+        }
+        for (const tombstone of nextTombstones) {
+          const serialized = JSON.stringify(tombstone);
+          if (stones.get(tombstone.id) !== serialized) stones.set(tombstone.id, serialized);
+        }
+      });
+      check(Y.encodeStateAsUpdate(doc).byteLength <= ENCODED_OPERATION_BYTES, 'History limit reached; download a backup.');
+      tracks = nextTracks; tombstones = nextTombstones;
+    } catch (error) {
+      doc.destroy(); doc = new Y.Doc(); Y.applyUpdate(doc, previous); tracks = previousTracks; tombstones = previousTombstones; throw error;
+    }
+    notify();
+  }
   return {
     replicaId: author,
     getMessages() { ensureOpen(); return structuredClone(messages); },
@@ -169,6 +278,56 @@ export function createWorkspace(input: Game | WorkspaceSnapshot, runtime: Runtim
       }
       const next = trimChatMessages([...merged.values()]);
       if (JSON.stringify(next) !== JSON.stringify(messages)) commitMessages(next);
+    },
+    getTracks() { ensureOpen(); return structuredClone(tracks); },
+    getTombstones() { ensureOpen(); return structuredClone(tombstones); },
+    addTrack(value) {
+      ensureOpen();
+      const track = validateAudioTrack(value);
+      check(!tombstones.some(tombstone => tombstone.id === track.id), 'Audio track was removed.');
+      // The first record for an ID wins; a duplicate add is a no-op, like a same-ID chat merge.
+      if (tracks.some(existing => existing.id === track.id)) return;
+      commitAudio(orderTracks([...tracks, track]), tombstones);
+    },
+    mergeAudio(incomingTracks, incomingTombstones) {
+      ensureOpen();
+      const mergedTracks = new Map(tracks.map(track => [track.id, track]));
+      for (const value of incomingTracks) {
+        const track = validateAudioTrack(value);
+        const existing = mergedTracks.get(track.id);
+        mergedTracks.set(track.id, existing === undefined ? track : mergeTrackRecords(existing, track));
+      }
+      const mergedTombstones = new Map(tombstones.map(tombstone => [tombstone.id, tombstone]));
+      for (const value of incomingTombstones) {
+        const tombstone = validateAudioTombstone(value);
+        const existing = mergedTombstones.get(tombstone.id);
+        mergedTombstones.set(tombstone.id, existing === undefined ? tombstone : mergeAudioTombstone(existing, tombstone));
+      }
+      for (const tombstoneId of mergedTombstones.keys()) mergedTracks.delete(tombstoneId);
+      const nextTracks = orderTracks([...mergedTracks.values()]), nextTombstones = orderTombstones([...mergedTombstones.values()]);
+      if (JSON.stringify(nextTracks) === JSON.stringify(tracks) && JSON.stringify(nextTombstones) === JSON.stringify(tombstones)) return;
+      commitAudio(nextTracks, nextTombstones);
+    },
+    setTrackGain(trackId, gain, by, at) {
+      ensureOpen();
+      const key = id(trackId), index = tracks.findIndex(track => track.id === key);
+      check(index !== -1, 'Unknown audio track.');
+      const next = validateAudioTrack({ ...tracks[index], gain, gainAt: timestamp(at), gainBy: id(by) });
+      const updated = [...tracks]; updated[index] = next;
+      commitAudio(orderTracks(updated), tombstones);
+    },
+    removeTrack(trackId, by, at) {
+      ensureOpen();
+      const key = id(trackId);
+      const tombstone = validateAudioTombstone({ id: key, at: timestamp(at), by: id(by) });
+      const existing = tombstones.find(record => record.id === key);
+      const nextTombstones = orderTombstones([
+        ...tombstones.filter(record => record.id !== key),
+        existing === undefined ? tombstone : mergeAudioTombstone(existing, tombstone),
+      ]);
+      const nextTracks = tracks.filter(track => track.id !== key);
+      if (JSON.stringify(nextTracks) === JSON.stringify(tracks) && JSON.stringify(nextTombstones) === JSON.stringify(tombstones)) return;
+      commitAudio(nextTracks, nextTombstones);
     },
     getHistory() { ensureOpen(); return structuredClone(history); },
     getSnapshot() { ensureOpen(); return { game: structuredClone(game), history: Y.encodeStateAsUpdate(doc) }; },
