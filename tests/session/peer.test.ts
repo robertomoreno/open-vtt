@@ -72,7 +72,18 @@ describe('peer session', () => {
   it('pins signaling-only and presence-only states to canCreatePlayer false', () => {
     let clock = 0;
     const view: RoomTransportView = { phase: 'looking', openRtcConnections: 0, presence: [{ id: 'ghost', seenAt: clock }, { id: 'solo-1', seenAt: clock }], error: null };
-    const fake: RoomTransport = { getView: () => view, subscribe: () => () => {}, close() { view.phase = 'closed'; } };
+    const fake: RoomTransport = {
+      getView: () => view,
+      subscribe: () => () => {},
+      close() { view.phase = 'closed'; },
+      audio: {
+        setHandlers() {},
+        async sendTrack() {},
+        async requestHolders() { return []; },
+        async requestFetch() { return false; },
+        async requestPosition() { return null; },
+      },
+    };
     const s = createPeerSession({ initial: soloSnapshot('seed'), rememberedPlayerId: 'alex', runtime: namedRuntime('solo'), now: () => clock, createTransport: () => fake });
     expect(s.openRoom()).not.toBeNull();
     expect(s.getView().phase).toBe('waiting');

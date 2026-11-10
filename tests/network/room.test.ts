@@ -1,6 +1,7 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import * as Y from 'yjs';
 import { roomNetworkConfig, rtcConfiguration } from '../../src/network/config';
+import { AUDIO_BYTES } from '../../src/network/limits';
 import { createRoomLink } from '../../src/network/room-link';
 import { createRoomTransport, type RoomTransportOptions } from '../../src/network/room';
 
@@ -16,7 +17,15 @@ class FakePc extends EventTarget {
   createDataChannel() { const c = new FakeChannel(); this.channels.push(c); return c; }
   close() { this.closed++; for (const c of this.channels) c.close(); }
 }
-type Action = { send: ReturnType<typeof vi.fn>; onMessage: ((data: any, ctx: { peerId: string }) => void) | null; onReceive: ((ctx: any) => boolean) | null; onReceiveProgress: ((p: number, ctx: { peerId: string }) => void) | null };
+type Action = {
+  send: ReturnType<typeof vi.fn>;
+  request: ReturnType<typeof vi.fn>;
+  requestMany: ReturnType<typeof vi.fn>;
+  onMessage: ((data: any, ctx: { peerId: string; metadata?: any }) => void) | null;
+  onRequest: ((data: any, ctx: { peerId: string; metadata?: any }) => any) | null;
+  onReceive: ((ctx: any) => boolean) | null;
+  onReceiveProgress: ((p: number, ctx: { peerId: string; metadata?: any }) => void) | null;
+};
 function fakeJoin() {
   const state = {
     configs: [] as any[], roomIds: [] as string[], callbacks: undefined as any, actions: {} as Record<string, Action>,
@@ -25,7 +34,15 @@ function fakeJoin() {
   const join = (config: any, roomId: string, callbacks?: any) => {
     state.configs.push(config); state.roomIds.push(roomId); state.callbacks = callbacks;
     state.room = {
-      makeAction: (name: string, cfg?: any) => (state.actions[name] = { send: vi.fn(async () => {}), onMessage: cfg?.onMessage ?? null, onReceive: cfg?.onReceive ?? null, onReceiveProgress: cfg?.onReceiveProgress ?? null }),
+      makeAction: (name: string, cfg?: any) => (state.actions[name] = {
+        send: vi.fn(async () => {}),
+        request: vi.fn(),
+        requestMany: vi.fn(),
+        onMessage: cfg?.kind === 'request' ? null : cfg?.onMessage ?? null,
+        onRequest: cfg?.kind === 'request' ? cfg?.onRequest ?? null : null,
+        onReceive: cfg?.onReceive ?? null,
+        onReceiveProgress: cfg?.onReceiveProgress ?? null,
+      }),
       getPeers: () => state.peers, leave: async () => { state.leaves++; },
       onPeerJoin: null, onPeerLeave: null,
     };
@@ -66,7 +83,7 @@ describe('room transport', () => {
     const config = state.configs[0];
     expect(state.configs).toHaveLength(1);
     expect(config.appId).toBe('gather-v2');
-    expect(config.maxReceiveBytes).toBe(8 * 1024 * 1024);
+    expect(config.maxReceiveBytes).toBe(12 * 1024 * 1024);
     expect(config.relayConfig).toEqual({ urls: roomNetworkConfig.signaling });
     expect(config.rtcConfig).toBe(roomNetworkConfig.rtc);
     expect(config.rtcConfig.iceServers).toEqual(rtcConfiguration.iceServers);
@@ -313,6 +330,91 @@ describe('room transport', () => {
         t.close();
       });
     }
+  });
+
+  describe('audio transport', () => {
+    it('joins with the raised 12 MiB receive ceiling', async () => {
+      const { state, t } = await start();
+      expect(state.configs[0].maxReceiveBytes).toBe(12 * 1024 * 1024);
+      t.close();
+    });
+
+    it('admits a 10 MiB audio payload but rejects an oversized or malformed one', async () => {
+      const { state, join, t } = await start();
+      join('peer-a');
+      const audio = state.actions['gather-audio-v1'];
+      const meta = { trackId: 'a'.repeat(64), name: 'Theme.mp3', type: 'audio/mpeg', size: AUDIO_BYTES };
+      expect(audio.onReceive!({ ...ctx('peer-a', AUDIO_BYTES, 1), metadata: meta })).toBe(true);
+      expect(audio.onReceive!({ ...ctx('peer-a', AUDIO_BYTES + 1, 2), metadata: meta })).toBe(false);
+      expect(audio.onReceive!({ ...ctx('peer-a', 10, 3), metadata: { trackId: 'bad' } })).toBe(false);
+      t.close();
+    });
+
+    it('delivers verified audio bytes and progress to the registered handler', async () => {
+      const { state, join, t } = await start();
+      join('peer-a');
+      const onTrack = vi.fn(), onProgress = vi.fn();
+      t.audio.setHandlers({ onTrack, onProgress });
+      const meta = { trackId: 'a'.repeat(64), name: 'Theme.mp3', type: 'audio/mpeg', size: 3 };
+      state.actions['gather-audio-v1'].onMessage!(new Uint8Array([1, 2, 3]), { peerId: 'peer-a', metadata: meta });
+      state.actions['gather-audio-v1'].onReceiveProgress!(0.5, { peerId: 'peer-a', metadata: meta });
+      expect(onTrack).toHaveBeenCalledWith(new Uint8Array([1, 2, 3]), meta, 'peer-a');
+      expect(onProgress).toHaveBeenCalledWith(0.5, meta, 'peer-a');
+      t.close();
+    });
+
+    it('answers who, fetch, and position requests and validates their payloads', async () => {
+      const { state, join, t } = await start();
+      join('peer-a');
+      t.audio.setHandlers({
+        onWho: async trackId => trackId === 'a'.repeat(64),
+        onFetch: async (trackId, peerId) => trackId === 'a'.repeat(64) && peerId === 'peer-a',
+        onPosition: trackId => trackId === 'a'.repeat(64) ? { trackId, playing: true, positionMs: 1234 } : null,
+      });
+      expect(await state.actions['gather-audio-who-v1'].onRequest!({ trackId: 'a'.repeat(64) }, { peerId: 'peer-a' })).toEqual({ has: true });
+      expect(await state.actions['gather-audio-fetch-v1'].onRequest!({ trackId: 'a'.repeat(64) }, { peerId: 'peer-a' })).toEqual({ accepted: true });
+      expect(await state.actions['gather-audio-position-v1'].onRequest!({ trackId: 'a'.repeat(64) }, { peerId: 'peer-a' })).toEqual({ trackId: 'a'.repeat(64), playing: true, positionMs: 1234 });
+      expect(await state.actions['gather-audio-who-v1'].onRequest!({ trackId: 'bad' }, { peerId: 'peer-a' })).toEqual({ has: false });
+      expect(await state.actions['gather-audio-position-v1'].onRequest!({ trackId: 'b'.repeat(64) }, { peerId: 'peer-a' })).toBeNull();
+      t.close();
+    });
+
+    it('extends only the silent audio transfer deadline when progress arrives', async () => {
+      vi.useFakeTimers({ toFake: ['setInterval', 'clearInterval', 'setTimeout', 'clearTimeout', 'Date'] });
+      const { state, join, t } = await start();
+      join('peer-a');
+      const audio = state.actions['gather-audio-v1'];
+      const meta = { trackId: 'a'.repeat(64), name: 'Theme.mp3', type: 'audio/mpeg', size: 1000 };
+      audio.onReceive!({ ...ctx('peer-a', 1000), metadata: meta } as any);
+      await vi.advanceTimersByTimeAsync(9_000);
+      audio.onReceiveProgress!(0.5, { peerId: 'peer-a', metadata: meta } as any);
+      await vi.advanceTimersByTimeAsync(1_001);
+      expect(state.peers['peer-a'].close).not.toHaveBeenCalled();
+      await vi.advanceTimersByTimeAsync(9_000);
+      expect(state.peers['peer-a'].close).toHaveBeenCalledTimes(1);
+      t.close();
+      expect(vi.getTimerCount()).toBe(0);
+    });
+
+    it('sends a targeted track and resolves holders and positions through request actions', async () => {
+      const { state, join, t } = await start();
+      join('peer-a'); join('peer-b');
+      const meta = { trackId: 'a'.repeat(64), name: 'Theme.mp3', type: 'audio/mpeg', size: 3 };
+      await t.audio.sendTrack(new Uint8Array([1, 2, 3]), meta, 'peer-a');
+      expect(state.actions['gather-audio-v1'].send).toHaveBeenCalledWith(new Uint8Array([1, 2, 3]), expect.objectContaining({ target: 'peer-a', metadata: meta }));
+      state.actions['gather-audio-who-v1'].requestMany.mockResolvedValue([
+        { status: 'fulfilled', peerId: 'peer-a', value: { has: true } },
+        { status: 'fulfilled', peerId: 'peer-b', value: { has: false } },
+      ]);
+      expect(await t.audio.requestHolders(meta.trackId)).toEqual(['peer-a']);
+      state.actions['gather-audio-fetch-v1'].request.mockResolvedValue({ accepted: true });
+      expect(await t.audio.requestFetch(meta.trackId, 'peer-a')).toBe(true);
+      state.actions['gather-audio-position-v1'].request.mockResolvedValue({ trackId: meta.trackId, playing: true, positionMs: 1000 });
+      const result = await t.audio.requestPosition(meta.trackId, 'peer-a');
+      expect(result?.position).toEqual({ trackId: meta.trackId, playing: true, positionMs: 1000 });
+      expect(result?.rttMs).toBeGreaterThanOrEqual(0);
+      t.close();
+    });
   });
 
   describe('lifecycle', () => {

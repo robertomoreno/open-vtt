@@ -90,6 +90,13 @@ export function createSessionHarness(): SessionHarness {
           };
         },
         subscribe(fn) { target.listeners.add(fn); return () => { target.listeners.delete(fn); }; },
+        audio: {
+          setHandlers() {},
+          async sendTrack() {},
+          async requestHolders() { return []; },
+          async requestFetch() { return false; },
+          async requestPosition() { return null; },
+        },
         close() {
           if (target.closed) return;
           target.closed = true;

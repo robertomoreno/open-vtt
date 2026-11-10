@@ -1,7 +1,8 @@
 import * as Y from 'yjs';
-import type { JoinRoom, JoinRoomConfig, MessageAction, Room } from '@trystero-p2p/core';
+import type { JoinRoom, JoinRoomConfig, MessageAction, RequestAction, Room } from '@trystero-p2p/core';
+import { validateAudioTransferMeta, type AudioPositionBody, type AudioTransferMeta } from '../game/audio';
 import { roomNetworkConfig, signalingIsLoopback } from './config';
-import { ACTION_TOKEN_BURST, ACTION_TOKEN_REFILL_PER_SECOND, ADMITTED_PARTICIPANTS, AWARENESS_BYTES, CONTROL_BYTES, CONTROL_ENTRIES, EXPIRY_MS, HEARTBEAT_MS, INCOMPLETE_TRANSFERS, MESSAGE_BYTES, NATIVE_REMOTE_CONNECTIONS, PENDING_ADMISSIONS, PENDING_INBOUND_BYTES, TRANSFER_TIMEOUT_MS } from './limits';
+import { ACTION_TOKEN_BURST, ACTION_TOKEN_REFILL_PER_SECOND, ADMITTED_PARTICIPANTS, AUDIO_BYTES, AUDIO_MAX_DURATION_MS, AUDIO_TRANSFER_BYTES, AWARENESS_BYTES, CONTROL_BYTES, CONTROL_ENTRIES, EXPIRY_MS, HEARTBEAT_MS, INCOMPLETE_TRANSFERS, MESSAGE_BYTES, NATIVE_REMOTE_CONNECTIONS, PENDING_ADMISSIONS, PENDING_INBOUND_BYTES, TRANSFER_TIMEOUT_MS } from './limits';
 import type { RoomLink } from './room-link';
 import { createBoundedRtcRuntime, type RtcConstructors } from './rtc-runtime';
 
@@ -11,13 +12,56 @@ export type RoomTransportView = {
   presence: Array<{ id: string; seenAt: number }>;
   error: string | null;
 };
-export type RoomTransport = { getView(): RoomTransportView; subscribe(fn: () => void): () => void; close(): void };
+export type AudioPositionResult = { peerId: string; position: AudioPositionBody; rttMs: number };
+export type RoomAudioHandlers = {
+  onTrack?: (bytes: Uint8Array, meta: AudioTransferMeta, peerId: string) => void;
+  onProgress?: (fraction: number, meta: AudioTransferMeta, peerId: string) => void;
+  onWho?: (trackId: string, peerId: string) => boolean | Promise<boolean>;
+  onFetch?: (trackId: string, peerId: string) => boolean | Promise<boolean>;
+  onPosition?: (trackId: string, peerId: string) => AudioPositionBody | null | Promise<AudioPositionBody | null>;
+};
+export type RoomAudio = {
+  setHandlers(handlers: RoomAudioHandlers): void;
+  /** Audio metadata is validated here, so the transport accepts any shape and rejects bad ones. */
+  sendTrack(bytes: Uint8Array, meta: unknown, target?: string | string[], onProgress?: (fraction: number, peerId: string) => void): Promise<void>;
+  requestHolders(trackId: string): Promise<string[]>;
+  requestFetch(trackId: string, peerId: string): Promise<boolean>;
+  requestPosition(trackId: string, preferredPeer?: string): Promise<AudioPositionResult | null>;
+};
+export type RoomTransport = { getView(): RoomTransportView; subscribe(fn: () => void): () => void; close(): void; audio: RoomAudio };
 export type RoomTransportOptions = { join?: JoinRoom<JoinRoomConfig>; native?: RtcConstructors };
 
 const participantPattern = /^[A-Za-z0-9_-]{1,64}$/;
+const audioIdPattern = /^[0-9a-f]{64}$/;
 const SYNC_ACTION = 'gather-sync-v2';
 const PRESENCE_ACTION = 'gather-presence-v2';
+const AUDIO_ACTION = 'gather-audio-v1';
+const AUDIO_WHO_ACTION = 'gather-audio-who-v1';
+const AUDIO_FETCH_ACTION = 'gather-audio-fetch-v1';
+const AUDIO_POSITION_ACTION = 'gather-audio-position-v1';
 const encoder = new TextEncoder();
+
+// Peer-supplied audio metadata and positions are untrusted: return null instead of throwing.
+function audioMeta(value: unknown): AudioTransferMeta | null {
+  try { return validateAudioTransferMeta(value); } catch { return null; }
+}
+function audioTrackId(value: unknown): string | null {
+  if (value === null || typeof value !== 'object' || Array.isArray(value)) return null;
+  const keys = Object.keys(value);
+  if (keys.length !== 1 || keys[0] !== 'trackId') return null;
+  const trackId = (value as { trackId?: unknown }).trackId;
+  return typeof trackId === 'string' && audioIdPattern.test(trackId) ? trackId : null;
+}
+function audioPositionBody(value: unknown, trackId: string): AudioPositionBody | null {
+  if (value === null || typeof value !== 'object' || Array.isArray(value)) return null;
+  const keys = Object.keys(value).sort();
+  if (keys.length !== 3 || keys[0] !== 'playing' || keys[1] !== 'positionMs' || keys[2] !== 'trackId') return null;
+  const body = value as { trackId?: unknown; playing?: unknown; positionMs?: unknown };
+  if (body.trackId !== trackId || typeof body.playing !== 'boolean') return null;
+  const positionMs = body.positionMs;
+  if (!Number.isSafeInteger(positionMs) || (positionMs as number) < 0 || (positionMs as number) > AUDIO_MAX_DURATION_MS) return null;
+  return { trackId, playing: body.playing, positionMs: positionMs as number };
+}
 
 function bucket(now: () => number) {
   let tokens = ACTION_TOKEN_BURST, at = now();
@@ -38,6 +82,12 @@ export function createRoomTransport(doc: Y.Doc, link: RoomLink, participantId: s
   const seen = new Map<string, { id: string; seenAt: number }>();
   const expiries = new Map<string, ReturnType<typeof setTimeout>>();
   const limiters = new Map<string, () => boolean>();
+  const audioLimiters = new Map<string, () => boolean>();
+  let audioHandlers: RoomAudioHandlers = {};
+  let audioTrack: MessageAction<Uint8Array> | undefined;
+  let audioWho: RequestAction<{ trackId: string }, { has: boolean }> | undefined;
+  let audioFetch: RequestAction<{ trackId: string }, { accepted: boolean }> | undefined;
+  let audioPosition: RequestAction<{ trackId: string }, AudioPositionBody | null> | undefined;
   type Transfer = { bytes: number; restart(): void; settle(): void };
   const pendingByPeer = new Map<string, Map<string, Transfer>>();
   let sequence = 0;
@@ -92,7 +142,7 @@ export function createRoomTransport(doc: Y.Doc, link: RoomLink, participantId: s
       room = join({
         appId: 'gather-v2',
         password: link.secret,
-        maxReceiveBytes: 8 * 1024 * 1024,
+        maxReceiveBytes: AUDIO_TRANSFER_BYTES,
         relayConfig: { urls: roomNetworkConfig.signaling },
         rtcConfig: roomNetworkConfig.rtc,
         rtcPolyfill: runtime.rtcPolyfill,
@@ -181,6 +231,85 @@ export function createRoomTransport(doc: Y.Doc, link: RoomLink, participantId: s
     for (const [id, transfers] of [...pendingByPeer]) if (peerId === undefined || id === peerId) for (const transfer of [...transfers.values()]) transfer.settle();
   };
 
+  // Audio requests get their own per-peer budget so holder/position polling never starves presence.
+  const audioLimiter = (peerId: string): boolean => {
+    let limiter = audioLimiters.get(peerId);
+    if (limiter === undefined) { limiter = bucket(() => Date.now()); audioLimiters.set(peerId, limiter); }
+    return limiter();
+  };
+  // A local handler fault is a UI bug, not a peer fault: never let it break the transport.
+  const safely = (fn: () => void) => { try { fn(); } catch { /* ignored on purpose */ } };
+
+  const audio: RoomAudio = {
+    setHandlers(handlers) { audioHandlers = { ...handlers }; },
+    async sendTrack(bytes, meta, target, onProgress) {
+      const valid = audioMeta(meta);
+      if (!(bytes instanceof Uint8Array) || bytes.byteLength < 1 || bytes.byteLength > AUDIO_BYTES || valid === null || valid.size !== bytes.byteLength) throw new Error('Invalid audio transfer.');
+      const action = audioTrack;
+      if (action === undefined) throw new Error('The room connection is not ready.');
+      await action.send(bytes, {
+        ...(target === undefined ? {} : { target }),
+        metadata: valid,
+        ...(onProgress === undefined ? {} : { onProgress: (fraction: number, context: { peerId: string }) => onProgress(fraction, context.peerId) }),
+      });
+    },
+    async requestHolders(trackId) {
+      const id = audioTrackId({ trackId });
+      const action = audioWho;
+      if (id === null || action === undefined) return [];
+      const targets = [...peers];
+      if (targets.length === 0) return [];
+      try {
+        const results = await action.requestMany({ trackId: id }, { targets });
+        const holders: string[] = [];
+        for (const result of results) {
+          if (result.status !== 'fulfilled') continue;
+          const value: unknown = result.value;
+          if (value !== null && typeof value === 'object' && (value as { has?: unknown }).has === true) holders.push(result.peerId);
+        }
+        return holders;
+      } catch { return []; }
+    },
+    async requestFetch(trackId, peerId) {
+      const id = audioTrackId({ trackId });
+      const action = audioFetch;
+      if (id === null || action === undefined || !peers.has(peerId)) return false;
+      try {
+        const value: unknown = await action.request({ trackId: id }, { target: peerId });
+        return value !== null && typeof value === 'object' && (value as { accepted?: unknown }).accepted === true;
+      } catch { return false; }
+    },
+    async requestPosition(trackId, preferredPeer) {
+      const id = audioTrackId({ trackId });
+      const action = audioPosition;
+      if (id === null || action === undefined) return null;
+      if (preferredPeer !== undefined && peers.has(preferredPeer)) {
+        const started = Date.now();
+        try {
+          const value: unknown = await action.request({ trackId: id }, { target: preferredPeer });
+          const position = audioPositionBody(value, id);
+          if (position !== null) return { peerId: preferredPeer, position, rttMs: Date.now() - started };
+        } catch { /* try the remaining peers below */ }
+      }
+      const targets = [...peers].filter(peer => peer !== preferredPeer);
+      if (targets.length === 0) return null;
+      const answeredAt = new Map<string, number>();
+      const started = Date.now();
+      try {
+        const results = await action.requestMany({ trackId: id }, {
+          targets,
+          onResult: result => { answeredAt.set(result.peerId, Date.now()); },
+        });
+        for (const result of results) {
+          if (result.status !== 'fulfilled') continue;
+          const position = audioPositionBody(result.value, id);
+          if (position !== null) return { peerId: result.peerId, position, rttMs: (answeredAt.get(result.peerId) ?? Date.now()) - started };
+        }
+      } catch { /* nobody answered */ }
+      return null;
+    },
+  };
+
   function wire(joined: Room) {
     const sync = joined.makeAction<Uint8Array>(SYNC_ACTION, {
       onReceive: context => admission(SYNC_ACTION, MESSAGE_BYTES, context),
@@ -208,6 +337,59 @@ export function createRoomTransport(doc: Y.Doc, link: RoomLink, participantId: s
         notify();
       },
     }) as MessageAction<any>;
+    const audioProgressed = progressed(AUDIO_ACTION);
+    const audioProgress = (progress: number, context: { peerId: string; metadata?: unknown }) => {
+      audioProgressed(progress, context);
+      // Audio metadata carries no transfer id, so an unlabelled progress event belongs to this
+      // peer's in-flight audio transfer (core runs one bulk transfer per peer at a time).
+      if (transferId(context.metadata) === undefined) {
+        const transfers = pendingByPeer.get(context.peerId);
+        const key = transfers?.keys().next().value;
+        if (transfers !== undefined && typeof key === 'string' && key.startsWith(`${AUDIO_ACTION}:`)) transfers.get(key)?.restart();
+      }
+    };
+    audioTrack = joined.makeAction<Uint8Array>(AUDIO_ACTION, {
+      // Validate the metadata before registering a transfer, so malformed payloads cannot spend the shared budget.
+      onReceive: context => {
+        const meta = audioMeta(context.metadata);
+        return meta !== null && meta.size === context.byteLength && admission(AUDIO_ACTION, AUDIO_BYTES, context);
+      },
+      onReceiveProgress: (progress, context) => {
+        audioProgress(progress, context);
+        const meta = audioMeta(context.metadata);
+        if (meta !== null) safely(() => audioHandlers.onProgress?.(progress, meta, context.peerId));
+      },
+      onMessage: (data, context) => {
+        if (closed || !peers.has(context.peerId)) return;
+        const meta = audioMeta(context.metadata);
+        if (!(data instanceof Uint8Array) || data.byteLength > AUDIO_BYTES || data.byteLength < 1 || meta === null || meta.size !== data.byteLength) { peerError('Peer sent invalid audio.'); return; }
+        safely(() => audioHandlers.onTrack?.(data, meta, context.peerId));
+      },
+    }) as MessageAction<Uint8Array>;
+    audioWho = joined.makeAction<{ trackId: string }, { has: boolean }>(AUDIO_WHO_ACTION, {
+      kind: 'request',
+      onRequest: async (data, context) => {
+        const id = audioTrackId(data);
+        if (id === null || !peers.has(context.peerId) || !audioLimiter(context.peerId)) return { has: false };
+        try { return { has: (await audioHandlers.onWho?.(id, context.peerId)) === true }; } catch { return { has: false }; }
+      },
+    });
+    audioFetch = joined.makeAction<{ trackId: string }, { accepted: boolean }>(AUDIO_FETCH_ACTION, {
+      kind: 'request',
+      onRequest: async (data, context) => {
+        const id = audioTrackId(data);
+        if (id === null || !peers.has(context.peerId) || !audioLimiter(context.peerId)) return { accepted: false };
+        try { return { accepted: (await audioHandlers.onFetch?.(id, context.peerId)) === true }; } catch { return { accepted: false }; }
+      },
+    });
+    audioPosition = joined.makeAction<{ trackId: string }, AudioPositionBody | null>(AUDIO_POSITION_ACTION, {
+      kind: 'request',
+      onRequest: async (data, context) => {
+        const id = audioTrackId(data);
+        if (id === null || !peers.has(context.peerId) || !audioLimiter(context.peerId)) return null;
+        try { return audioPositionBody(await audioHandlers.onPosition?.(id, context.peerId), id); } catch { return null; }
+      },
+    });
     const targets = (except?: unknown) => [...peers].filter(peer => peer !== except);
     const send = (action: MessageAction<any>, data: unknown, target: string | string[]) => {
       Promise.resolve(action.send(data, { target, metadata: { t: sequence++ } })).catch(() => peerError('Peer send failed.'));
@@ -234,6 +416,7 @@ export function createRoomTransport(doc: Y.Doc, link: RoomLink, participantId: s
       peers.delete(peerId);
       participants.delete(peerId);
       limiters.delete(peerId);
+      audioLimiters.delete(peerId);
       seen.delete(peerId);
       clearTimeout(expiries.get(peerId));
       expiries.delete(peerId);
@@ -265,6 +448,7 @@ export function createRoomTransport(doc: Y.Doc, link: RoomLink, participantId: s
       listeners.add(fn);
       return () => { listeners.delete(fn); };
     },
+    audio,
     close() {
       if (closed) return;
       closed = true;
@@ -278,6 +462,7 @@ export function createRoomTransport(doc: Y.Doc, link: RoomLink, participantId: s
       runtime?.close();
       peers.clear();
       seen.clear();
+      audioLimiters.clear();
       for (const timer of expiries.values()) clearTimeout(timer);
       expiries.clear();
       pendingBytes = 0;
