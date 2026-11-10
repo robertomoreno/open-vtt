@@ -63,6 +63,7 @@ export type AudioSessionOptions = {
 };
 
 export type AudioTrackListener = (bytes: Uint8Array, meta: AudioTransferMeta, peerId: string) => void;
+export type AudioProgressListener = (fraction: number, meta: AudioTransferMeta, peerId: string) => void;
 export type AudioRequestListener = (trackId: string, peerId: string) => boolean | Promise<boolean>;
 export type AudioPositionListener = (trackId: string, peerId: string) => AudioPositionBody | null | Promise<AudioPositionBody | null>;
 
@@ -83,6 +84,7 @@ export type AudioSession = {
   requestAudioTrack(trackId: string, peerId: string): Promise<boolean>;
   requestAudioPosition(trackId: string, preferredPeer?: string): Promise<AudioPositionResult | null>;
   onAudioTrack(fn: AudioTrackListener): () => void;
+  onAudioProgress(fn: AudioProgressListener): () => void;
   onAudioFetch(fn: AudioRequestListener): () => void;
   onAudioWho(fn: AudioRequestListener): () => void;
   onAudioPosition(fn: AudioPositionListener): () => void;
@@ -112,6 +114,7 @@ export function createAudioSession(options: AudioSessionOptions): AudioSession {
   const participantId = id(options.participantId ?? runtime.id());
 
   const trackListeners = new Set<AudioTrackListener>();
+  const progressListeners = new Set<AudioProgressListener>();
   const fetchListeners = new Set<AudioRequestListener>();
   const whoListeners = new Set<AudioRequestListener>();
   const positionListeners = new Set<AudioPositionListener>();
@@ -415,6 +418,11 @@ export function createAudioSession(options: AudioSessionOptions): AudioSession {
           try { fn(bytes, meta, peerId); } catch { /* a listener fault must not break the transport */ }
         }
       },
+      onProgress(fraction, meta, peerId) {
+        for (const fn of [...progressListeners]) {
+          try { fn(fraction, meta, peerId); } catch { /* a listener fault must not break the transport */ }
+        }
+      },
       async onFetch(trackId, peerId) {
         for (const fn of [...fetchListeners]) {
           try { if (await fn(trackId, peerId)) return true; } catch { /* ignore local listener faults */ }
@@ -577,6 +585,7 @@ export function createAudioSession(options: AudioSessionOptions): AudioSession {
     },
 
     onAudioTrack(fn) { return unsubscriber(trackListeners, fn); },
+    onAudioProgress(fn) { return unsubscriber(progressListeners, fn); },
     onAudioFetch(fn) { return unsubscriber(fetchListeners, fn); },
     onAudioWho(fn) { return unsubscriber(whoListeners, fn); },
     onAudioPosition(fn) { return unsubscriber(positionListeners, fn); },
@@ -592,6 +601,7 @@ export function createAudioSession(options: AudioSessionOptions): AudioSession {
       try { transport?.audio.setHandlers({}); } catch { /* the transport may be closed */ }
       transport = null;
       trackListeners.clear();
+      progressListeners.clear();
       fetchListeners.clear();
       whoListeners.clear();
       positionListeners.clear();

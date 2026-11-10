@@ -70,6 +70,7 @@ function fakeSession(game: Game): PeerSession {
     requestAudioTrack: async () => false,
     requestAudioPosition: async () => null,
     onAudioTrack: () => () => {},
+    onAudioProgress: () => () => {},
     onAudioFetch: () => () => {},
     onAudioWho: () => () => {},
     onAudioPosition: () => () => {},

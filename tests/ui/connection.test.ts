@@ -66,6 +66,7 @@ function fakeSession(initial: WorkspaceSnapshot | null, joinRoom = vi.fn()): Pee
     requestAudioTrack: async () => false,
     requestAudioPosition: async () => null,
     onAudioTrack: () => () => {},
+    onAudioProgress: () => () => {},
     onAudioFetch: () => () => {},
     onAudioWho: () => () => {},
     onAudioPosition: () => () => {},

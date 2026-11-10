@@ -112,6 +112,7 @@ export type PeerSession = {
   requestAudioTrack(trackId: string, peerId: string): Promise<boolean>;
   requestAudioPosition(trackId: string, preferredPeer?: string): Promise<AudioPositionResult | null>;
   onAudioTrack(fn: (bytes: Uint8Array, meta: AudioTransferMeta, peerId: string) => void): () => void;
+  onAudioProgress(fn: (fraction: number, meta: AudioTransferMeta, peerId: string) => void): () => void;
   onAudioFetch(fn: (trackId: string, peerId: string) => boolean | Promise<boolean>): () => void;
   onAudioWho(fn: (trackId: string, peerId: string) => boolean | Promise<boolean>): () => void;
   onAudioPosition(fn: (trackId: string, peerId: string) => AudioPositionBody | null | Promise<AudioPositionBody | null>): () => void;

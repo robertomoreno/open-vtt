@@ -10,7 +10,7 @@ import { createWorkspace, type Workspace } from '../game/workspace';
 import { ACTION_TOKEN_BURST, ACTION_TOKEN_REFILL_PER_SECOND, EXPIRY_MS, HEARTBEAT_MS } from '../network/limits';
 import { createRoomLink, type RoomLink } from '../network/room-link';
 import { createRoomTransport, type AudioPositionResult, type RoomTransport } from '../network/room';
-import { createAudioSession, emptyAudioSessionView, type AudioSession } from './audio';
+import { createAudioSession, type AudioSession } from './audio';
 import { createMembership, type Membership, type MembershipEvent } from './membership';
 import type { ChatDraft, PeerSession, PeerSessionOptions, PeerSessionPhase, PeerSessionView } from './peer-types';
 import {
@@ -655,7 +655,9 @@ export function createPeerSession(options: PeerSessionOptions): PeerSession {
         conflicts: conflicts.map(notice => ({ ...notice })),
         error,
         connectionError: closed ? null : (transport?.getView().error ?? null),
-        audio: audio?.getView() ?? emptyAudioSessionView(),
+        // Absent until a workspace is bootstrapped: the UI can then attach transfer
+        // handlers to the newly created audio session instead of a permanent no-op.
+        audio: audio?.getView(),
         saveGeneration,
       };
     },
@@ -820,6 +822,9 @@ export function createPeerSession(options: PeerSessionOptions): PeerSession {
     },
     onAudioTrack(fn: (bytes: Uint8Array, meta: AudioTransferMeta, peerId: string) => void): () => void {
       return audio?.onAudioTrack(fn) ?? (() => {});
+    },
+    onAudioProgress(fn: (fraction: number, meta: AudioTransferMeta, peerId: string) => void): () => void {
+      return audio?.onAudioProgress(fn) ?? (() => {});
     },
     onAudioFetch(fn: (trackId: string, peerId: string) => boolean | Promise<boolean>): () => void {
       return audio?.onAudioFetch(fn) ?? (() => {});

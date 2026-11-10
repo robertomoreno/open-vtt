@@ -69,6 +69,17 @@ describe('peer session', () => {
     h.destroy();
   });
 
+  it('exposes audio only once a workspace exists', async () => {
+    const h = createSessionHarness();
+    const a = h.add('a', soloSnapshot('seed'), 'alex');
+    const b = h.add('b', null);
+    expect(a.getView().audio).toBeDefined();
+    expect(b.getView().audio).toBeUndefined();
+    h.connect('a', 'b'); await h.flush();
+    expect(b.getView().audio).toBeDefined();
+    h.destroy();
+  });
+
   it('pins signaling-only and presence-only states to canCreatePlayer false', () => {
     let clock = 0;
     const view: RoomTransportView = { phase: 'looking', openRtcConnections: 0, presence: [{ id: 'ghost', seenAt: clock }, { id: 'solo-1', seenAt: clock }], error: null };

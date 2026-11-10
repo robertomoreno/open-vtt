@@ -119,6 +119,19 @@ describe('session audio', () => {
     expect(audio.getView().startedAt).toBe(clock.at + 500);
   });
 
+  it('fans incoming transfer progress out to progress listeners', () => {
+    const { audio } = setup();
+    const onProgress = vi.fn();
+    audio.onAudioProgress(onProgress);
+    const handlers: any[] = [];
+    const fake = transport();
+    fake.audio.setHandlers = h => { handlers.push(h); };
+    audio.setTransport(fake);
+    const meta = { trackId: track().id, name: 'x', type: 'audio/mpeg' as const, size: 3 };
+    handlers.at(-1).onProgress(0.5, meta, 'peer-a');
+    expect(onProgress).toHaveBeenCalledWith(0.5, meta, 'peer-a');
+  });
+
   it('delegates transfer handlers and clears them when the transport is removed', async () => {
     const { audio } = setup();
     const onTrack = vi.fn();
