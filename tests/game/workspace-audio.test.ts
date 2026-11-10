@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import * as Y from 'yjs';
 import { AUDIO_TOMBSTONES, AUDIO_TRACKS } from '../../src/network/limits';
-import { createAudioTrack } from '../../src/game/audio';
+import { createAudioTrack, mergeAudioTrack } from '../../src/game/audio';
 import { createWorkspace, validateWorkspaceSnapshot } from '../../src/game/workspace';
 import { createTestWorkspace, namedRuntime } from '../helpers/workspace';
 
@@ -34,12 +34,33 @@ describe('workspace audio', () => {
     const w = createTestWorkspace('a');
     const base = track(1);
     w.addTrack(base);
-    w.mergeAudio([{ ...base, name: 'Renamed.mp3', gain: 150, gainAt: '2026-11-10T12:00:00.000Z', gainBy: 'bea' }], []);
+    w.mergeAudio([{ ...base, name: 'Renamed.mp3', addedAt: '2026-11-10T11:00:00.000Z', addedBy: 'bea', gain: 150, gainAt: '2026-11-10T12:00:00.000Z', gainBy: 'bea' }], []);
     expect(w.getTracks()[0].name).toBe('Track 1.mp3');
     expect(w.getTracks()[0].gain).toBe(150);
     w.mergeAudio([], [{ id: base.id, at: '2026-11-10T13:00:00.000Z', by: 'bea' }]);
     expect(w.getTracks()).toEqual([]);
     expect(w.getTombstones()).toHaveLength(1);
+  });
+
+  it('merges the same records deterministically regardless of order', () => {
+    const base = track(1);
+    const renamed = { ...base, name: 'Renamed.mp3', gain: 150, gainAt: '2026-11-10T12:00:00.000Z', gainBy: 'bea' };
+    const expected = mergeAudioTrack(base, renamed);
+    const forward = createTestWorkspace('forward');
+    forward.addTrack(base);
+    forward.mergeAudio([renamed], []);
+    const reverse = createTestWorkspace('reverse');
+    reverse.addTrack(renamed);
+    reverse.mergeAudio([base], []);
+    expect(forward.getTracks()).toEqual(reverse.getTracks());
+    expect(forward.getTracks()).toEqual([expected]);
+    expect(expected.gain).toBe(150);
+    const restoredForward = createWorkspace(forward.getSnapshot(), namedRuntime('restored-forward'));
+    const restoredReverse = createWorkspace(reverse.getSnapshot(), namedRuntime('restored-reverse'));
+    expect(restoredForward.getTracks()).toEqual(restoredReverse.getTracks());
+    expect(restoredForward.getTracks()).toEqual(forward.getTracks());
+    restoredForward.destroy();
+    restoredReverse.destroy();
   });
 
   it('persists gain changes and removal, and is idempotent on merge', () => {

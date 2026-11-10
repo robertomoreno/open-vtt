@@ -46,27 +46,6 @@ function metadataBytes(tracks: readonly AudioTrack[]): number {
   return tracks.reduce((total, track) => total + audioTrackBytes(track), 0);
 }
 
-/**
- * An id is content-addressed, so two records with the same `(addedAt, addedBy)` describe
- * the same upload event: the first active record keeps its cosmetic fields even when a
- * duplicate copy renames it. Records from distinct uploads defer to the canonical
- * `(addedAt, addedBy, canonical JSON)` ordering in `mergeAudioTrack`. Gain always follows
- * the newest edit.
- */
-function mergeTrackRecords(existing: AudioTrack, incoming: AudioTrack): AudioTrack {
-  const merged = mergeAudioTrack(existing, incoming);
-  if (existing.addedAt !== incoming.addedAt || existing.addedBy !== incoming.addedBy) return merged;
-  return {
-    ...merged,
-    name: existing.name,
-    type: existing.type,
-    size: existing.size,
-    durationMs: existing.durationMs,
-    addedAt: existing.addedAt,
-    addedBy: existing.addedBy,
-  };
-}
-
 function readDoc(doc: Y.Doc): GameHistory {
   check([...doc.share.keys()].every(key => ['meta', 'seeds', 'operations', 'chat', ...AUDIO_KEYS].includes(key)), 'Unexpected workspace data.');
   const meta = doc.getMap('meta');
@@ -295,7 +274,7 @@ export function createWorkspace(input: Game | WorkspaceSnapshot, runtime: Runtim
       for (const value of incomingTracks) {
         const track = validateAudioTrack(value);
         const existing = mergedTracks.get(track.id);
-        mergedTracks.set(track.id, existing === undefined ? track : mergeTrackRecords(existing, track));
+        mergedTracks.set(track.id, existing === undefined ? track : mergeAudioTrack(existing, track));
       }
       const mergedTombstones = new Map(tombstones.map(tombstone => [tombstone.id, tombstone]));
       for (const value of incomingTombstones) {
