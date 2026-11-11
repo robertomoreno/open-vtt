@@ -150,14 +150,16 @@ Two separate failures were present:
    unavailable" status could help, but it is outside Phase 1 scope. Do not
    globally suppress browser network errors.
 
-## Recommended next step
+## Verification after deployment
 
-Deploy the fix and verify the real flow on the deployed site: create a room in
-one browser, join from another (including two windows of the same browser), and
-exchange a roll or chat message. The same-machine failure is fixed; if two
-different machines still fail, record the room phase/error and treat it as a
-NAT/firewall limitation rather than a Nostr relay failure. The dead-relay
-console noise remains and can be handled separately with option 1 or 2.
+The fix was deployed in Pages run `43015269419`. Two separate browser instances
+of the same engine on the same Mac now create and join a room through public
+Nostr relays, reach `Connected and synchronized`, and open the guest player
+chooser without “Room discovery failed.” This was checked for Chromium↔Chromium
+and WebKit↔WebKit. The public gate also passes all four engine pairs. The
+dead-relay console noise remains and can be handled separately with option 1 or
+2. If two different machines still fail, record the room phase/error and treat
+it as a NAT/firewall limitation rather than a Nostr relay failure.
 
 ## Verification checklist for any change
 
@@ -218,5 +220,11 @@ reports, fixtures, or logs.
 ## Deployment status
 
 - Live: <https://robertomoreno.github.io/open-vtt/>
-- Last successful Pages run: `43007089966` (2026-11-11)
+- Fix commit: `65a1a41` (2026-11-11).
+- Last successful Pages run: `43015269419` (2026-11-11), deployed bundle
+  `assets/index-Bs0_MqG4.js`.
+- Live verification after deployment: two separate Chromium instances and two
+  separate WebKit instances each created and joined a room through public Nostr
+  relays, reached `Connected and synchronized`, and opened the guest player
+  chooser without “Room discovery failed.”
 - Current production config: Nostr, redundancy 8, no explicit relay list.
