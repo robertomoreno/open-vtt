@@ -30,6 +30,7 @@ jobs:
           VITE_GATHER_SIGNALING_PROVIDER: nostr
           VITE_GATHER_SIGNALING_REDUNDANCY: "8"
           VITE_GATHER_SIGNALING_URLS: ""
+          VITE_GATHER_COMMIT: ${{ github.sha }}
       - run: touch dist/.nojekyll
       - uses: actions/configure-pages@v5
       - uses: actions/upload-pages-artifact@v3

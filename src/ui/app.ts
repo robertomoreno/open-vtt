@@ -51,6 +51,7 @@ export type AppDependencies = {
   environment?: Environment;
   createSession?: typeof createPeerSession;
   network?: any;
+  build?: string;
 };
 
 const mounts = new WeakMap<HTMLElement, { destroy(): void }>();
@@ -84,7 +85,14 @@ export function mountApp(root: HTMLElement, deps: AppDependencies = {}) {
   const screen = el('div', '', 'screen');
   const flow = el('section');
   flow.id = 'connection-flow';
-  root.replaceChildren(header, warning, error, flow, screen);
+  const build = el('footer', '', 'build-version');
+  build.id = 'build-version';
+  const commit = (deps.build ?? import.meta.env.VITE_GATHER_COMMIT ?? '').trim();
+  const shortCommit = commit ? commit.slice(0, 7) : 'dev';
+  build.textContent = `build ${shortCommit}`;
+  build.title = commit ? `Commit ${commit}` : 'Local development build';
+  build.dataset.commit = commit;
+  root.replaceChildren(header, warning, error, flow, screen, build);
 
   let destroyed = false;
   let session: PeerSession | null = null;

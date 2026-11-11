@@ -53,3 +53,4 @@
 .music-range input{margin:0;padding:0}
 .music-time,.music-value{font-size:12px;color:#52654a}
 .music-value{display:inline-block;min-width:38px}
+.build-version{position:fixed;right:12px;bottom:10px;z-index:20;padding:2px 8px;border:1px solid #daddd2;border-radius:999px;background:#faf9f5e6;color:#5d6c57;font:11px/1.5 ui-monospace,SFMono-Regular,Menlo,monospace;user-select:text}

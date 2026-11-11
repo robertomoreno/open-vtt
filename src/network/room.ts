@@ -161,7 +161,10 @@ export function createRoomTransport(doc: Y.Doc, link: RoomLink, participantId: s
         onPeerHandshake: handshake,
         onJoinError: (details) => {
           if (import.meta.env.DEV) console.warn('[Gather room] join error:', details.error, 'peer=', details.peerId);
-          peerError('Room discovery failed.');
+          const message = details.error.includes('incorrect room password')
+            ? 'The room link does not match this room. Open the latest link.'
+            : 'The other browser was found, but a direct connection could not be opened. Check your network or firewall.';
+          peerError(message);
         },
       });
       wire(room);

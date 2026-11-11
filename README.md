@@ -24,6 +24,8 @@ npm run test:e2e
 
 `npm run test:e2e` starts the local relay and a dedicated dev server on port 5174 with local signaling; it does not contact public relays. `npm run test:e2e:nostr` is the opt-in real-browser gate for the production default: it starts the same dedicated dev server configured for `nostr` (no local relay) and exercises public relays. On 2026-11-11 it passed all four combinations: Chromium↔WebKit in both directions plus Chromium↔Chromium and WebKit↔WebKit; see `docs/superpowers/debugging/2026-11-11-nostr-relay-console-errors.md`. `dist/` contains the production static files. Serve them over HTTPS; no application server is needed. The current desktop Chrome, Firefox, Edge, and Safari are the compatibility targets. Feature detection explains unavailable APIs rather than crashing.
 
+The lower-right corner of every screen shows the short commit that built the page (`build dev` for a local build). Use it to confirm that a tab is running the deployed version rather than a cached copy.
+
 ## Save and restore
 
 - **New game:** enter a game name and your name. You become the first GM and the host. You can roll while alone.

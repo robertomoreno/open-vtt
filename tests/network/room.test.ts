@@ -131,6 +131,20 @@ describe('room transport', () => {
     t.close();
   });
 
+  it('explains that discovery succeeded when the direct connection fails', async () => {
+    const { state, t } = await start();
+    state.callbacks.onJoinError({ error: 'could not connect to peer abc after exchanging SDP; configure TURN servers', peerId: 'abc' });
+    expect(t.getView().error).toBe('The other browser was found, but a direct connection could not be opened. Check your network or firewall.');
+    t.close();
+  });
+
+  it('reports a room-secret mismatch separately from a network failure', async () => {
+    const { state, t } = await start();
+    state.callbacks.onJoinError({ error: 'incorrect room password when decrypting offer', peerId: 'abc' });
+    expect(t.getView().error).toBe('The room link does not match this room. Open the latest link.');
+    t.close();
+  });
+
   it('sends the full state only to a joining peer and later updates to every connected peer except their origin', async () => {
     const doc = new Y.Doc();
     doc.getMap('m').set('before', 1);
