@@ -3,7 +3,7 @@ import { createRoomLink, roomLink } from '../../src/network/room-link';
 import { APP_URL } from './config';
 import { ProviderGatePage } from './pages/provider-gate.page';
 
-for (const [a, b] of [['chromium', 'webkit'], ['webkit', 'chromium']]) {
+for (const [a, b] of [['chromium', 'webkit'], ['webkit', 'chromium'], ['chromium', 'chromium'], ['webkit', 'webkit']] as const) {
   test(`${a} ↔ ${b}: public Nostr discovery opens native channels and carries binary values`, async () => {
     test.setTimeout(180_000);
     const browserA = await (a === 'chromium' ? chromium : webkit).launch();

@@ -1,6 +1,33 @@
 # Nostr relay console errors after GitHub Pages deployment (2026-11-11)
 
-Status: open — handoff for the next session. No fix has been applied.
+Status: fixed on 2026-11-11. The dead-relay console noise remains; the separate “Room discovery failed.” connection failure is fixed.
+
+## Fix (2026-11-11): same-machine mDNS hosts
+
+The deployed room could discover the other participant through Nostr but never
+opened the WebRTC data channel. Both sides stayed at “Waiting for connection.”
+until Trystero reported:
+
+```text
+could not connect to peer … after exchanging SDP; configure TURN servers …
+```
+
+which the table showed as “Room discovery failed.” This was **not** a Nostr
+relay failure: discovery had already succeeded.
+
+Two same-engine Playwright browser instances on the same Mac failed
+(Chromium↔Chromium and WebKit↔WebKit), while Chromium↔WebKit passed. Both peers
+advertised mDNS-obfuscated host candidates such as `<id>.local`; this
+macOS/browser combination could not resolve those names across browser
+processes, so ICE stayed at `checking`. Rewriting the incoming mDNS host to
+`127.0.0.1` in a one-off browser init script made both same-engine pairs connect
+immediately.
+
+The permanent fix in `src/network/rtc-runtime.ts` keeps the original incoming
+candidate and also calls `addIceCandidate` with the same UDP port on
+`127.0.0.1`. A remote peer rejects the loopback pair and can still use the
+original LAN/internet candidate; a peer on the same computer connects. This is
+not TURN and does not change NAT or firewall limitations.
 
 ## Summary
 
@@ -39,10 +66,12 @@ are not application exceptions and they are not a total signaling failure.
 2. Create or open a shared room.
 3. Watch the browser console: repeated `WebSocket connection … failed` entries
    appear for the two dead relays.
-4. Confirm discovery still works (the room can reach `connected` and exchange
-   rolls/chat) or record the failure if it cannot.
-5. Re-run the public gate: `npm run test:e2e:nostr`. On 2026-11-11 it passed
-   2/2 (Chromium↔WebKit both directions, 12.6 s).
+4. Confirm discovery still works and exchange a roll or chat; before the
+   2026-11-11 fix, same-engine same-machine pairs reached “Room discovery
+   failed.” after SDP exchange even though Nostr discovered the peer.
+5. Re-run the public gate: `npm run test:e2e:nostr`. On 2026-11-11 after the
+   fix it passed 4/4 (both cross-engine directions and both same-engine pairs,
+   14.4 s).
 
 ## Evidence (2026-11-11)
 
@@ -63,28 +92,42 @@ are not application exceptions and they are not a total signaling failure.
 - `warnOnRelayFailure: false` only suppresses Trystero's own announce-failure
   `console.warn` in `core/dist/strategy.mjs`; it cannot suppress the browser's
   native WebSocket network errors.
-- The public gate still passes with the six healthy relays. The local relay e2e
-  suite is unaffected.
+- The original public gate passed only for Chromium↔WebKit. After the mDNS fix,
+  all four pairs pass, including Chromium↔Chromium and WebKit↔WebKit. The local
+  relay e2e suite is unaffected.
 
 ## Root cause
 
-Two of the eight default relays selected for `gather-v2` are dead. Trystero's
-socket layer retries failed connections indefinitely with exponential backoff,
-and the browser logs each failed WebSocket. The app remains functional while at
-least one selected relay is healthy; the console noise is expected until the
-dead relays leave the selected set or Trystero retires handshake failures.
+Two separate failures were present:
+
+1. **Console noise:** two of the eight default relays selected for `gather-v2`
+   are dead. Trystero's socket layer retries failed connections indefinitely
+   with exponential backoff, and the browser logs each failed WebSocket. The
+   app remains functional for signaling while at least one selected relay is
+   healthy.
+2. **No data channel:** same-machine peers exchanged mDNS `.local` host
+   candidates that could not be resolved across browser processes. The app's
+   existing loopback rewrite applied only to loopback WSS signaling, so the
+   production Nostr room could discover the peer but never complete ICE. The
+   RTC runtime now also tries each incoming mDNS host on `127.0.0.1` while
+   retaining the original candidate.
 
 ## Impact
 
-- **Functionality:** discovery works with 6/8 relays and the gate passes. If
-  more defaults die, `redundancy: 8` may leave too few healthy relays.
+- **Functionality:** discovery works with 6/8 relays. Same-machine peers now
+  connect through public signaling even when mDNS `.local` names cannot be
+  resolved across browser processes. If more defaults die, `redundancy: 8` may
+  leave too few healthy relays.
+- **Remote peers:** unchanged. No TURN is configured, so restrictive NAT,
+  corporate firewalls, and incompatible network policies can still prevent a
+  direct connection.
 - **UX:** repeated console errors can look like a broken app. There is no UI
   explanation for relay failures.
 - **Privacy:** browser network errors expose relay hostnames to the user's
   console. Gather itself does not log endpoints in production. Committed
   reports, fixtures, and logs must keep endpoints redacted.
 
-## Options for the next session (not yet chosen)
+## Options for the remaining dead-relay console noise
 
 1. **Pin a healthy explicit relay list in the Pages workflow.** Set
    `VITE_GATHER_SIGNALING_PROVIDER=nostr` and
@@ -109,19 +152,20 @@ dead relays leave the selected set or Trystero retires handshake failures.
 
 ## Recommended next step
 
-Verify a real two-browser connection on the deployed site: create a room in one
-browser, join from another, and exchange a roll or chat message. Record whether
-both reach `connected` and stay connected. If yes, choose between option 1
-(pin a healthy list) and option 2 (accept and document). If no, treat it as a
-separate signaling failure and capture the room phase/error and the number of
-reachable relays.
+Deploy the fix and verify the real flow on the deployed site: create a room in
+one browser, join from another (including two windows of the same browser), and
+exchange a roll or chat message. The same-machine failure is fixed; if two
+different machines still fail, record the room phase/error and treat it as a
+NAT/firewall limitation rather than a Nostr relay failure. The dead-relay
+console noise remains and can be handled separately with option 1 or 2.
 
 ## Verification checklist for any change
 
 - `npm run typecheck`
-- `npm test` (519 tests at the 2026-11-11 head)
+- `npm test`
 - `npm run build:pages` and confirm `dist/index.html` uses `/open-vtt/assets/…`
-- `npm run test:e2e:nostr` (public gate, Chromium↔WebKit both directions)
+- `npm run test:e2e:nostr` (public gate: Chromium↔WebKit both directions plus
+  Chromium↔Chromium and WebKit↔WebKit)
 - Two live browser contexts on the deployed site connect and exchange data
 - No relay URLs or credentials in committed docs/logs/fixtures; all participants
   use the same provider configuration
@@ -155,6 +199,8 @@ Source references:
   socket retry (3.333 s → 60 s).
 - `node_modules/@trystero-p2p/core/dist/strategy.mjs` — `warnOnRelayFailure`.
 - `src/network/signaling/providers/nostr.ts` — Gather's relay config.
+- `src/network/rtc-runtime.ts` — incoming mDNS host candidates also tried on
+  `127.0.0.1`; original candidate retained.
 - `src/network/signaling/config.ts` — provider defaults and validation.
 - `.github/workflows/pages.yml` — Pages build environment.
 - `docs/superpowers/debugging/2026-11-10-nostr-provider-gate.md` — previous

@@ -2,6 +2,28 @@ import { createBinaryAssembler, createInboundBudget, encodeBinaryFrames } from '
 import { MESSAGE_BYTES, NATIVE_BUFFERED_BYTES, NATIVE_BUFFER_LOW_BYTES, NATIVE_REMOTE_CONNECTIONS, OUTBOUND_QUEUE_CONNECTION_BYTES, OUTBOUND_QUEUE_TOTAL_BYTES } from './limits';
 
 export type RtcConstructors = Pick<typeof globalThis, 'RTCPeerConnection'>;
+
+// Browsers replace host addresses with mDNS names such as "4f3a...local".
+// Two peers on the same machine can exchange those candidates through public
+// signaling, but some browser/macOS combinations cannot resolve them across
+// processes, so ICE never leaves "checking". Keep the original candidate for
+// real remote peers and also try the same UDP port on loopback: a remote peer
+// simply rejects that pair, while a same-machine peer can connect.
+const MDNS_HOST = / (\S+\.local) (\d+) typ host\b/;
+function loopbackCandidate(candidate: RTCIceCandidateInit | RTCIceCandidate | null | undefined): RTCIceCandidateInit | null {
+  if (candidate === null || candidate === undefined) return null;
+  let init: RTCIceCandidateInit;
+  try {
+    init = typeof (candidate as RTCIceCandidate).toJSON === 'function'
+      ? (candidate as RTCIceCandidate).toJSON()
+      : { ...(candidate as RTCIceCandidateInit) };
+  } catch {
+    return null;
+  }
+  if (typeof init.candidate !== 'string') return null;
+  const rewritten = init.candidate.replace(MDNS_HOST, ' 127.0.0.1 $2 typ host');
+  return rewritten === init.candidate ? null : { ...init, candidate: rewritten };
+}
 type Options = { native?: RtcConstructors; now: () => number; onChange: () => void; onError: (message: string) => void };
 type Handler = ((event: any) => void) | null;
 type Frames = { iterator: Iterator<Uint8Array>; bytes: number; held?: Uint8Array };
@@ -271,6 +293,21 @@ export function createBoundedRtcRuntime(options: Options) {
     }
     get ondatachannel(): Handler { return this.#handler; }
     set ondatachannel(fn: Handler) { this.#handler = fn; }
+    async addIceCandidate(candidate?: RTCIceCandidateInit | RTCIceCandidate | null): Promise<void> {
+      const fallback = loopbackCandidate(candidate);
+      if (fallback === null) {
+        await super.addIceCandidate(candidate ?? undefined);
+        return;
+      }
+      // Wrap the calls so a synchronous native throw still counts as a rejected
+      // attempt instead of skipping the fallback.
+      const add = (value: RTCIceCandidateInit) => Promise.resolve().then(() => super.addIceCandidate(value));
+      const [original, loopback] = await Promise.allSettled([
+        add(candidate as RTCIceCandidateInit),
+        add(fallback),
+      ]);
+      if (original.status === 'rejected' && loopback.status === 'rejected') throw original.reason;
+    }
     createDataChannel(label: string, init?: RTCDataChannelInit) {
       if (this.#channels >= 1) throw new Error('Only one data channel is allowed per connection.');
       this.#channels++;

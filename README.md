@@ -22,7 +22,7 @@ npx playwright install chromium firefox webkit
 npm run test:e2e
 ```
 
-`npm run test:e2e` starts the local relay and a dedicated dev server on port 5174 with local signaling; it does not contact public relays. `npm run test:e2e:nostr` is the opt-in real-browser gate for the production default: it starts the same dedicated dev server configured for `nostr` (no local relay) and exercises public relays. It passed on 2026-11-10 for Chromium↔WebKit in both directions; see `docs/superpowers/debugging/2026-11-10-nostr-provider-gate.md`. `dist/` contains the production static files. Serve them over HTTPS; no application server is needed. The current desktop Chrome, Firefox, Edge, and Safari are the compatibility targets. Feature detection explains unavailable APIs rather than crashing.
+`npm run test:e2e` starts the local relay and a dedicated dev server on port 5174 with local signaling; it does not contact public relays. `npm run test:e2e:nostr` is the opt-in real-browser gate for the production default: it starts the same dedicated dev server configured for `nostr` (no local relay) and exercises public relays. On 2026-11-11 it passed all four combinations: Chromium↔WebKit in both directions plus Chromium↔Chromium and WebKit↔WebKit; see `docs/superpowers/debugging/2026-11-11-nostr-relay-console-errors.md`. `dist/` contains the production static files. Serve them over HTTPS; no application server is needed. The current desktop Chrome, Firefox, Edge, and Safari are the compatibility targets. Feature detection explains unavailable APIs rather than crashing.
 
 ## Save and restore
 
@@ -66,7 +66,9 @@ localStorage.setItem('gather:dev:signaling', 'ws://127.0.0.1:4444');
 location.reload();
 ```
 
-When every configured signaling URL is loopback for the `wss` provider, the app also rewrites browsers' mDNS-obfuscated `.local` host candidates to `127.0.0.1` for that room. Some macOS/browser configurations cannot resolve those candidates across processes, which otherwise leaves ICE stuck at `checking`/`failed` even though signaling works. This fallback is dev-only and only valid because loopback signaling means every peer is on the same machine; it is **not** TURN and does not make remote peers or NAT traversal work.
+When every configured signaling URL is loopback for the `wss` provider, the app rewrites browsers' mDNS-obfuscated `.local` host candidates to `127.0.0.1` for that room. Some macOS/browser configurations cannot resolve those candidates across processes, which otherwise leaves ICE stuck at `checking`/`failed` even though signaling works. That full rewrite is dev-only and only valid because loopback signaling means every peer is on the same machine.
+
+Independently of the signaling provider, every incoming mDNS host candidate is also tried on `127.0.0.1` while the original candidate is kept. This lets two participants on the same computer connect through public signaling even when the OS or browser cannot resolve `.local` names across processes. A genuinely remote peer simply rejects the loopback pair, so LAN and internet candidates still work. This is **not** TURN and does not make restrictive NAT, firewalls, or incompatible network policies connect.
 
 If ICE still fails, check the browser's macOS Local Network and incoming-connections permissions; a firewall-blocked browser cannot receive WebRTC traffic. Firefox in particular may be blocked by the application firewall even when Chromium works.
 
@@ -147,7 +149,7 @@ Audio is shared with every room participant and has no encryption beyond the tra
 - `stun:stun.l.google.com:19302`
 - `stun:stun1.l.google.com:19302`
 
-STUN discovers network addresses; it does **not** relay game data. The service sees discovery traffic, including your public address.
+STUN discovers network addresses; it does **not** relay game data. The service sees discovery traffic, including your public address. Incoming mDNS host candidates are also tried on `127.0.0.1` in addition to the candidate the peer advertised; this sends only to the local machine and helps same-computer peers connect.
 
 Production signaling defaults to public Nostr relays with eight-relay redundancy; development and the default browser tests use the bundled loopback WSS relay and do not contact public relays (the opt-in `npm run test:e2e:nostr` gate does). Nostr relays see participants' IP addresses, a random per-page public key, ephemeral event kinds, a hashed room topic, timing, and payload lengths. SDP/ICE is encrypted with the room secret, and announcements contain a peer ID. Public relays have no SLA and can rate-limit, block ephemeral event kinds, or disappear. All participants in a room must use the same provider configuration; the room link does not carry a provider. Signaling exchanges room metadata only; it does not store gameplay state.
 
@@ -161,10 +163,10 @@ Games support **32 players**, **100 recent rolls**, and one die per request (d4/
 
 Current desktop Chrome, Firefox, Edge, and Safari are the compatibility targets. Feature detection explains unavailable APIs rather than crashing.
 
-### Local relay and Nostr gate runs (2026-11-09/10, macOS)
+### Local relay and Nostr gate runs (2026-11-09/11, macOS)
 
 - Development and `npm run test:e2e` use the bundled loopback relay; no public signaling server is contacted.
-- The opt-in `npm run test:e2e:nostr` gate (public relays, no local relay) passed for Chromium↔WebKit in both directions on 2026-11-10: discovery through public Nostr relays opened native channels, 1.5 MB values matched byte-for-byte, delivery continued after the relay sockets were closed, and teardown succeeded. Two public relays were unreachable (one DNS, one HTTP 502) without blocking discovery; no event-kind rejection or rate limiting was observed. See `docs/superpowers/debugging/2026-11-10-nostr-provider-gate.md`.
+- The opt-in `npm run test:e2e:nostr` gate (public relays, no local relay) passed all four combinations on 2026-11-11: Chromium↔WebKit and WebKit↔Chromium, plus Chromium↔Chromium and WebKit↔WebKit. Discovery through public Nostr relays opened native channels, 1.5 MB values matched byte-for-byte, delivery continued after the relay sockets were closed, and teardown succeeded. Two public relays were unreachable without blocking discovery. The same-engine pairs failed before the incoming mDNS loopback fallback and passed after it. See `docs/superpowers/debugging/2026-11-11-nostr-relay-console-errors.md`.
 - The local shared-room connection suite passes for Chromium↔Chromium and both Chromium/WebKit cross directions (run 2026-11-09; Chromium↔Chromium and Chromium↔WebKit rechecked 2026-11-10): room synchronization, claims, rolls, leave/rejoin, and download. WebKit↔WebKit passed in an earlier run but can flake at the player-claim step; that is a game-UI timing race, not a signaling failure.
 - The shared-audio acceptance suite passes in headless Chromium: a >2 MiB WAV upload, holder fallback after the uploader leaves, same-browser persistence, shared play/seek/gain, and private device volume. Playwright launches Chromium with `--mute-audio`, so these tests assert media state and the shared playhead, not audible output.
 - The chat, games, and reconciliation suites also passed in Chromium on 2026-11-10.

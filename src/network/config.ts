@@ -28,7 +28,10 @@ export function parseSignalingUrls(input: string, allowWs = false, limit = SIGNA
 // public STUN candidates and ICE fails. When every signaling URL is loopback,
 // all participants must be on this machine, so rewriting host candidates to
 // 127.0.0.1 is exact. The resolved signaling plan decides whether that rewrite
-// applies; this predicate only classifies a single endpoint.
+// applies; this predicate only classifies a single endpoint. Independently of
+// signaling, the RTC runtime also tries each incoming mDNS host on 127.0.0.1
+// while retaining the original candidate, so same-machine peers work through
+// public signaling without assuming that every peer is local.
 export function isLoopbackUrl(value: string): boolean {
   try {
     const hostname = new URL(value).hostname.replace(/^\[|\]$/g, '');

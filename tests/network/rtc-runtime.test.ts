@@ -15,7 +15,9 @@ class FakeChannel extends EventTarget {
 class FakePc extends EventTarget {
   static all: FakePc[] = [];
   channels: FakeChannel[] = []; closed = 0;
+  iceCandidates: any[] = [];
   constructor() { super(); FakePc.all.push(this); }
+  async addIceCandidate(candidate: any) { this.iceCandidates.push(candidate); }
   createDataChannel(_l: string, init?: { ordered?: boolean; maxRetransmits?: number }) {
     const c = new FakeChannel(); if (init?.ordered === false) c.ordered = false; if (init?.maxRetransmits !== undefined) c.maxRetransmits = init.maxRetransmits;
     this.channels.push(c); return c;
@@ -265,6 +267,52 @@ describe('bounded RTC runtime', () => {
     const n = changes.n;
     FakePc.all[0].channels[0].open();
     expect(changes.n).toBe(n);
+  });
+});
+
+describe('remote ICE candidate fallback', () => {
+  const mdns = {
+    candidate: 'candidate:842163049 1 udp 1677729535 4f3a8b2c-1d2e-4f5a-9b6c-7d8e9f0a1b2c.local 51820 typ host generation 0 ufrag abcd network-id 1',
+    sdpMid: '0',
+    sdpMLineIndex: 0,
+    usernameFragment: 'abcd',
+  };
+
+  it('adds the original mDNS candidate and a loopback variant for same-machine peers', async () => {
+    const { runtime } = make();
+    const pc = new runtime.rtcPolyfill();
+    await pc.addIceCandidate(mdns);
+    expect(FakePc.all[0].iceCandidates).toEqual([
+      mdns,
+      { ...mdns, candidate: mdns.candidate.replace('4f3a8b2c-1d2e-4f5a-9b6c-7d8e9f0a1b2c.local', '127.0.0.1') },
+    ]);
+  });
+
+  it('passes non-mDNS candidates through once, unchanged', async () => {
+    const { runtime } = make();
+    const pc = new runtime.rtcPolyfill();
+    const candidate = { candidate: 'candidate:1 1 udp 2122260223 192.0.2.10 51820 typ host', sdpMid: '0', sdpMLineIndex: 0 };
+    await pc.addIceCandidate(candidate);
+    expect(FakePc.all[0].iceCandidates).toEqual([candidate]);
+  });
+
+  it('preserves the original candidate when the loopback variant is rejected', async () => {
+    const { runtime } = make();
+    const pc = new runtime.rtcPolyfill();
+    const native = FakePc.all[0];
+    const original = FakePc.prototype.addIceCandidate;
+    let calls = 0;
+    FakePc.prototype.addIceCandidate = async function (candidate: any) {
+      calls++;
+      if (calls === 2) throw new Error('loopback rejected');
+      return original.call(this, candidate);
+    };
+    try {
+      await expect(pc.addIceCandidate(mdns)).resolves.toBeUndefined();
+      expect(native.iceCandidates).toEqual([mdns]);
+    } finally {
+      FakePc.prototype.addIceCandidate = original;
+    }
   });
 });
 
