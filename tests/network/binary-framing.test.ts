@@ -21,7 +21,11 @@ describe('binary framing', () => {
       expect(frame.byteLength).toBeLessThanOrEqual(16_384);
       result = assembler.accept(frame);
     }
-    expect(result).toEqual(bytes);
+    // A deep toEqual on a 2 MiB Uint8Array takes seconds under CI load and trips the
+    // default 5s timeout; Buffer.compare is a native byte-for-byte check instead.
+    expect(result).toBeDefined();
+    expect(result!.byteLength).toBe(bytes.byteLength);
+    expect(Buffer.compare(result!, bytes)).toBe(0);
   });
 
   it('writes the documented big-endian header', () => {
